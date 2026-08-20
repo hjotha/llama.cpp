@@ -1085,6 +1085,10 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
     vk_pipeline pipeline_paged_attn_f16_d128;
     vk_pipeline pipeline_paged_attn_f16_d256;
+    vk_pipeline pipeline_paged_attn_q4_d128;
+    vk_pipeline pipeline_paged_attn_q4_d256;
+    vk_pipeline pipeline_paged_attn_q8_d128;
+    vk_pipeline pipeline_paged_attn_q8_d256;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -5499,6 +5503,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d128, "paged_attn_f16_d128", paged_attn_f16_d128_len, paged_attn_f16_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         if (device->max_workgroup_size_log2 >= 8) {
             ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d256, "paged_attn_f16_d256", paged_attn_f16_d256_len, paged_attn_f16_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        }
+        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q4_d128, "paged_attn_q4_d128", paged_attn_q4_d128_len, paged_attn_q4_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q8_d128, "paged_attn_q8_d128", paged_attn_q8_d128_len, paged_attn_q8_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        if (device->max_workgroup_size_log2 >= 8) {
+            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q4_d256, "paged_attn_q4_d256", paged_attn_q4_d256_len, paged_attn_q4_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q8_d256, "paged_attn_q8_d256", paged_attn_q8_d256_len, paged_attn_q8_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         }
     }
 
@@ -11112,11 +11122,25 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(n_heads != 0 && n_heads_kv != 0 && n_heads % n_heads_kv == 0);
     GGML_ASSERT(block_size > 0 && max_blocks > 0);
     GGML_ASSERT(k_cache == v_cache);
-    GGML_ASSERT(k_cache->type == GGML_TYPE_F16 && v_cache->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_cache->type == v_cache->type);
 
-    vk_pipeline pipeline = head_dim == 256 ? ctx->device->pipeline_paged_attn_f16_d256 : ctx->device->pipeline_paged_attn_f16_d128;
+    const bool kv_f16 = k_cache->type == GGML_TYPE_F16;
+    const bool kv_q4  = k_cache->type == GGML_TYPE_Q4_0;
+    const bool kv_q8  = k_cache->type == GGML_TYPE_Q8_0;
+    GGML_ASSERT(kv_f16 || kv_q4 || kv_q8);
+
+    vk_pipeline pipeline;
+    if (kv_f16) {
+        pipeline = head_dim == 256 ? ctx->device->pipeline_paged_attn_f16_d256 : ctx->device->pipeline_paged_attn_f16_d128;
+    } else if (kv_q4) {
+        pipeline = head_dim == 256 ? ctx->device->pipeline_paged_attn_q4_d256 : ctx->device->pipeline_paged_attn_q4_d128;
+    } else {
+        pipeline = head_dim == 256 ? ctx->device->pipeline_paged_attn_q8_d256 : ctx->device->pipeline_paged_attn_q8_d128;
+    }
     GGML_ASSERT(pipeline);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
+
+    const uint32_t kv_stride_unit = kv_f16 ? sizeof(ggml_fp16_t) : 1;
 
     const vk_paged_attn_push_constants pc = {
         head_dim, n_heads, n_heads_kv, n_seq, (uint32_t) block_size, (uint32_t) max_blocks, 0,
@@ -11126,9 +11150,9 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         (uint32_t) (k_new->nb[2]         / sizeof(float)),
         (uint32_t) (v_new->nb[1]         / sizeof(float)),
         (uint32_t) (v_new->nb[2]         / sizeof(float)),
-        (uint32_t) (k_cache->nb[1]       / sizeof(ggml_fp16_t)),
-        (uint32_t) (k_cache->nb[2]       / sizeof(ggml_fp16_t)),
-        (uint32_t) (k_cache->nb[3]       / sizeof(ggml_fp16_t)),
+        (uint32_t) (k_cache->nb[1]       / kv_stride_unit),
+        (uint32_t) (k_cache->nb[2]       / kv_stride_unit),
+        (uint32_t) (k_cache->nb[3]       / kv_stride_unit),
         (uint32_t) (dst->nb[1]           / sizeof(float)),
         (uint32_t) (dst->nb[2]           / sizeof(float)),
         op_params_f[0],
@@ -18277,11 +18301,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!device->fp16) {
                     return false;
                 }
+                const bool kv_f16 = op->src[3]->type == GGML_TYPE_F16;
+                const bool kv_q4  = op->src[3]->type == GGML_TYPE_Q4_0;
+                const bool kv_q8  = op->src[3]->type == GGML_TYPE_Q8_0;
                 if (op->src[0]->type != GGML_TYPE_F32 ||
                     op->src[1]->type != GGML_TYPE_F32 ||
                     op->src[2]->type != GGML_TYPE_F32 ||
-                    op->src[3]->type != GGML_TYPE_F16 ||
-                    op->src[4]->type != GGML_TYPE_F16 ||
+                    op->src[3]->type != op->src[4]->type ||
+                    !(kv_f16 || kv_q4 || kv_q8) ||
                     op->src[5]->type != GGML_TYPE_I32 ||
                     op->src[6]->type != GGML_TYPE_I32 ||
                     op->src[7]->type != GGML_TYPE_I32 ||
@@ -18292,18 +18319,29 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 const int block_size = ggml_get_op_params_i32(op, 1);
                 const int max_blocks = ggml_get_op_params_i32(op, 2);
+                const uint64_t head_dim = op->src[0]->ne[0];
                 auto contiguous = [](const ggml_tensor * t, size_t type_size) {
                     return t->nb[0] == type_size &&
                            t->nb[1] == t->nb[0] * t->ne[0] &&
                            t->nb[2] == t->nb[1] * t->ne[1] &&
                            t->nb[3] == t->nb[2] * t->ne[2];
                 };
+                if ((kv_q4 || kv_q8) && head_dim % ggml_blck_size(op->src[3]->type) != 0) {
+                    return false;
+                }
+                const size_t kv_row_bytes = kv_f16 ? sizeof(ggml_fp16_t) * head_dim : ggml_row_size(op->src[3]->type, head_dim);
+                const bool kv_contiguous = kv_f16 ?
+                    contiguous(op->src[3], sizeof(ggml_fp16_t)) :
+                    op->src[3]->nb[0] == ggml_type_size(op->src[3]->type) &&
+                    op->src[3]->nb[1] == kv_row_bytes &&
+                    op->src[3]->nb[2] == op->src[3]->nb[1] * op->src[3]->ne[1] &&
+                    op->src[3]->nb[3] == op->src[3]->nb[2] * op->src[3]->ne[2];
                 if (block_size <= 0 || max_blocks <= 0 || op->src[3] != op->src[4] ||
                     !contiguous(op->src[0], sizeof(float)) ||
                     !contiguous(op->src[1], sizeof(float)) ||
                     !contiguous(op->src[2], sizeof(float)) ||
                     !contiguous(op, sizeof(float)) ||
-                    !contiguous(op->src[3], sizeof(ggml_fp16_t)) ||
+                    !kv_contiguous ||
                     op->src[3]->ne[0] != op->src[0]->ne[0] ||
                     op->src[3]->ne[1] != block_size ||
                     op->src[3]->ne[2] < 2 * op->src[1]->ne[1] ||
@@ -18317,7 +18355,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     op->src[9]->nb[0] != sizeof(int32_t)) {
                     return false;
                 }
-                const uint64_t head_dim = op->src[0]->ne[0];
                 if (head_dim != 128 && (head_dim != 256 || device->max_workgroup_size_log2 < 8)) {
                     return false;
                 }

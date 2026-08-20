@@ -875,6 +875,10 @@ void process_shaders() {
 
     string_to_spv("paged_attn_f16_d128", "paged_attn_f16.comp", {{"PAGED_ATTN_LOCAL_SIZE", "128"}});
     string_to_spv("paged_attn_f16_d256", "paged_attn_f16.comp", {{"PAGED_ATTN_LOCAL_SIZE", "256"}});
+    string_to_spv("paged_attn_q4_d128", "paged_attn_quant.comp", {{"PAGED_ATTN_LOCAL_SIZE", "128"}, {"PAGED_ATTN_QTYPE", "4"}});
+    string_to_spv("paged_attn_q4_d256", "paged_attn_quant.comp", {{"PAGED_ATTN_LOCAL_SIZE", "256"}, {"PAGED_ATTN_QTYPE", "4"}});
+    string_to_spv("paged_attn_q8_d128", "paged_attn_quant.comp", {{"PAGED_ATTN_LOCAL_SIZE", "128"}, {"PAGED_ATTN_QTYPE", "8"}});
+    string_to_spv("paged_attn_q8_d256", "paged_attn_quant.comp", {{"PAGED_ATTN_LOCAL_SIZE", "256"}, {"PAGED_ATTN_QTYPE", "8"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});

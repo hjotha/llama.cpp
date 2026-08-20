@@ -1,0 +1,311 @@
+#version 450
+
+#ifndef PAGED_ATTN_LOCAL_SIZE
+#define PAGED_ATTN_LOCAL_SIZE 128
+#endif
+
+#ifndef PAGED_ATTN_QTYPE
+#define PAGED_ATTN_QTYPE 8
+#endif
+
+#define PAGED_ATTN_QK 32
+#if PAGED_ATTN_QTYPE == 4
+#define PAGED_ATTN_BLOCK_BYTES 18
+#else
+#define PAGED_ATTN_BLOCK_BYTES 34
+#endif
+
+layout(local_size_x = PAGED_ATTN_LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q          { float data_q[]; };
+layout (binding = 1) readonly buffer KNew       { float data_k_new[]; };
+layout (binding = 2) readonly buffer VNew       { float data_v_new[]; };
+layout (binding = 3) buffer KCache              { uint  data_k_cache[]; };
+layout (binding = 4) buffer VCache              { uint  data_v_cache[]; };
+layout (binding = 5) readonly buffer BlockTable  { uint  data_block_table[]; };
+layout (binding = 6) readonly buffer WriteSlots  { uint  data_write_slots[]; };
+layout (binding = 7) readonly buffer ContextLens { uint  data_context_lens[]; };
+layout (binding = 8) readonly buffer BatchOffset { uint  data_batch_offsets[]; };
+layout (binding = 9) readonly buffer BatchLens   { uint  data_batch_lens[]; };
+layout (binding = 10) writeonly buffer Out       { float data_out[]; };
+
+layout (push_constant) uniform parameters {
+    uint head_dim;
+    uint n_heads;
+    uint n_heads_kv;
+    uint n_seq;
+    uint block_size;
+    uint max_blocks;
+    uint mode;
+
+    uint q_head_stride;
+    uint q_token_stride;
+    uint k_head_stride;
+    uint k_token_stride;
+    uint v_head_stride;
+    uint v_token_stride;
+    uint kv_token_stride;
+    uint kv_head_stride;
+    uint kv_block_stride;
+    uint out_head_stride;
+    uint out_token_stride;
+    float scale;
+} p;
+
+shared float reduce[PAGED_ATTN_LOCAL_SIZE];
+shared float reduced_qk;
+shared float values[PAGED_ATTN_LOCAL_SIZE];
+
+uint k_byte(const uint offset) {
+    const uint word = data_k_cache[offset >> 2];
+    return (word >> ((offset & 3u) * 8u)) & 0xffu;
+}
+
+uint v_byte(const uint offset) {
+    const uint word = data_v_cache[offset >> 2];
+    return (word >> ((offset & 3u) * 8u)) & 0xffu;
+}
+
+void k_store_byte(const uint offset, const uint value) {
+    const uint word_index = offset >> 2;
+    const uint shift = (offset & 3u) * 8u;
+    const uint mask = 0xffu << shift;
+    data_k_cache[word_index] = (data_k_cache[word_index] & ~mask) | ((value & 0xffu) << shift);
+}
+
+void v_store_byte(const uint offset, const uint value) {
+    const uint word_index = offset >> 2;
+    const uint shift = (offset & 3u) * 8u;
+    const uint mask = 0xffu << shift;
+    data_v_cache[word_index] = (data_v_cache[word_index] & ~mask) | ((value & 0xffu) << shift);
+}
+
+uint k_u16(const uint offset) {
+    return k_byte(offset) | (k_byte(offset + 1u) << 8u);
+}
+
+uint v_u16(const uint offset) {
+    return v_byte(offset) | (v_byte(offset + 1u) << 8u);
+}
+
+float k_scale(const uint offset) {
+    return unpackHalf2x16(k_u16(offset)).x;
+}
+
+float v_scale(const uint offset) {
+    return unpackHalf2x16(v_u16(offset)).x;
+}
+
+void k_store_half(const uint offset, const float value) {
+    const uint bits = packHalf2x16(vec2(value, 0.0));
+    k_store_byte(offset, bits & 0xffu);
+    k_store_byte(offset + 1u, (bits >> 8u) & 0xffu);
+}
+
+void v_store_half(const uint offset, const float value) {
+    const uint bits = packHalf2x16(vec2(value, 0.0));
+    v_store_byte(offset, bits & 0xffu);
+    v_store_byte(offset + 1u, (bits >> 8u) & 0xffu);
+}
+
+int round_away(const float value) {
+    return int(value >= 0.0 ? floor(value + 0.5) : ceil(value - 0.5));
+}
+
+void quantize_k_row(const uint row) {
+    const uint n_blocks = p.head_dim / PAGED_ATTN_QK;
+    for (uint ib = 0u; ib < n_blocks; ++ib) {
+        float amax = 0.0;
+#if PAGED_ATTN_QTYPE == 4
+        float max_value = 0.0;
+        for (uint j = 0u; j < PAGED_ATTN_QK; ++j) {
+            const float value = values[ib * PAGED_ATTN_QK + j];
+            if (amax < abs(value)) {
+                amax = abs(value);
+                max_value = value;
+            }
+        }
+        const float d = max_value / -8.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint block = row + ib * PAGED_ATTN_BLOCK_BYTES;
+        k_store_half(block, d);
+        for (uint j = 0u; j < PAGED_ATTN_QK / 2u; ++j) {
+            const uint lo = uint(values[ib * PAGED_ATTN_QK + j] * id + 8.5);
+            const uint hi = uint(values[ib * PAGED_ATTN_QK + 16u + j] * id + 8.5);
+            k_store_byte(block + 2u + j, min(lo, 15u) | (min(hi, 15u) << 4u));
+        }
+#else
+        for (uint j = 0u; j < PAGED_ATTN_QK; ++j) {
+            amax = max(amax, abs(values[ib * PAGED_ATTN_QK + j]));
+        }
+        const float d = amax / 127.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint block = row + ib * PAGED_ATTN_BLOCK_BYTES;
+        k_store_half(block, d);
+        for (uint j = 0u; j < PAGED_ATTN_QK; ++j) {
+            const int q = clamp(round_away(values[ib * PAGED_ATTN_QK + j] * id), -128, 127);
+            k_store_byte(block + 2u + j, uint(q) & 0xffu);
+        }
+#endif
+    }
+}
+
+void quantize_v_row(const uint row) {
+    const uint n_blocks = p.head_dim / PAGED_ATTN_QK;
+    for (uint ib = 0u; ib < n_blocks; ++ib) {
+        float amax = 0.0;
+#if PAGED_ATTN_QTYPE == 4
+        float max_value = 0.0;
+        for (uint j = 0u; j < PAGED_ATTN_QK; ++j) {
+            const float value = values[ib * PAGED_ATTN_QK + j];
+            if (amax < abs(value)) {
+                amax = abs(value);
+                max_value = value;
+            }
+        }
+        const float d = max_value / -8.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint block = row + ib * PAGED_ATTN_BLOCK_BYTES;
+        v_store_half(block, d);
+        for (uint j = 0u; j < PAGED_ATTN_QK / 2u; ++j) {
+            const uint lo = uint(values[ib * PAGED_ATTN_QK + j] * id + 8.5);
+            const uint hi = uint(values[ib * PAGED_ATTN_QK + 16u + j] * id + 8.5);
+            v_store_byte(block + 2u + j, min(lo, 15u) | (min(hi, 15u) << 4u));
+        }
+#else
+        for (uint j = 0u; j < PAGED_ATTN_QK; ++j) {
+            amax = max(amax, abs(values[ib * PAGED_ATTN_QK + j]));
+        }
+        const float d = amax / 127.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        const uint block = row + ib * PAGED_ATTN_BLOCK_BYTES;
+        v_store_half(block, d);
+        for (uint j = 0u; j < PAGED_ATTN_QK; ++j) {
+            const int q = clamp(round_away(values[ib * PAGED_ATTN_QK + j] * id), -128, 127);
+            v_store_byte(block + 2u + j, uint(q) & 0xffu);
+        }
+#endif
+    }
+}
+
+float k_value(const uint row, const uint index) {
+    const uint block = row + (index / PAGED_ATTN_QK) * PAGED_ATTN_BLOCK_BYTES;
+    const float d = k_scale(block);
+#if PAGED_ATTN_QTYPE == 4
+    const uint q = k_byte(block + 2u + index / 2u);
+    return float((index < 16u ? q & 0xfu : q >> 4u)) * d - 8.0 * d;
+#else
+    const int q = int(k_byte(block + 2u + index));
+    return float(q < 128 ? q : q - 256) * d;
+#endif
+}
+
+float v_value(const uint row, const uint index) {
+    const uint block = row + (index / PAGED_ATTN_QK) * PAGED_ATTN_BLOCK_BYTES;
+    const float d = v_scale(block);
+#if PAGED_ATTN_QTYPE == 4
+    const uint q = v_byte(block + 2u + index / 2u);
+    return float((index < 16u ? q & 0xfu : q >> 4u)) * d - 8.0 * d;
+#else
+    const int q = int(v_byte(block + 2u + index));
+    return float(q < 128 ? q : q - 256) * d;
+#endif
+}
+
+void write_cache() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    if (head >= p.n_heads_kv || seq >= p.n_seq || tid >= p.head_dim) {
+        return;
+    }
+
+    const uint seq_start = data_batch_offsets[seq];
+    const uint num_tokens = data_batch_lens[seq];
+    for (uint i = 0u; i < num_tokens; ++i) {
+        const uint token = seq_start + i;
+        const uint slot = data_write_slots[token];
+        const uint block = slot / p.block_size;
+        const uint token_in_block = slot % p.block_size;
+        const uint row = block * p.kv_block_stride + head * p.kv_head_stride + token_in_block * p.kv_token_stride;
+        const uint src_index = token * p.k_token_stride + head * p.k_head_stride + tid;
+
+        values[tid] = data_k_new[src_index];
+        barrier();
+        if (tid == 0u) {
+            // ponytail: serialize one quantized row; parallelize block writes only if profiling shows write bandwidth matters.
+            quantize_k_row(row);
+        }
+        barrier();
+
+        values[tid] = data_v_new[src_index];
+        barrier();
+        if (tid == 0u) {
+            quantize_v_row(row + p.n_heads_kv * p.kv_head_stride);
+        }
+        barrier();
+    }
+}
+
+void decode() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    if (head >= p.n_heads || seq >= p.n_seq || tid >= p.head_dim) {
+        return;
+    }
+
+    const uint kv_head = head / (p.n_heads / p.n_heads_kv);
+    const uint num_new_tokens = data_batch_lens[seq];
+    const uint context_len = data_context_lens[seq];
+    for (uint i = 0u; i < num_new_tokens; ++i) {
+        const uint token = data_batch_offsets[seq] + i;
+        const float q_value = data_q[token * p.q_token_stride + head * p.q_head_stride + tid] * p.scale;
+        float qk_max = -3.402823466e+38;
+        float exp_sum = 0.0;
+        float acc = 0.0;
+        const uint q_pos = context_len - num_new_tokens + i;
+        const uint num_blocks = q_pos / p.block_size + 1u;
+
+        for (uint bid = 0u; bid < num_blocks; ++bid) {
+            const uint physical_block = data_block_table[seq * p.max_blocks + bid];
+            const uint start_token = bid * p.block_size;
+            const uint end_token = min(start_token + p.block_size, q_pos + 1u);
+            for (uint cached_token = start_token; cached_token < end_token; ++cached_token) {
+                const uint token_in_block = cached_token % p.block_size;
+                const uint k_row = physical_block * p.kv_block_stride + kv_head * p.kv_head_stride + token_in_block * p.kv_token_stride;
+                const uint v_row = k_row + p.n_heads_kv * p.kv_head_stride;
+                const float k = k_value(k_row, tid);
+                const float v = v_value(v_row, tid);
+
+                reduce[tid] = q_value * k;
+                barrier();
+                if (tid == 0u) {
+                    float sum = 0.0;
+                    for (uint d = 0u; d < p.head_dim; ++d) {
+                        sum += reduce[d];
+                    }
+                    reduced_qk = sum;
+                }
+                barrier();
+
+                const float qk = reduced_qk;
+                const float qk_max_new = max(qk_max, qk);
+                const float exp_old = exp(qk_max - qk_max_new);
+                const float exp_new = exp(qk - qk_max_new);
+                exp_sum = exp_sum * exp_old + exp_new;
+                acc = acc * exp_old + exp_new * v;
+                qk_max = qk_max_new;
+            }
+        }
+        data_out[token * p.out_token_stride + head * p.out_head_stride + tid] = acc / (exp_sum + 1e-6);
+    }
+}
+
+void main() {
+    if (p.mode == 0u) {
+        write_cache();
+    } else {
+        decode();
+    }
+}

@@ -8050,7 +8050,8 @@ struct ggml_tensor * ggml_paged_attn(
     struct ggml_tensor  * batch_lens,
     float                 scale,
     int                   block_size,
-    int                   max_blocks) {
+    int                   max_blocks,
+    int                   active_context) {
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), q->ne);
     result->op = GGML_OP_PAGED_ATTN;
@@ -8071,6 +8072,7 @@ struct ggml_tensor * ggml_paged_attn(
     int32_t * op_params_i = (int32_t *) (op_params_f + 1);
     op_params_i[0] = block_size;
     op_params_i[1] = max_blocks;
+    op_params_i[2] = active_context;
 
     return result;
 }

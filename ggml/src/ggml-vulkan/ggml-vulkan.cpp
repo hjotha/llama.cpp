@@ -1413,6 +1413,10 @@ struct vk_paged_attn_push_constants {
     uint32_t out_head_stride;
     uint32_t out_token_stride;
     float scale;
+    uint32_t max_context;
+    uint32_t context_groups;
+    uint32_t partial_offset;
+    uint32_t token_offset;
 };
 static_assert(sizeof(vk_paged_attn_push_constants) <= 128, "sizeof(vk_paged_attn_push_constants) must be <= 128");
 
@@ -5499,16 +5503,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
-    if (device->fp16) {
-        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d128, "paged_attn_f16_d128", paged_attn_f16_d128_len, paged_attn_f16_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+    if (device->fp16 && device->subgroup_basic && device->subgroup_arithmetic) {
+        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d128, "paged_attn_f16_d128", paged_attn_f16_d128_len, paged_attn_f16_d128_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         if (device->max_workgroup_size_log2 >= 8) {
-            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d256, "paged_attn_f16_d256", paged_attn_f16_d256_len, paged_attn_f16_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d256, "paged_attn_f16_d256", paged_attn_f16_d256_len, paged_attn_f16_d256_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         }
-        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q4_d128, "paged_attn_q4_d128", paged_attn_q4_d128_len, paged_attn_q4_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q8_d128, "paged_attn_q8_d128", paged_attn_q8_d128_len, paged_attn_q8_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q4_d128, "paged_attn_q4_d128", paged_attn_q4_d128_len, paged_attn_q4_d128_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q8_d128, "paged_attn_q8_d128", paged_attn_q8_d128_len, paged_attn_q8_d128_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         if (device->max_workgroup_size_log2 >= 8) {
-            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q4_d256, "paged_attn_q4_d256", paged_attn_q4_d256_len, paged_attn_q4_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
-            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q8_d256, "paged_attn_q8_d256", paged_attn_q8_d256_len, paged_attn_q8_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q4_d256, "paged_attn_q4_d256", paged_attn_q4_d256_len, paged_attn_q4_d256_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_q8_d256, "paged_attn_q8_d256", paged_attn_q8_d256_len, paged_attn_q8_d256_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         }
     }
 
@@ -11098,6 +11102,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 }
 
 static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    static constexpr uint32_t max_context_groups = 16;
+    static constexpr uint32_t parallel_max_tokens = 4;
+    static constexpr uint32_t parallel_min_context = 2048;
+
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_new         = dst->src[1];
     const ggml_tensor * v_new         = dst->src[2];
@@ -11110,13 +11118,31 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const ggml_tensor * batch_lens    = dst->src[9];
 
     const float * op_params_f = (const float *) dst->op_params;
-    const int block_size      = ((const int32_t *) (op_params_f + 1))[0];
-    const int max_blocks      = ((const int32_t *) (op_params_f + 2))[0];
+    const int32_t * op_params_i = (const int32_t *) (op_params_f + 1);
+    const int block_size      = op_params_i[0];
+    const int max_blocks      = op_params_i[1];
+    const uint32_t active_context = (uint32_t) std::max(op_params_i[2], 1);
 
     const uint32_t head_dim   = (uint32_t) q->ne[0];
     const uint32_t n_heads    = (uint32_t) q->ne[1];
     const uint32_t n_heads_kv = (uint32_t) k_new->ne[1];
     const uint32_t n_seq      = (uint32_t) batch_lens->ne[0];
+    const uint32_t n_tokens   = (uint32_t) q->ne[2];
+    const uint32_t context_groups = std::min(max_context_groups, (active_context + 511) / 512);
+    // The graph may be reused while context_lens keeps growing. Size scratch for the
+    // block-table capacity, not the active-context snapshot embedded in op_params.
+    const uint32_t scratch_context = (uint32_t) max_blocks * (uint32_t) block_size;
+    const uint32_t chunk_tokens = std::min(parallel_max_tokens, n_tokens);
+    const uint64_t score_count = (uint64_t) chunk_tokens * n_heads * scratch_context;
+    const uint64_t partial_count = (uint64_t) chunk_tokens * n_heads * context_groups * head_dim;
+    const uint64_t scratch_size = (score_count + partial_count) * sizeof(float);
+    const uint32_t gqa_ratio = n_heads / n_heads_kv;
+    // The temporary score/partial layout is shared across sequences. Keep the
+    // split path single-sequence until the shaders include seq in that layout.
+    const bool parallel_decode = n_seq == 1 &&
+                                 active_context >= parallel_min_context &&
+                                 gqa_ratio <= 8 &&
+                                 scratch_size <= ctx->device->properties.limits.maxStorageBufferRange;
 
     GGML_ASSERT(head_dim == 128 || head_dim == 256);
     GGML_ASSERT(n_heads != 0 && n_heads_kv != 0 && n_heads % n_heads_kv == 0);
@@ -11138,7 +11164,18 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         pipeline = head_dim == 256 ? ctx->device->pipeline_paged_attn_q8_d256 : ctx->device->pipeline_paged_attn_q8_d128;
     }
     GGML_ASSERT(pipeline);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline,
+        parallel_decode ? 1 + 4 * CEIL_DIV(n_tokens, parallel_max_tokens) : 2);
+
+    if (parallel_decode) {
+        if (ctx->prealloc_size_split_k < scratch_size) {
+            ctx->prealloc_size_split_k = scratch_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
 
     const uint32_t kv_stride_unit = kv_f16 ? sizeof(ggml_fp16_t) : 1;
 
@@ -11156,6 +11193,10 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         (uint32_t) (dst->nb[1]           / sizeof(float)),
         (uint32_t) (dst->nb[2]           / sizeof(float)),
         op_params_f[0],
+        scratch_context,
+        context_groups,
+        (uint32_t) score_count,
+        0,
     };
 
     const vk_subbuffer q_buf             = ggml_vk_tensor_subbuffer(ctx, q);
@@ -11169,11 +11210,14 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const vk_subbuffer batch_offsets_buf = ggml_vk_tensor_subbuffer(ctx, batch_offsets);
     const vk_subbuffer batch_lens_buf    = ggml_vk_tensor_subbuffer(ctx, batch_lens);
     const vk_subbuffer dst_buf           = ggml_vk_tensor_subbuffer(ctx, dst);
+    const vk_subbuffer scratch_buf       = parallel_decode
+        ? ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0)
+        : q_buf;
 
     const std::initializer_list<vk::DescriptorBufferInfo> buffers = {
         q_buf, k_new_buf, v_new_buf, k_cache_buf, v_cache_buf,
         block_table_buf, write_slots_buf, context_lens_buf,
-        batch_offsets_buf, batch_lens_buf, dst_buf,
+        batch_offsets_buf, batch_lens_buf, dst_buf, scratch_buf,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, pc,
@@ -11181,9 +11225,35 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     ggml_vk_sync_buffers(ctx, subctx);
 
     auto decode_pc = pc;
-    decode_pc.mode = 1;
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
-                              { n_heads, n_seq, 1 });
+    if (parallel_decode) {
+        for (uint32_t token_offset = 0; token_offset < n_tokens; token_offset += parallel_max_tokens) {
+            const uint32_t tokens = std::min(parallel_max_tokens, n_tokens - token_offset);
+            decode_pc.token_offset = token_offset;
+            decode_pc.mode = 2;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
+                                      { n_heads_kv, n_seq, tokens * context_groups });
+            ggml_vk_sync_buffers(ctx, subctx);
+            decode_pc.mode = 3;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
+                                      { n_heads, n_seq, tokens });
+            ggml_vk_sync_buffers(ctx, subctx);
+            decode_pc.mode = 4;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
+                                      { n_heads_kv, n_seq, tokens * context_groups });
+            ggml_vk_sync_buffers(ctx, subctx);
+            decode_pc.mode = 5;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
+                                      { n_heads, n_seq, tokens });
+            ctx->prealloc_split_k_need_sync = true;
+            if (n_tokens > parallel_max_tokens) {
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+        }
+    } else {
+        decode_pc.mode = 1;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
+                                  { n_heads, n_seq, 1 });
+    }
 }
 
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
@@ -18298,8 +18368,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_PAGED_ATTN:
             {
-                if (!device->fp16) {
+                auto reject = [&](const char * reason) {
+                    GGML_LOG_INFO("%s: rejecting PAGED_ATTN on Vulkan%zu: %s\n", __func__, ctx->device, reason);
                     return false;
+                };
+                if (op->src[3]->buffer) {
+                    const auto buft = op->src[3]->buffer->buft;
+                    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name ||
+                        ((ggml_backend_vk_buffer_type_context *) buft->context)->device->idx != ctx->device) {
+                        return reject("KV buffer belongs to another backend");
+                    }
+                }
+                if (!device->fp16 || !device->subgroup_basic || !device->subgroup_arithmetic) {
+                    return reject("required fp16/subgroup feature missing");
                 }
                 const bool kv_f16 = op->src[3]->type == GGML_TYPE_F16;
                 const bool kv_q4  = op->src[3]->type == GGML_TYPE_Q4_0;
@@ -18315,7 +18396,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     op->src[8]->type != GGML_TYPE_I32 ||
                     op->src[9]->type != GGML_TYPE_I32 ||
                     op->type != GGML_TYPE_F32) {
-                    return false;
+                    return reject("unsupported tensor type");
                 }
                 const int block_size = ggml_get_op_params_i32(op, 1);
                 const int max_blocks = ggml_get_op_params_i32(op, 2);
@@ -18327,7 +18408,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                            t->nb[3] == t->nb[2] * t->ne[2];
                 };
                 if ((kv_q4 || kv_q8) && head_dim % ggml_blck_size(op->src[3]->type) != 0) {
-                    return false;
+                    return reject("quantized head dimension is not block aligned");
                 }
                 const size_t kv_row_bytes = kv_f16 ? sizeof(ggml_fp16_t) * head_dim : ggml_row_size(op->src[3]->type, head_dim);
                 const bool kv_contiguous = kv_f16 ?
@@ -18353,10 +18434,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     op->src[7]->nb[0] != sizeof(int32_t) ||
                     op->src[8]->nb[0] != sizeof(int32_t) ||
                     op->src[9]->nb[0] != sizeof(int32_t)) {
-                    return false;
+                    return reject("unsupported tensor shape or stride");
                 }
                 if (head_dim != 128 && (head_dim != 256 || device->max_workgroup_size_log2 < 8)) {
-                    return false;
+                    return reject("unsupported head dimension or workgroup size");
                 }
                 return
                        op->src[0]->ne[1] > 0 &&
@@ -19335,7 +19416,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_paged_attn(ggml_ctx,
                                            src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4],
                                            src_clone[5], src_clone[6], src_clone[7], src_clone[8], src_clone[9],
-                                           params[0], params_i[0], params_i[1]);
+                                           params[0], params_i[0], params_i[1], params_i[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

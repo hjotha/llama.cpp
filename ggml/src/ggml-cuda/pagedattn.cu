@@ -2,9 +2,12 @@
 
 #include "cpy-utils.cuh"
 #include "dequantize.cuh"
+#include "fattn.cuh"
 
 static constexpr int PAGED_ATTN_CONTEXT_CTAS = 64;
+static constexpr int PAGED_ATTN_VALUE_CTAS = 32;
 static constexpr int PAGED_ATTN_PARALLEL_MAX_TOKENS = 4;
+static constexpr int PAGED_ATTN_FA_STRIDE = 256;
 
 __device__ __forceinline__ float paged_warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -45,7 +48,9 @@ __device__ __forceinline__ float paged_block_reduce_sum(float val, float * smem,
         }
     }
     __syncthreads();
-    return smem[0];
+    const float result = smem[0];
+    __syncthreads();
+    return result;
 }
 
 __device__ __forceinline__ float paged_block_reduce_max(float val, float * smem, int tid, int n_threads) {
@@ -65,7 +70,9 @@ __device__ __forceinline__ float paged_block_reduce_max(float val, float * smem,
         }
     }
     __syncthreads();
-    return smem[0];
+    const float result = smem[0];
+    __syncthreads();
+    return result;
 }
 
 __global__ void paged_attention_write_kernel(const float * __restrict__ k_new,  // [batch_size, n_heads_kv, head_dim]
@@ -200,6 +207,164 @@ static __device__ __forceinline__ float paged_cache_value(
 }
 
 template<typename block_t, bool quantized>
+static __global__ void paged_attention_gather_f16_kernel(
+        const void * __restrict__ kv_cache,
+        const int * __restrict__ block_table,
+        const size_t stride_token,
+        const size_t stride_head,
+        const size_t stride_block,
+        const int n_heads_kv,
+        const int block_size,
+        const int context_len,
+        const int padded_context,
+        half * __restrict__ k_f16,
+        half * __restrict__ v_f16) {
+    const int token    = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int dim      = threadIdx.x;
+    const int head_dim = blockDim.x;
+    float k = 0.0f;
+    float v = 0.0f;
+
+    if (token < context_len) {
+        const int bid            = token / block_size;
+        const int token_in_block = token % block_size;
+        const int physical_block = block_table[bid];
+        const size_t k_offset = (size_t) physical_block * stride_block +
+                                (size_t) head_idx * stride_head +
+                                (size_t) token_in_block * stride_token;
+        const size_t v_offset = (size_t) physical_block * stride_block +
+                                (size_t) (n_heads_kv + head_idx) * stride_head +
+                                (size_t) token_in_block * stride_token;
+        k = paged_cache_value<block_t, quantized>(kv_cache, k_offset, dim);
+        v = paged_cache_value<block_t, quantized>(kv_cache, v_offset, dim);
+    }
+
+    const size_t out = ((size_t) head_idx * padded_context + token) * head_dim + dim;
+    k_f16[out] = __float2half(k);
+    v_f16[out] = __float2half(v);
+}
+
+static __global__ void paged_attention_mask_f16_kernel(
+        const int context_len,
+        const int n_tokens,
+        const int padded_context,
+        half * __restrict__ mask) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    const int query = blockIdx.y;
+    if (token >= padded_context) {
+        return;
+    }
+
+    const int query_pos = context_len - n_tokens + query;
+    mask[(size_t) query * padded_context + token] =
+        token <= query_pos ? __float2half(0.0f) : __float2half(-INFINITY);
+}
+
+template<typename block_t, bool quantized>
+static bool ggml_cuda_paged_attn_prefill(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_tensor * q,
+        const ggml_tensor * k_new,
+        const ggml_tensor * kv_cache,
+        const ggml_tensor * block_table,
+        const ggml_tensor * batch_lens,
+        const size_t stride_token,
+        const size_t stride_head,
+        const size_t stride_block,
+        const int block_size,
+        const int max_blocks,
+        const float scale) {
+    const int head_dim       = q->ne[0];
+    const int n_heads        = q->ne[1];
+    const int n_tokens       = q->ne[2];
+    const int n_heads_kv     = k_new->ne[1];
+    const int n_seq          = batch_lens->ne[0];
+    const int active_context = ((const int32_t *) ((const float *) dst->op_params + 1))[2];
+    if (n_seq != 1 || n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || active_context <= 0) {
+        return false;
+    }
+
+    const int padded_context = (active_context + PAGED_ATTN_FA_STRIDE - 1) &
+                               ~(PAGED_ATTN_FA_STRIDE - 1);
+    GGML_ASSERT(padded_context <= max_blocks * block_size);
+
+    ggml_cuda_pool_alloc<half> k_f16(ctx.pool(),
+        (size_t) padded_context * n_heads_kv * head_dim);
+    ggml_cuda_pool_alloc<half> v_f16(ctx.pool(),
+        (size_t) padded_context * n_heads_kv * head_dim);
+    ggml_cuda_pool_alloc<half> mask(ctx.pool(), (size_t) padded_context * n_tokens);
+
+    paged_attention_gather_f16_kernel<block_t, quantized><<<
+        dim3(padded_context, n_heads_kv), dim3(head_dim), 0, ctx.stream()>>>(
+            kv_cache->data, (const int *) block_table->data,
+            stride_token, stride_head, stride_block, n_heads_kv,
+            block_size, active_context, padded_context, k_f16.ptr, v_f16.ptr);
+    paged_attention_mask_f16_kernel<<<
+        dim3((padded_context + 255) / 256, n_tokens), dim3(256), 0, ctx.stream()>>>(
+            active_context, n_tokens, padded_context, mask.ptr);
+
+    ggml_tensor q_fa = *q;
+    q_fa.ne[1] = n_tokens;
+    q_fa.ne[2] = n_heads;
+    q_fa.ne[3] = 1;
+    q_fa.nb[0] = sizeof(float);
+    q_fa.nb[1] = (size_t) head_dim * n_heads * sizeof(float);
+    q_fa.nb[2] = (size_t) head_dim * sizeof(float);
+    q_fa.nb[3] = (size_t) head_dim * n_heads * n_tokens * sizeof(float);
+
+    ggml_tensor k_fa = *kv_cache;
+    k_fa.type = GGML_TYPE_F16;
+    k_fa.data = k_f16.ptr;
+    k_fa.view_src = nullptr;
+    k_fa.view_offs = 0;
+    k_fa.ne[0] = head_dim;
+    k_fa.ne[1] = padded_context;
+    k_fa.ne[2] = n_heads_kv;
+    k_fa.ne[3] = 1;
+    k_fa.nb[0] = sizeof(half);
+    k_fa.nb[1] = (size_t) head_dim * sizeof(half);
+    k_fa.nb[2] = (size_t) head_dim * padded_context * sizeof(half);
+    k_fa.nb[3] = (size_t) head_dim * padded_context * n_heads_kv * sizeof(half);
+
+    ggml_tensor v_fa = k_fa;
+    v_fa.data = v_f16.ptr;
+    v_fa.view_src = nullptr;
+
+    ggml_tensor mask_fa = k_fa;
+    mask_fa.data = mask.ptr;
+    mask_fa.view_src = nullptr;
+    mask_fa.ne[0] = padded_context;
+    mask_fa.ne[1] = n_tokens;
+    mask_fa.ne[2] = 1;
+    mask_fa.ne[3] = 1;
+    mask_fa.nb[0] = sizeof(half);
+    mask_fa.nb[1] = (size_t) padded_context * sizeof(half);
+    mask_fa.nb[2] = mask_fa.nb[1] * n_tokens;
+    mask_fa.nb[3] = mask_fa.nb[2];
+
+    ggml_tensor fa = *dst;
+    fa.op = GGML_OP_FLASH_ATTN_EXT;
+    memset(fa.op_params, 0, sizeof(fa.op_params));
+    ((float *) fa.op_params)[0] = scale;
+    ((int32_t *) fa.op_params)[3] = GGML_PREC_F32;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        fa.src[i] = nullptr;
+    }
+    fa.src[0] = &q_fa;
+    fa.src[1] = &k_fa;
+    fa.src[2] = &v_fa;
+    fa.src[3] = &mask_fa;
+
+    if (!ggml_cuda_flash_attn_ext_supported(ctx.device, &fa)) {
+        return false;
+    }
+    ggml_cuda_flash_attn_ext(ctx, &fa);
+    return true;
+}
+
+template<typename block_t, bool quantized>
 static __global__ void paged_attention_score_kernel(
         const float * __restrict__ q,
         const void * __restrict__ kv_cache,
@@ -263,8 +428,9 @@ static __global__ void paged_attention_score_kernel(
     }
 }
 
-template<typename block_t, bool quantized>
-static __global__ void paged_attention_value_kernel(
+template<typename block_t, bool quantized, int GQA>
+static __global__ void paged_attention_score_gqa_kernel(
+        const float * __restrict__ q,
         const void * __restrict__ kv_cache,
         const int * __restrict__ block_table,
         const int * __restrict__ context_lens,
@@ -273,12 +439,74 @@ static __global__ void paged_attention_value_kernel(
         const size_t stride_token,
         const size_t stride_head,
         const size_t stride_block,
-        const int n_heads_kv,
         const int block_size,
         const int max_blocks,
+        const float scale,
+        const size_t max_context,
+        float * __restrict__ scores) {
+    extern __shared__ float q_shared[];
+
+    const int kv_head_idx = blockIdx.x;
+    const int seq_idx     = blockIdx.y;
+    const int context_cta = blockIdx.z % PAGED_ATTN_CONTEXT_CTAS;
+    const int token_idx   = blockIdx.z / PAGED_ATTN_CONTEXT_CTAS;
+    const int tid         = threadIdx.x;
+    const int lane        = tid & 31;
+    const int warp_id     = tid >> 5;
+    const int head_dim    = blockDim.x;
+    const int n_warps     = head_dim >> 5;
+    const int n_heads     = gridDim.x * GQA;
+    const int seq_start   = batch_offsets[seq_idx];
+    const int num_tokens  = batch_lens[seq_idx];
+    if (token_idx >= num_tokens) {
+        return;
+    }
+
+    const int token_batch_idx = seq_start + token_idx;
+    for (int g = 0; g < GQA; ++g) {
+        const int head_idx = kv_head_idx * GQA + g;
+        const size_t q_offset = (size_t) token_batch_idx * n_heads * head_dim +
+                                (size_t) head_idx * head_dim;
+        q_shared[g * head_dim + tid] = q[q_offset + tid] * scale;
+    }
+    __syncthreads();
+
+    const int q_pos = context_lens[seq_idx] - num_tokens + token_idx;
+    for (int token = context_cta * n_warps + warp_id;
+         token <= q_pos;
+         token += PAGED_ATTN_CONTEXT_CTAS * n_warps) {
+        const int bid            = token / block_size;
+        const int token_in_block = token % block_size;
+        const int physical_block = block_table[seq_idx * max_blocks + bid];
+        const size_t k_offset = (size_t) physical_block * stride_block +
+                                (size_t) kv_head_idx * stride_head +
+                                (size_t) token_in_block * stride_token;
+        float qk[GQA] = {};
+        for (int dim = lane; dim < head_dim; dim += 32) {
+            const float k = paged_cache_value<block_t, quantized>(kv_cache, k_offset, dim);
+            for (int g = 0; g < GQA; ++g) {
+                qk[g] += q_shared[g * head_dim + dim] * k;
+            }
+        }
+        for (int g = 0; g < GQA; ++g) {
+            qk[g] = paged_warp_reduce_sum(qk[g]);
+            if (lane == 0) {
+                const int head_idx = kv_head_idx * GQA + g;
+                float * score_row = scores +
+                    ((size_t) token_batch_idx * n_heads + head_idx) * max_context;
+                score_row[token] = qk[g];
+            }
+        }
+    }
+}
+
+static __global__ void paged_attention_softmax_kernel(
+        const int * __restrict__ context_lens,
+        const int * __restrict__ batch_offsets,
+        const int * __restrict__ batch_lens,
         const size_t max_context,
         float * __restrict__ scores,
-        float * __restrict__ out) {
+        float * __restrict__ inv_sum) {
     extern __shared__ float smem[];
 
     const int head_idx   = blockIdx.x;
@@ -287,7 +515,6 @@ static __global__ void paged_attention_value_kernel(
     const int tid        = threadIdx.x;
     const int n_heads    = gridDim.x;
     const int head_dim   = blockDim.x;
-    const int kv_head_idx = head_idx / (n_heads / n_heads_kv);
     const int seq_start   = batch_offsets[seq_idx];
     const int num_tokens  = batch_lens[seq_idx];
     if (token_idx >= num_tokens) {
@@ -312,8 +539,46 @@ static __global__ void paged_attention_value_kernel(
     }
     const float exp_sum = paged_block_reduce_sum(local_sum, smem, tid, head_dim);
 
+    if (tid == 0) {
+        inv_sum[(size_t) token_batch_idx * n_heads + head_idx] = 1.0f / (exp_sum + 1e-6f);
+    }
+}
+
+template<typename block_t, bool quantized>
+static __global__ void paged_attention_vdot_kernel(
+        const void * __restrict__ kv_cache,
+        const int * __restrict__ block_table,
+        const int * __restrict__ context_lens,
+        const int * __restrict__ batch_offsets,
+        const int * __restrict__ batch_lens,
+        const size_t stride_token,
+        const size_t stride_head,
+        const size_t stride_block,
+        const int n_heads_kv,
+        const int block_size,
+        const int max_blocks,
+        const size_t max_context,
+        const float * __restrict__ scores,
+        float * __restrict__ partial) {
+    const int head_idx    = blockIdx.x;
+    const int seq_idx     = blockIdx.y;
+    const int value_cta   = blockIdx.z % PAGED_ATTN_VALUE_CTAS;
+    const int token_idx   = blockIdx.z / PAGED_ATTN_VALUE_CTAS;
+    const int tid         = threadIdx.x;
+    const int n_heads     = gridDim.x;
+    const int kv_head_idx = head_idx / (n_heads / n_heads_kv);
+    const int seq_start   = batch_offsets[seq_idx];
+    const int num_tokens  = batch_lens[seq_idx];
+    if (token_idx >= num_tokens) {
+        return;
+    }
+
+    const int token_batch_idx = seq_start + token_idx;
+    const int q_pos = context_lens[seq_idx] - num_tokens + token_idx;
+    const float * score_row = scores + ((size_t) token_batch_idx * n_heads + head_idx) * max_context;
+
     float acc = 0.0f;
-    for (int token = 0; token <= q_pos; ++token) {
+    for (int token = value_cta; token <= q_pos; token += PAGED_ATTN_VALUE_CTAS) {
         const int bid            = token / block_size;
         const int token_in_block = token % block_size;
         const int physical_block = block_table[seq_idx * max_blocks + bid];
@@ -323,9 +588,93 @@ static __global__ void paged_attention_value_kernel(
         acc += score_row[token] * paged_cache_value<block_t, quantized>(kv_cache, v_offset, tid);
     }
 
-    const size_t out_idx = (size_t) token_batch_idx * n_heads * head_dim +
-                           (size_t) head_idx * head_dim + tid;
-    out[out_idx] = acc / (exp_sum + 1e-6f);
+    const size_t partial_idx = (((size_t) token_batch_idx * n_heads + head_idx) *
+                                PAGED_ATTN_VALUE_CTAS + value_cta) * blockDim.x + tid;
+    partial[partial_idx] = acc;
+}
+
+template<typename block_t, bool quantized, int GQA>
+static __global__ void paged_attention_vdot_gqa_kernel(
+        const void * __restrict__ kv_cache,
+        const int * __restrict__ block_table,
+        const int * __restrict__ context_lens,
+        const int * __restrict__ batch_offsets,
+        const int * __restrict__ batch_lens,
+        const size_t stride_token,
+        const size_t stride_head,
+        const size_t stride_block,
+        const int n_heads_kv,
+        const int block_size,
+        const int max_blocks,
+        const size_t max_context,
+        const float * __restrict__ scores,
+        float * __restrict__ partial) {
+    const int kv_head_idx = blockIdx.x;
+    const int seq_idx     = blockIdx.y;
+    const int value_cta   = blockIdx.z % PAGED_ATTN_VALUE_CTAS;
+    const int token_idx   = blockIdx.z / PAGED_ATTN_VALUE_CTAS;
+    const int tid         = threadIdx.x;
+    const int n_heads     = gridDim.x * GQA;
+    const int seq_start   = batch_offsets[seq_idx];
+    const int num_tokens  = batch_lens[seq_idx];
+    if (token_idx >= num_tokens) {
+        return;
+    }
+
+    const int token_batch_idx = seq_start + token_idx;
+    const int q_pos = context_lens[seq_idx] - num_tokens + token_idx;
+    float acc[GQA] = {};
+    for (int token = value_cta; token <= q_pos; token += PAGED_ATTN_VALUE_CTAS) {
+        const int bid            = token / block_size;
+        const int token_in_block = token % block_size;
+        const int physical_block = block_table[seq_idx * max_blocks + bid];
+        const size_t v_offset = (size_t) physical_block * stride_block +
+                                (size_t) (n_heads_kv + kv_head_idx) * stride_head +
+                                (size_t) token_in_block * stride_token;
+        const float v = paged_cache_value<block_t, quantized>(kv_cache, v_offset, tid);
+        for (int g = 0; g < GQA; ++g) {
+            const int head_idx = kv_head_idx * GQA + g;
+            const float * score_row = scores +
+                ((size_t) token_batch_idx * n_heads + head_idx) * max_context;
+            acc[g] += score_row[token] * v;
+        }
+    }
+
+    for (int g = 0; g < GQA; ++g) {
+        const int head_idx = kv_head_idx * GQA + g;
+        const size_t partial_idx = (((size_t) token_batch_idx * n_heads + head_idx) *
+                                    PAGED_ATTN_VALUE_CTAS + value_cta) * blockDim.x + tid;
+        partial[partial_idx] = acc[g];
+    }
+}
+
+static __global__ void paged_attention_vreduce_kernel(
+        const int * __restrict__ batch_offsets,
+        const int * __restrict__ batch_lens,
+        const float * __restrict__ partial,
+        const float * __restrict__ inv_sum,
+        float * __restrict__ out) {
+    const int head_idx   = blockIdx.x;
+    const int seq_idx    = blockIdx.y;
+    const int token_idx  = blockIdx.z;
+    const int tid        = threadIdx.x;
+    const int n_heads    = gridDim.x;
+    const int seq_start  = batch_offsets[seq_idx];
+    const int num_tokens = batch_lens[seq_idx];
+    if (token_idx >= num_tokens) {
+        return;
+    }
+
+    const int token_batch_idx = seq_start + token_idx;
+    const size_t partial_base = ((size_t) token_batch_idx * n_heads + head_idx) *
+                                PAGED_ATTN_VALUE_CTAS * blockDim.x + tid;
+    float acc = 0.0f;
+    for (int value_cta = 0; value_cta < PAGED_ATTN_VALUE_CTAS; ++value_cta) {
+        acc += partial[partial_base + (size_t) value_cta * blockDim.x];
+    }
+
+    const size_t out_idx = ((size_t) token_batch_idx * n_heads + head_idx) * blockDim.x + tid;
+    out[out_idx] = acc * inv_sum[(size_t) token_batch_idx * n_heads + head_idx];
 }
 
 template<typename block_t, int QK>
@@ -493,23 +842,59 @@ static void ggml_cuda_op_paged_attn_quantized(ggml_backend_cuda_context & ctx, g
         (const int *) write_slots->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
         stride_token, stride_head, stride_block, n_heads_kv, block_size);
 
+    if (ggml_cuda_paged_attn_prefill<block_t, true>(
+            ctx, dst, q, k_new, kv_cache, block_table, batch_lens,
+            stride_token, stride_head, stride_block, block_size, max_blocks, scale)) {
+        return;
+    }
+
     const size_t reduce_smem = (size_t) ((head_dim + 31) / 32) * sizeof(float);
     if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS) {
         const size_t max_context = (size_t) max_blocks * block_size;
         ggml_cuda_pool_alloc<float> scores(ctx.pool(), (size_t) n_tokens * n_heads * max_context);
-        paged_attention_score_kernel<block_t, true><<<
-            dim3(n_heads, n_seq, n_tokens * PAGED_ATTN_CONTEXT_CTAS), dim3(head_dim),
-            (size_t) head_dim * sizeof(float), ctx.stream()>>>(
-                (const float *) q->data, kv_cache->data, (const int *) block_table->data,
-                (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-                stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
-                max_context, scores.ptr);
-        paged_attention_value_kernel<block_t, true><<<
+        ggml_cuda_pool_alloc<float> inv_sum(ctx.pool(), (size_t) n_tokens * n_heads);
+        ggml_cuda_pool_alloc<float> partial(
+            ctx.pool(), (size_t) n_tokens * n_heads * PAGED_ATTN_VALUE_CTAS * head_dim);
+        if (n_heads / n_heads_kv == 6) {
+            paged_attention_score_gqa_kernel<block_t, true, 6><<<
+                dim3(n_heads_kv, n_seq, n_tokens * PAGED_ATTN_CONTEXT_CTAS), dim3(head_dim),
+                (size_t) 6 * head_dim * sizeof(float), ctx.stream()>>>(
+                    (const float *) q->data, kv_cache->data, (const int *) block_table->data,
+                    (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, block_size, max_blocks, scale,
+                    max_context, scores.ptr);
+        } else {
+            paged_attention_score_kernel<block_t, true><<<
+                dim3(n_heads, n_seq, n_tokens * PAGED_ATTN_CONTEXT_CTAS), dim3(head_dim),
+                (size_t) head_dim * sizeof(float), ctx.stream()>>>(
+                    (const float *) q->data, kv_cache->data, (const int *) block_table->data,
+                    (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
+                    max_context, scores.ptr);
+        }
+        paged_attention_softmax_kernel<<<
             dim3(n_heads, n_seq, n_tokens), dim3(head_dim), reduce_smem, ctx.stream()>>>(
-                kv_cache->data, (const int *) block_table->data, (const int *) context_lens->data,
+                (const int *) context_lens->data, (const int *) batch_offsets->data,
+                (const int *) batch_lens->data, max_context, scores.ptr, inv_sum.ptr);
+        if (n_heads / n_heads_kv == 6) {
+            paged_attention_vdot_gqa_kernel<block_t, true, 6><<<
+                dim3(n_heads_kv, n_seq, n_tokens * PAGED_ATTN_VALUE_CTAS), dim3(head_dim), 0, ctx.stream()>>>(
+                    kv_cache->data, (const int *) block_table->data, (const int *) context_lens->data,
+                    (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks,
+                    max_context, scores.ptr, partial.ptr);
+        } else {
+            paged_attention_vdot_kernel<block_t, true><<<
+                dim3(n_heads, n_seq, n_tokens * PAGED_ATTN_VALUE_CTAS), dim3(head_dim), 0, ctx.stream()>>>(
+                    kv_cache->data, (const int *) block_table->data, (const int *) context_lens->data,
+                    (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks,
+                    max_context, scores.ptr, partial.ptr);
+        }
+        paged_attention_vreduce_kernel<<<
+            dim3(n_heads, n_seq, n_tokens), dim3(head_dim), 0, ctx.stream()>>>(
                 (const int *) batch_offsets->data, (const int *) batch_lens->data,
-                stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks,
-                max_context, scores.ptr, (float *) dst->data);
+                partial.ptr, inv_sum.ptr, (float *) dst->data);
     } else {
         paged_attention_quant_decode_kernel<block_t, QK><<<
             dim3(n_heads, n_seq, n_tokens), dim3(head_dim), reduce_smem, ctx.stream()>>>(
@@ -573,22 +958,57 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const int *) write_slots->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
         stride_token, stride_head, stride_block, n_heads_kv, block_size);
 
+    if (ggml_cuda_paged_attn_prefill<half, false>(
+            ctx, dst, q, k_new, kv_cache, block_table, batch_lens,
+            stride_token, stride_head, stride_block, block_size, max_blocks, scale)) {
+        return;
+    }
+
     const size_t reduce_smem = (size_t) ((head_dim + 31) / 32) * sizeof(float);
     if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS) {
         const size_t max_context = (size_t) max_blocks * block_size;
         ggml_cuda_pool_alloc<float> scores(ctx.pool(), (size_t) n_tokens * n_heads * max_context);
-        paged_attention_score_kernel<half, false><<<
-            dim3(n_heads, n_seq, n_tokens * PAGED_ATTN_CONTEXT_CTAS), block_dims,
-            (size_t) head_dim * sizeof(float), ctx.stream()>>>(
-                (const float *) q->data, kv_cache->data, (const int *) block_table->data,
-                (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-                stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
-                max_context, scores.ptr);
-        paged_attention_value_kernel<half, false><<<grid_dims, block_dims, reduce_smem, ctx.stream()>>>(
-            kv_cache->data, (const int *) block_table->data, (const int *) context_lens->data,
+        ggml_cuda_pool_alloc<float> inv_sum(ctx.pool(), (size_t) n_tokens * n_heads);
+        ggml_cuda_pool_alloc<float> partial(
+            ctx.pool(), (size_t) n_tokens * n_heads * PAGED_ATTN_VALUE_CTAS * head_dim);
+        if (n_heads / n_heads_kv == 6) {
+            paged_attention_score_gqa_kernel<half, false, 6><<<
+                dim3(n_heads_kv, n_seq, n_tokens * PAGED_ATTN_CONTEXT_CTAS), block_dims,
+                (size_t) 6 * head_dim * sizeof(float), ctx.stream()>>>(
+                    (const float *) q->data, kv_cache->data, (const int *) block_table->data,
+                    (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, block_size, max_blocks, scale,
+                    max_context, scores.ptr);
+        } else {
+            paged_attention_score_kernel<half, false><<<
+                dim3(n_heads, n_seq, n_tokens * PAGED_ATTN_CONTEXT_CTAS), block_dims,
+                (size_t) head_dim * sizeof(float), ctx.stream()>>>(
+                    (const float *) q->data, kv_cache->data, (const int *) block_table->data,
+                    (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
+                    max_context, scores.ptr);
+        }
+        paged_attention_softmax_kernel<<<grid_dims, block_dims, reduce_smem, ctx.stream()>>>(
+            (const int *) context_lens->data, (const int *) batch_offsets->data,
+            (const int *) batch_lens->data, max_context, scores.ptr, inv_sum.ptr);
+        if (n_heads / n_heads_kv == 6) {
+            paged_attention_vdot_gqa_kernel<half, false, 6><<<
+                dim3(n_heads_kv, n_seq, n_tokens * PAGED_ATTN_VALUE_CTAS), block_dims, 0, ctx.stream()>>>(
+                    kv_cache->data, (const int *) block_table->data, (const int *) context_lens->data,
+                    (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks,
+                    max_context, scores.ptr, partial.ptr);
+        } else {
+            paged_attention_vdot_kernel<half, false><<<
+                dim3(n_heads, n_seq, n_tokens * PAGED_ATTN_VALUE_CTAS), block_dims, 0, ctx.stream()>>>(
+                    kv_cache->data, (const int *) block_table->data, (const int *) context_lens->data,
+                    (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks,
+                    max_context, scores.ptr, partial.ptr);
+        }
+        paged_attention_vreduce_kernel<<<grid_dims, block_dims, 0, ctx.stream()>>>(
             (const int *) batch_offsets->data, (const int *) batch_lens->data,
-            stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks,
-            max_context, scores.ptr, (float *) dst->data);
+            partial.ptr, inv_sum.ptr, (float *) dst->data);
     } else {
         paged_attention_decode_kernel<<<grid_dims, block_dims, reduce_smem, ctx.stream()>>>(
             (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,

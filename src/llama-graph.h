@@ -413,6 +413,7 @@ public:
     ggml_tensor * paged_batch_lens    = nullptr;
 
     int32_t last_n_tokens;
+    uint64_t storage_generation = 0;
 
     const llama_kv_cache_paged_context * mctx;
 };
@@ -1204,7 +1205,8 @@ struct llm_graph_context {
              ggml_tensor * batch_lens,      // [batch_size]
                    float   kq_scale,
                      int   block_size,
-                     int   max_blocks) const;
+                     int   max_blocks,
+                     int   active_context) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

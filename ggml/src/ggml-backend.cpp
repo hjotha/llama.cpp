@@ -937,6 +937,16 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         return cur_backend_id;
     }
 
+    // The paged KV buffer is persistent state, so the attention op must follow it.
+    // Otherwise the small host metadata inputs can make the generic heuristic pick CPU.
+    if (tensor->op == GGML_OP_PAGED_ATTN && tensor->src[3] != NULL) {
+        cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor->src[3], tensor);
+        if (cur_backend_id != -1) {
+            SET_CAUSE(tensor, "1.kv");
+            return cur_backend_id;
+        }
+    }
+
     // operations with weights are preferably run on the same backend as the weights
     // TODO: there are exceptions (see below) - not an ideal solution
     bool allow = true;

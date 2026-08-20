@@ -56,7 +56,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     const llama_paged_batch_info * get_paged_batch_info() const { return last_paged_info; }
 
     uint32_t get_num_gpu_blocks() const;
-
+    uint64_t get_storage_generation() const { return storage_generation; }
     //
     // llama_memory_i
     //
@@ -126,7 +126,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     struct ggml_tensor * get_cpu_tensor(int layer_idx) const;
     struct ggml_tensor * create_layer_tensor(struct ggml_context * ctx, enum ggml_type type, uint32_t num_blocks) const;
     bool reset_layer_storage(layer_storage & storage, ggml_backend_t target_backend, uint32_t num_blocks, size_t bytes_to_copy);
-    bool ensure_physical_capacity(uint32_t required_blocks);
+    bool ensure_physical_capacity(uint32_t required_blocks, bool rebalance = false);
     void maybe_restore_initial_storage();
 
     std::vector<layer_storage> kv_gpu_layers;
@@ -164,6 +164,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t       gpu_watermark_num_blocks;
     size_t         block_bytes;
     bool           allow_dynamic_spill;
+    uint64_t       storage_generation = 0;
 
     ggml_backend_t cpu_backend;
 
@@ -200,7 +201,7 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     int32_t get_n_tokens() const;
     int32_t get_batch_size() const;
     int32_t get_max_blocks() const;
-
+    uint64_t get_storage_generation() const;
     int32_t * get_write_slots() const;
     int32_t * get_block_table() const;
     int32_t * get_context_lens() const;

@@ -220,11 +220,11 @@ bool llama_kv_cache_paged::reset_layer_storage(layer_storage & storage,
         return false;
     }
 
-    ggml_backend_buffer_ptr new_buf { ggml_backend_alloc_ctx_tensors(new_ctx.get(), target_backend) };
+    ggml_backend_buffer_ptr new_buf;
     std::vector<uint8_t> staging;
     size_t copy_bytes = 0;
 
-    if (!new_buf && storage.tensor != nullptr && target_backend == storage.backend) {
+    if (storage.tensor != nullptr && target_backend == storage.backend) {
         copy_bytes = std::min(bytes_to_copy, ggml_nbytes(storage.tensor));
         staging.resize(copy_bytes);
         if (copy_bytes > 0) {
@@ -232,14 +232,12 @@ bool llama_kv_cache_paged::reset_layer_storage(layer_storage & storage,
             ggml_backend_tensor_get(storage.tensor, staging.data(), 0, copy_bytes);
         }
 
-        // Growing beside the old allocation can fail even when the final buffer fits.
-        // Keep a host copy and retry after releasing the old buffer.
+        // Avoid a transient double allocation: under WDDM it can evict otherwise fitting
+        // CUDA buffers to system memory and leave decode permanently bandwidth-bound.
         storage.tensor = nullptr;
         storage.buf.reset();
         storage.ctx.reset();
-        new_ctx.reset(ggml_init(params));
-        new_tensor = new_ctx ? create_layer_tensor(new_ctx.get(), kv_type, num_blocks) : nullptr;
-        new_buf.reset(new_tensor ? ggml_backend_alloc_ctx_tensors(new_ctx.get(), target_backend) : nullptr);
+        new_buf.reset(ggml_backend_alloc_ctx_tensors(new_ctx.get(), target_backend));
 
         if (!new_buf) {
             new_ctx.reset(ggml_init(params));
@@ -255,8 +253,11 @@ bool llama_kv_cache_paged::reset_layer_storage(layer_storage & storage,
             storage.backend  = old_backend;
             storage.tensor   = new_tensor;
             storage.capacity = old_capacity;
+            ++storage_generation;
             return false;
         }
+    } else {
+        new_buf.reset(ggml_backend_alloc_ctx_tensors(new_ctx.get(), target_backend));
     }
     if (!new_buf) {
         return false;
@@ -282,6 +283,7 @@ bool llama_kv_cache_paged::reset_layer_storage(layer_storage & storage,
     storage.backend  = target_backend;
     storage.tensor   = new_tensor;
     storage.capacity = num_blocks;
+    ++storage_generation;
     if (old_backend != nullptr) {
         LLAMA_LOG_INFO("%s: paged KV moved %s:%u -> %s:%u blocks\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(old_backend)), old_capacity,
@@ -290,27 +292,47 @@ bool llama_kv_cache_paged::reset_layer_storage(layer_storage & storage,
     return true;
 }
 
-bool llama_kv_cache_paged::ensure_physical_capacity(uint32_t required_blocks) {
+bool llama_kv_cache_paged::ensure_physical_capacity(uint32_t required_blocks, bool rebalance) {
     if (required_blocks == 0) {
         return true;
     }
 
-    const uint32_t growth_step = std::max((uint32_t) 1, initial_num_gpu_blocks / 4);
+    const uint32_t growth_step = std::max((uint32_t) 1, initial_num_gpu_blocks);
     const uint32_t target_blocks = std::min(num_gpu_blocks,
         ((required_blocks + growth_step - 1) / growth_step) * growth_step);
-    if (target_blocks <= initial_num_gpu_blocks) {
+    if (target_blocks <= initial_num_gpu_blocks && !rebalance) {
         return true;
     }
 
-    for (const uint32_t il : attn_layer_ids) {
+    // ponytail: the initial pool is the existing hardware calibration knob;
+    // expose a separate VRAM budget only if another device needs independent tuning.
+    const uint32_t original_budget_blocks = std::min(num_gpu_blocks,
+        initial_num_gpu_blocks * 2);
+    const size_t max_original_layers = std::min(attn_layer_ids.size(),
+        (size_t) ((uint64_t) original_budget_blocks * attn_layer_ids.size() / target_blocks));
+
+    for (size_t layer_index = 0; layer_index < attn_layer_ids.size(); ++layer_index) {
+        const uint32_t il = attn_layer_ids[layer_index];
         auto & storage = kv_gpu_layers[il];
-        if (storage.capacity >= target_blocks) {
+        const bool can_spill = allow_dynamic_spill && storage.candidate_backend != nullptr &&
+                               storage.candidate_backend != storage.backend;
+        const bool spill_first = (rebalance || target_blocks > original_budget_blocks) && can_spill &&
+                                 storage.backend == storage.original_backend &&
+                                 layer_index >= max_original_layers;
+        if (storage.capacity >= target_blocks && !spill_first) {
             continue;
         }
 
-        std::vector<ggml_backend_t> candidates = { storage.backend };
-        if (allow_dynamic_spill && storage.candidate_backend != nullptr &&
-                storage.candidate_backend != storage.backend) {
+        std::vector<ggml_backend_t> candidates;
+        if (spill_first) {
+            LLAMA_LOG_INFO("%s: spilling layer %u before growth (%zu/%zu layers remain on original backend)\n",
+                __func__, il, max_original_layers, attn_layer_ids.size());
+        }
+        if (spill_first) {
+            candidates.push_back(storage.candidate_backend);
+        }
+        candidates.push_back(storage.backend);
+        if (can_spill && !spill_first) {
             candidates.push_back(storage.candidate_backend);
         }
         for (ggml_backend_t backend : spill_backends) {
@@ -322,16 +344,17 @@ bool llama_kv_cache_paged::ensure_physical_capacity(uint32_t required_blocks) {
             candidates.push_back(storage.original_backend);
         }
 
+        const uint32_t new_capacity = std::max(storage.capacity, target_blocks);
         const size_t bytes_to_copy = (size_t) std::min(required_gpu_capacity(), storage.capacity) * block_bytes;
         bool grown = false;
         for (ggml_backend_t candidate : candidates) {
-            if (reset_layer_storage(storage, candidate, target_blocks, bytes_to_copy)) {
+            if (reset_layer_storage(storage, candidate, new_capacity, bytes_to_copy)) {
                 grown = true;
                 break;
             }
         }
         if (!grown) {
-            LLAMA_LOG_WARN("%s: unable to grow layer %u to %u blocks\n", __func__, il, target_blocks);
+            LLAMA_LOG_WARN("%s: unable to grow layer %u to %u blocks\n", __func__, il, new_capacity);
             return false;
         }
     }
@@ -370,7 +393,11 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
                     curr_block_count, total_num_tokens, num_requested_blocks);
 
     if (num_requested_blocks == 0) {
-        return true;
+        if (!allow_dynamic_spill || num_tokens > 4) {
+            return true;
+        }
+        maybe_restore_initial_storage();
+        return ensure_physical_capacity(required_gpu_capacity(), /*rebalance=*/true);
     }
 
     const bool ignore_watermark = !group.block_table.empty();
@@ -386,7 +413,7 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
     if (!preview_ids.empty()) {
         required_blocks = std::max(required_blocks, *std::max_element(preview_ids.begin(), preview_ids.end()) + 1);
     }
-    if (!ensure_physical_capacity(required_blocks)) {
+    if (!ensure_physical_capacity(required_blocks, allow_dynamic_spill && num_tokens <= 4)) {
         return false;
     }
 
@@ -461,7 +488,8 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
 
     const auto & block_table = it->second.block_table;
     regular_write_slots.resize(ubatch.n_tokens);
-    regular_block_table.assign(block_table.begin(), block_table.end());
+    regular_block_table.assign(num_gpu_blocks, 0);
+    std::copy(block_table.begin(), block_table.end(), regular_block_table.begin());
     regular_context_lens.assign(1, 0);
     regular_batch_offsets.assign(1, 0);
     regular_batch_lens.assign(1, ubatch.n_tokens);
@@ -480,7 +508,7 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
     }
 
     regular_context_lens[0] = max_pos + 1;
-    info.n_blocks_per_seq = block_table.size();
+    info.n_blocks_per_seq = num_gpu_blocks;
     info.n_seq            = 1;
     info.n_tokens         = ubatch.n_tokens;
     info.write_slots      = regular_write_slots.data();
@@ -527,7 +555,9 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
 
     group.block_table.clear();
     sequence_positions.erase(group.request_id);
-    maybe_restore_initial_storage();
+    if (required_gpu_capacity() <= initial_num_gpu_blocks) {
+        maybe_restore_initial_storage();
+    }
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
@@ -703,10 +733,7 @@ llama_memory_context_ptr llama_kv_cache_paged::init_full() {
 }
 
 llama_memory_context_ptr llama_kv_cache_paged::init_update(llama_context * /*lctx*/, bool /*optimize*/) {
-    std::vector<llama_ubatch> dummy_ubatch = {};
-    auto                      ctx          = std::make_unique<llama_kv_cache_paged_context>(this, dummy_ubatch);
-    // TODO maybe confirm block counts or clean up stale pointers
-    return ctx;
+    return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
 
 struct ggml_tensor * llama_kv_cache_paged::get_kv_tensor(int layer_idx) const {
@@ -771,7 +798,6 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos /
         if (pos_it != sequence_positions.end()) {
             pos_it->second.max = std::min(pos_it->second.max, p0 - 1);
         }
-        maybe_restore_initial_storage();
     }
     return true;
 }
@@ -872,6 +898,11 @@ int32_t llama_kv_cache_paged_context::get_batch_size() const {
 
 int32_t llama_kv_cache_paged_context::get_max_blocks() const {
     return max_blocks;
+}
+
+uint64_t llama_kv_cache_paged_context::get_storage_generation() const {
+    GGML_ASSERT(manager && "manager has not been initialized.");
+    return manager->get_storage_generation();
 }
 
 int32_t * llama_kv_cache_paged_context::get_write_slots() const {

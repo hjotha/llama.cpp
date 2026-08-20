@@ -2853,7 +2853,8 @@ extern "C" {
                                                   struct ggml_tensor  * batch_lens,
                                                   float                 scale,
                                                   int                   block_size,
-                                                  int                   max_blocks);
+                                                  int                   max_blocks,
+                                                  int                   active_context);
 
     //
     // quantization

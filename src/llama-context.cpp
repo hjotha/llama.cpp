@@ -272,8 +272,10 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.kv_paged   = params.kv_paged;
+    cparams.kv_paged_dynamic = params.kv_paged_dynamic;
     cparams.block_size = params.block_size;
     cparams.n_gpu_blocks = params.n_gpu_blocks;
+    cparams.n_gpu_blocks_initial = params.n_gpu_blocks_initial;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
 
@@ -398,8 +400,14 @@ llama_context::llama_context(
         };
 
         std::vector<ggml_backend_t> layer_backends;
+        std::vector<ggml_backend_t> kv_backends;
         if (cparams.kv_paged) {
             layer_backends.resize(model.hparams.n_layer(), backend_cpu);
+            for (auto & b : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    kv_backends.push_back(b.get());
+                }
+            }
             for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
                 const auto * layer_dev = model.dev_layer(il);
                 for (auto & b : backends) {
@@ -411,7 +419,7 @@ llama_context::llama_context(
             }
         }
 
-        memory.reset(model.create_memory(params_mem, cparams, layer_backends, backend_cpu));
+        memory.reset(model.create_memory(params_mem, cparams, layer_backends, kv_backends, backend_cpu));
     }
 
     // init backends
@@ -3570,8 +3578,10 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.kv_paged                    =*/ false,
+        /*.kv_paged_dynamic            =*/ false,
         /*.block_size                  =*/ 16,
         /*.n_gpu_blocks                =*/ 0,
+        /*.n_gpu_blocks_initial        =*/ 0,
         /*.n_cpu_blocks                =*/ 0,
         /*.kv_paged_watermark          =*/ 0.05f,
         /*.sampler                     =*/ nullptr,
@@ -3630,6 +3640,12 @@ llama_context * llama_init_from_model(
     if (params.kv_paged && params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_Q4_0 && params.type_k != GGML_TYPE_Q8_0) {
         LLAMA_LOG_ERROR("%s: paged KV cache supports only F16, Q4_0, and Q8_0 (got %s)\n",
                         __func__, ggml_type_name(params.type_k));
+        return nullptr;
+    }
+
+    if (params.kv_paged_dynamic &&
+        (params.n_gpu_blocks_initial == 0 || params.n_gpu_blocks_initial > params.n_gpu_blocks)) {
+        LLAMA_LOG_ERROR("%s: dynamic paged KV requires 0 < n_gpu_blocks_initial <= n_gpu_blocks\n", __func__);
         return nullptr;
     }
 

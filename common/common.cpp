@@ -1390,7 +1390,13 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
             __func__, free_vram / 1024.0f / 1024.0f, ggml_type_name(params.cache_type_k), head_dim, n_layers,
             bytes_per_block, n_gpu_blocks, n_cpu_blocks);
 
-    params.n_gpu_blocks = n_gpu_blocks;
+    if (params.kv_paged_dynamic) {
+        params.n_gpu_blocks_initial = n_gpu_blocks;
+        params.n_gpu_blocks = std::max({ params.n_gpu_blocks, n_gpu_blocks,
+                (uint32_t) std::ceil((double) params.n_ctx / params.block_size) });
+    } else {
+        params.n_gpu_blocks = n_gpu_blocks;
+    }
     params.n_cpu_blocks = n_cpu_blocks;
 }
 
@@ -1782,6 +1788,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.paged_attn_cuda = params.paged_attn_cuda;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1838,8 +1845,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.kv_paged          = params.kv_paged;
+    cparams.kv_paged_dynamic  = params.kv_paged_dynamic;
     cparams.block_size        = params.block_size;
     cparams.n_gpu_blocks      = params.n_gpu_blocks;
+    cparams.n_gpu_blocks_initial = params.kv_paged_dynamic && params.n_gpu_blocks_initial == 0
+        ? params.n_gpu_blocks
+        : params.n_gpu_blocks_initial;
     cparams.n_cpu_blocks      = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
 

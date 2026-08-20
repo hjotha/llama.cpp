@@ -2,7 +2,9 @@
 
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 
 void llama_block_manager::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) {
     LLAMA_LOG_INFO("%s: Block manager initialized: n_free_gpu_blocks=%d, n_free_cpu_blocks=%d\n", __func__, n_gpu,
@@ -14,14 +16,14 @@ void llama_block_manager::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) 
     watermark_cpu_safety_num_blocks = std::ceil(total_num_cpu_blocks * watermark);
 
     gpu_registry.resize(n_gpu);
-    for (uint32_t i = 0; i < n_gpu; ++i) {
+    for (uint32_t i = n_gpu; i-- > 0;) {
         gpu_registry[i].id     = i;
         gpu_registry[i].is_gpu = true;
         free_gpu_ids.push_back(i);
     }
 
     cpu_registry.resize(n_cpu);
-    for (uint32_t i = 0; i < n_cpu; ++i) {
+    for (uint32_t i = n_cpu; i-- > 0;) {
         cpu_registry[i].id     = i + total_num_gpu_blocks;
         cpu_registry[i].is_gpu = false;
         free_cpu_ids.push_back(i + total_num_gpu_blocks);
@@ -93,6 +95,7 @@ void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_bl
             free_gpu_ids.push_back(id);
         }
     }
+    std::sort(free_gpu_ids.begin(), free_gpu_ids.end(), std::greater<uint32_t>());
 }
 
 void llama_block_manager::release_cpu_blocks(const physical_block_ids & freed_blocks_ids) {
@@ -103,6 +106,7 @@ void llama_block_manager::release_cpu_blocks(const physical_block_ids & freed_bl
             free_cpu_ids.push_back(id);
         }
     }
+    std::sort(free_cpu_ids.begin(), free_cpu_ids.end(), std::greater<uint32_t>());
 }
 
 bool llama_block_manager::is_gpu(uint32_t block_id) const {

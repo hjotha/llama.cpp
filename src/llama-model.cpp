@@ -1361,7 +1361,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const bool pin_full_attention = params.paged_attn_cuda && il < n_layer_all && !hparams.is_recr(il) && n_devices() > 1;
+        const int layer_gpu = pin_full_attention ? 0 : std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -2092,6 +2093,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
                                             const std::vector<ggml_backend_t> & layer_backends,
+                                            const std::vector<ggml_backend_t> & kv_backends,
                                             ggml_backend_t backend_cpu) const {
     llama_memory_i * res;
 
@@ -2270,7 +2272,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                      arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -2335,6 +2338,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_kv      */ params.type_k,
                             /* attn_block_size   */ cparams.block_size,
                             /* attn_n_gpu_blocks */ cparams.n_gpu_blocks,
+                            /* attn_initial_blocks */ cparams.n_gpu_blocks_initial,
                             /* attn_n_cpu_blocks */ cparams.n_cpu_blocks,
                             /* attn_watermark    */ cparams.kv_paged_watermark,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
@@ -2345,7 +2349,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* layer_backends    */ layer_backends,
+                            /* kv_backends       */ kv_backends,
                             /* backend_cpu       */ backend_cpu,
+                            /* dynamic_spill     */ cparams.kv_paged_dynamic,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
@@ -2452,7 +2458,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        if (cparams.kv_paged) {
+                        if (cparams.kv_paged && params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
                             GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
                             GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
                             LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
@@ -2473,11 +2479,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             paged_cache->init(
                                 layer_backends,
+                                kv_backends,
                                 backend_cpu,
                                 params.type_k,
                                 n_gpu_blocks,
                                 n_cpu_blocks,
-                                watermark);
+                                watermark,
+                                cparams.n_gpu_blocks_initial,
+                                cparams.kv_paged_dynamic);
 
                             res = paged_cache;
                         } else {
@@ -2550,6 +2559,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.paged_attn_cuda             =*/ false,
     };
 
     return result;

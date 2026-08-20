@@ -14,6 +14,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
                 ggml_type   type_kv,
                  uint32_t   block_size,
                  uint32_t   n_gpu_blocks,
+                 uint32_t   initial_gpu_blocks,
                  uint32_t   n_cpu_blocks,
                    float    watermark,
                  uint32_t   n_ubatch,
@@ -27,7 +28,9 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
                      bool   offload,
                             /* backends */
     const std::vector<ggml_backend_t> & layer_backends,
+    const std::vector<ggml_backend_t> & kv_backends,
              ggml_backend_t backend_cpu,
+                     bool   dynamic_spill,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
@@ -56,8 +59,8 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
             : filter_recr
     )) {
     mem_attn->init(
-        layer_backends, backend_cpu, type_kv,
-        n_gpu_blocks, n_cpu_blocks, watermark);
+        layer_backends, kv_backends, backend_cpu, type_kv,
+        n_gpu_blocks, n_cpu_blocks, watermark, initial_gpu_blocks, dynamic_spill);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_paged::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -101,6 +104,11 @@ llama_memory_context_ptr llama_memory_hybrid_paged::init_batch(llama_batch_alloc
         if (!mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
+            return std::make_unique<llama_memory_hybrid_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+
+        if (!mem_attn->prepare_batch(balloc.get_batch())) {
+            LLAMA_LOG_WARN("%s: failed to prepare paged attention batch\n", __func__);
             return std::make_unique<llama_memory_hybrid_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
@@ -222,12 +230,11 @@ llama_memory_hybrid_paged_context::llama_memory_hybrid_paged_context(
     ctx_attn(new llama_kv_cache_paged_context(mem->get_mem_attn(), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
-    // the paged attention context needs the batch info set by the scheduler
-    //   before the graph can read the paged tensors
+    // The server path builds metadata from each ubatch. The scheduler path is
+    // still available for examples/paged and supplies its own arrays.
     auto * paged_ctx = static_cast<llama_kv_cache_paged_context *>(ctx_attn.get());
-    const auto * info = mem->get_mem_attn()->get_paged_batch_info();
-    GGML_ASSERT(info && "no paged batch info set before init_batch was called.");
-    paged_ctx->set_batch_data(*info);
+    GGML_ASSERT(!this->ubatches.empty());
+    paged_ctx->set_batch_data(this->ubatches.front());
 }
 
 bool llama_memory_hybrid_paged_context::next() {

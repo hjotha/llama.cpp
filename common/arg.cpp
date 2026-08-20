@@ -1725,14 +1725,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_paged = value;
         }
-    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-dynamic"},
+        "grow paged KV on demand and migrate its attention layers between registered GPU backends",
+        [](common_params & params) {
+            params.kv_paged = true;
+            params.kv_paged_dynamic = true;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_DYNAMIC").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--paged-attn-cuda"},
+        "pin full-attention layers to the first offload device (use with --tensor-split for recurrent-only layers on the next device)",
+        [](common_params & params) {
+            params.paged_attn_cuda = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-ncpub", "--n-cpu-blocks"}, "N",
         "number of physical CPU blocks for paged KV cache (default: 1)",
         [](common_params & params, int value) {
             params.n_cpu_blocks = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-nchk", "--n-checkpoint"}, "N",
         "print a TPS checkpoint every N decoded tokens for paged KV (default: 0 = disabled)",
@@ -1753,7 +1768,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.n_gpu_blocks = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--n-gpu-blocks-initial"}, "N",
+        "number of paged KV GPU blocks allocated at startup (default: 0 = full pool)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--n-gpu-blocks-initial must be non-negative");
+            }
+            params.n_gpu_blocks_initial = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-kvbls", "--kv-block-size"}, "N",
         "fixed number of tokens for a given paged block (default: 16)",
@@ -1763,7 +1788,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.block_size = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--kv-paged-watermark"}, "N",
         "fraction of blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0))",
@@ -1774,7 +1799,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_paged_watermark = potential_watermark;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},

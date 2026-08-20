@@ -21,6 +21,7 @@ struct llama_cparams {
 
     uint32_t block_size;
     uint32_t n_gpu_blocks;
+    uint32_t n_gpu_blocks_initial;
     uint32_t n_cpu_blocks;
     float    kv_paged_watermark;
 
@@ -58,6 +59,7 @@ struct llama_cparams {
     bool op_offload;
 bool kv_unified;
     bool kv_paged;
+    bool kv_paged_dynamic;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

@@ -28,6 +28,7 @@ public:
                 ggml_type   type_kv,
                  uint32_t   block_size,
                  uint32_t   n_gpu_blocks,
+                 uint32_t   initial_gpu_blocks,
                  uint32_t   n_cpu_blocks,
                    float    watermark,
                  uint32_t   n_ubatch,
@@ -41,7 +42,9 @@ public:
                      bool   offload,
                             /* backends */
     const std::vector<ggml_backend_t> & layer_backends,
+    const std::vector<ggml_backend_t> & kv_backends,
              ggml_backend_t backend_cpu,
+                     bool   dynamic_spill,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr);

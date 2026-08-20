@@ -356,6 +356,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool paged_attn_cuda; // pin full-attention layers to the first device
     };
 
     struct llama_sampler_seq_config {
@@ -419,8 +420,10 @@ extern "C" {
         // Paged KV cache (experimental)
         // Opt-in block-indexing KV cache with continuous-batching scheduling
         bool     kv_paged;           // enable paged KV cache
+        bool     kv_paged_dynamic;   // grow and migrate KV pools between registered GPU backends
         uint32_t block_size;         // tokens per physical KV block
         uint32_t n_gpu_blocks;       // GPU block pool size
+        uint32_t n_gpu_blocks_initial; // initially allocated GPU blocks (0 = full pool)
         uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
         float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
 

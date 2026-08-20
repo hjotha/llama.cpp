@@ -23,18 +23,36 @@ class llama_kv_cache_paged : public llama_memory_i {
                          const llama_memory_i::layer_filter_cb & filter_attn = nullptr);
 
     void init(const std::vector<ggml_backend_t> & layer_backends,
+              const std::vector<ggml_backend_t> & candidate_backends,
               ggml_backend_t backend_cpu,
               enum ggml_type type,
               uint32_t       n_gpu_blocks,
               uint32_t       n_cpu_blocks,
-              float          watermark);  // percentage
+              float          watermark,  // percentage
+              uint32_t       initial_gpu_blocks,
+              bool           dynamic_spill);
+
+    void init(const std::vector<ggml_backend_t> & layer_backends,
+              ggml_backend_t backend_cpu,
+              enum ggml_type type,
+              uint32_t       n_gpu_blocks,
+              uint32_t       n_cpu_blocks,
+              float          watermark) {  // percentage
+        init(layer_backends, {}, backend_cpu, type, n_gpu_blocks, n_cpu_blocks, watermark, n_gpu_blocks, false);
+    }
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
 
-void    set_paged_batch_info(const llama_paged_batch_info * info);
+    // Prepare the single-sequence context path used by llama-server. The
+    // scheduler path continues to provide its own llama_paged_batch_info.
+    bool prepare_batch(const llama_batch & batch);
+    bool build_batch_info(const llama_ubatch & ubatch, llama_paged_batch_info & info) const;
+    void commit_batch(const llama_ubatch & ubatch);
+
+    void set_paged_batch_info(const llama_paged_batch_info * info);
     const llama_paged_batch_info * get_paged_batch_info() const { return last_paged_info; }
 
     uint32_t get_num_gpu_blocks() const;
@@ -88,19 +106,37 @@ void    set_paged_batch_info(const llama_paged_batch_info * info);
     void set_seq_max_pos(llama_seq_id seq_id, llama_pos new_max);
 
   private:
+    struct layer_storage {
+        ggml_backend_t original_backend = nullptr;
+        ggml_backend_t candidate_backend = nullptr;
+        ggml_backend_t backend = nullptr;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        struct ggml_tensor * tensor = nullptr;
+        uint32_t capacity = 0;
+    };
+
     void concat_block_ids(llama_block_ids & to_block_table, const llama_block_ids & from_block_table);
     void do_block_copy(const llama_block_ids & src_ids, const llama_block_ids & new_ids, bool to_gpu);
+    bool has_free_gpu_blocks(uint32_t num_requested_blocks, bool ignore_watermark) const;
+    llama_block_ids preview_gpu_blocks(uint32_t num_blocks) const;
+    llama_block_ids checkout_gpu_blocks(uint32_t num_blocks);
+    void release_gpu_blocks(const llama_block_ids & freed_blocks);
+    uint32_t required_gpu_capacity() const;
+    struct ggml_tensor * get_cpu_tensor(int layer_idx) const;
+    struct ggml_tensor * create_layer_tensor(struct ggml_context * ctx, enum ggml_type type, uint32_t num_blocks) const;
+    bool reset_layer_storage(layer_storage & storage, ggml_backend_t target_backend, uint32_t num_blocks, size_t bytes_to_copy);
+    bool ensure_physical_capacity(uint32_t required_blocks);
+    void maybe_restore_initial_storage();
 
-    // One physical pool per layer backend. Block IDs stay logical and are
-    // mirrored at the same offsets in every device pool.
-    std::vector<std::vector<struct ggml_tensor *>> kv_gpu_layers;
+    std::vector<layer_storage> kv_gpu_layers;
     std::vector<struct ggml_tensor *> kv_cpu_layers;
+    ggml_context_ptr cpu_ctx;
+    ggml_backend_buffer_ptr cpu_buf;
 
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> gpu_ctxs_bufs;
-    std::vector<ggml_backend_t> gpu_backends;
     std::vector<int32_t> attn_layer_ids;
-    std::vector<int32_t> layer_pool_ids;
-    std::vector<int32_t> layer_pool_indices;
+    std::vector<int32_t> layer_cpu_indices;
+    std::vector<ggml_backend_t> spill_backends;
 
     enum ggml_type kv_type;
 
@@ -124,9 +160,15 @@ void    set_paged_batch_info(const llama_paged_batch_info * info);
 
     uint32_t       num_gpu_blocks;
     uint32_t       num_cpu_blocks;
+    uint32_t       initial_num_gpu_blocks;
+    uint32_t       gpu_watermark_num_blocks;
     size_t         block_bytes;
+    bool           allow_dynamic_spill;
 
     ggml_backend_t cpu_backend;
+
+    std::vector<uint32_t> free_gpu_ids;
+    std::vector<uint32_t> gpu_block_ref_counts;
 
     struct seq_range {
         llama_pos min = -1;
@@ -134,6 +176,13 @@ void    set_paged_batch_info(const llama_paged_batch_info * info);
     };
 
     std::unordered_map<llama_seq_id, seq_range> sequence_positions;
+    std::unordered_map<llama_seq_id, llama_sequence_group> regular_groups;
+
+    mutable std::vector<int32_t> regular_write_slots;
+    mutable std::vector<int32_t> regular_block_table;
+    mutable std::vector<int32_t> regular_context_lens;
+    mutable std::vector<int32_t> regular_batch_offsets;
+    mutable std::vector<int32_t> regular_batch_lens;
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {
@@ -147,6 +196,7 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     llama_kv_cache_paged_context(llama_memory_status status) : status(status) {}
 
     void    set_batch_data(const llama_paged_batch_info & info);
+    void    set_batch_data(const llama_ubatch & ubatch);
     int32_t get_n_tokens() const;
     int32_t get_batch_size() const;
     int32_t get_max_blocks() const;
@@ -174,7 +224,7 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     llama_memory_status get_status() const override { return status; }
 
   private:
-    const llama_kv_cache_paged * manager;
+    llama_kv_cache_paged * manager;
 
     //
     // batch processing context
@@ -187,6 +237,12 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     int32_t * paged_context_lens  = nullptr;  // [batch_size]
     int32_t * paged_batch_offsets = nullptr;  // [batch_size]
     int32_t * paged_batch_lens    = nullptr;  // [batch_size]
+
+    std::vector<int32_t> owned_write_slots;
+    std::vector<int32_t> owned_block_table;
+    std::vector<int32_t> owned_context_lens;
+    std::vector<int32_t> owned_batch_offsets;
+    std::vector<int32_t> owned_batch_lens;
 
     int32_t n_tokens   = 0;
     int32_t batch_size = 0;

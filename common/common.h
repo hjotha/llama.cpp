@@ -563,10 +563,13 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool kv_paged          = false; // enable paged KV cache
+    bool paged_attn_cuda   = false; // pin full-attention layers to the first device
+    bool kv_paged_dynamic  = false; // grow and migrate paged KV pools between registered GPU backends
 
     int32_t  block_size      = 16;
 
     uint32_t n_gpu_blocks    = 1;
+    uint32_t n_gpu_blocks_initial = 0; // 0 = allocate the full pool at startup
     uint32_t n_cpu_blocks    = 1;
     uint32_t n_checkpoint    = 0;   // print TPS checkpoint every N decoded tokens (0 = disabled)
     bool     no_eos          = false; // ignore EOS tokens and keep generating until n_predict

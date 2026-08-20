@@ -271,6 +271,11 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_paged   = params.kv_paged;
+    cparams.block_size = params.block_size;
+    cparams.n_gpu_blocks = params.n_gpu_blocks;
+    cparams.n_cpu_blocks = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -392,7 +397,21 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        std::vector<ggml_backend_t> layer_backends;
+        if (cparams.kv_paged) {
+            layer_backends.resize(model.hparams.n_layer(), backend_cpu);
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                const auto * layer_dev = model.dev_layer(il);
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == layer_dev) {
+                        layer_backends[il] = b.get();
+                        break;
+                    }
+                }
+            }
+        }
+
+        memory.reset(model.create_memory(params_mem, cparams, layer_backends, backend_cpu));
     }
 
     // init backends
@@ -766,6 +785,10 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+uint32_t llama_context::block_size() const {
+    return cparams.block_size;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -3546,6 +3569,11 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_paged                    =*/ false,
+        /*.block_size                  =*/ 16,
+        /*.n_gpu_blocks                =*/ 0,
+        /*.n_cpu_blocks                =*/ 0,
+        /*.kv_paged_watermark          =*/ 0.05f,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3590,6 +3618,18 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.kv_paged && params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: paged KV cache requires the same K (%s) and V (%s) cache type\n",
+                        __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.kv_paged && params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_Q4_0 && params.type_k != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: paged KV cache supports only F16, Q4_0, and Q8_0 (got %s)\n",
+                        __func__, ggml_type_name(params.type_k));
         return nullptr;
     }
 

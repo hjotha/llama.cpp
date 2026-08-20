@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-model.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1286,6 +1287,113 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static bool common_paged_kv_is_hybrid_arch(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_JAMBA:
+        case LLM_ARCH_FALCON_H1:
+        case LLM_ARCH_PLAMO2:
+        case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_MINIMAX_01:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static uint32_t common_paged_kv_attention_layers(const llama_model * model) {
+    const auto & hparams = model->hparams;
+    const uint32_t n_layers = hparams.n_layer_all - hparams.n_layer_nextn;
+
+    if (!common_paged_kv_is_hybrid_arch(model->arch)) {
+        return n_layers;
+    }
+
+    uint32_t n_attention_layers = 0;
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        bool is_attention = hparams.is_recr_impl[il] == 0;
+
+        if (model->arch == LLM_ARCH_FALCON_H1) {
+            is_attention = true;
+        } else if ((model->arch == LLM_ARCH_NEMOTRON_H || model->arch == LLM_ARCH_NEMOTRON_H_MOE) &&
+                   hparams.n_ff_arr[il] != 0) {
+            is_attention = false;
+        }
+
+        n_attention_layers += is_attention;
+    }
+
+    return n_attention_layers;
+}
+
+static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        LOG_WRN("%s: no GPU device found, cannot fit paged KV blocks.\n", __func__);
+        return;
+    }
+
+    size_t free_vram = 0;
+    size_t total_vram = 0;
+    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+
+    const uint32_t n_heads_kv = model->hparams.n_head_kv_arr[0];
+    const uint32_t n_layers   = common_paged_kv_attention_layers(model);
+    const uint32_t head_dim   = model->hparams.n_embd_head_v_full;
+    const uint32_t block_size = params.block_size;
+
+    const size_t bytes_per_row   = ggml_row_size(params.cache_type_k, head_dim);
+    const size_t bytes_per_block = (size_t) 2 * bytes_per_row * n_heads_kv * block_size * n_layers;
+
+    if (n_layers == 0 || bytes_per_row == 0) {
+        LOG_ERR("%s: model has no paged-attention layers or an invalid KV type (%s).\n",
+                __func__, ggml_type_name(params.cache_type_k));
+        return;
+    }
+
+    const size_t margin = params.fit_params_target.empty()
+        ? (size_t)(total_vram * 0.05f)
+        : (size_t)params.fit_params_target[0];
+
+    if (free_vram <= margin) {
+        LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
+                "free_vram=%.1f MiB <= margin=%.1f MiB. "
+                "Try reducing --margin or offloading fewer layers to GPU.\n",
+                __func__, free_vram / 1024.0f / 1024.0f, margin    / 1024.0f / 1024.0f);
+        return; // leave params.n_gpu_blocks at its existing value
+    }
+
+    const size_t available = (free_vram > margin) ? free_vram - margin : 0;
+
+    if (bytes_per_block == 0 || available < bytes_per_block) {
+        LOG_ERR("%s: available VRAM (%.1f MiB) is less than one block (%.1f MiB). "
+                "Try increasing n_gpu_blocks manually or reducing block_size.\n",
+                __func__, available      / 1024.0f / 1024.0f, bytes_per_block / 1024.0f / 1024.0f);
+        return;
+    }
+
+    const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
+    const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
+
+    LOG_INF("%s: free_vram=%0.1f MiB, type=%s, head_dim=%u, attention_layers=%u, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u\n",
+            __func__, free_vram / 1024.0f / 1024.0f, ggml_type_name(params.cache_type_k), head_dim, n_layers,
+            bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+
+    params.n_gpu_blocks = n_gpu_blocks;
+    params.n_cpu_blocks = n_cpu_blocks;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1311,6 +1419,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    if (params.fit_params && params.kv_paged) {
+        LOG_INF("%s: fitting KV paged params to device memory\n", __func__);
+        common_fit_paged_kv_blocks(params, pimpl->model.get());
+        cparams = common_context_params_to_llama(params); // re-derive this params to reflect changes
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1723,6 +1837,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.kv_paged          = params.kv_paged;
+    cparams.block_size        = params.block_size;
+    cparams.n_gpu_blocks      = params.n_gpu_blocks;
+    cparams.n_cpu_blocks      = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -873,6 +873,9 @@ void process_shaders() {
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
+    string_to_spv("paged_attn_f16_d128", "paged_attn_f16.comp", {{"PAGED_ATTN_LOCAL_SIZE", "128"}});
+    string_to_spv("paged_attn_f16_d256", "paged_attn_f16.comp", {{"PAGED_ATTN_LOCAL_SIZE", "256"}});
+
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 

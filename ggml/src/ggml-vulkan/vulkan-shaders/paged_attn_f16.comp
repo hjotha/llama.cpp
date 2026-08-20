@@ -1,0 +1,157 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#ifndef PAGED_ATTN_LOCAL_SIZE
+#define PAGED_ATTN_LOCAL_SIZE 128
+#endif
+
+layout(local_size_x = PAGED_ATTN_LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q          { float     data_q[]; };
+layout (binding = 1) readonly buffer KNew       { float     data_k_new[]; };
+layout (binding = 2) readonly buffer VNew       { float     data_v_new[]; };
+layout (binding = 3) buffer KCache              { float16_t data_k_cache[]; };
+layout (binding = 4) buffer VCache              { float16_t data_v_cache[]; };
+layout (binding = 5) readonly buffer BlockTable  { uint      data_block_table[]; };
+layout (binding = 6) readonly buffer WriteSlots  { uint      data_write_slots[]; };
+layout (binding = 7) readonly buffer ContextLens { uint      data_context_lens[]; };
+layout (binding = 8) readonly buffer BatchOffset { uint      data_batch_offsets[]; };
+layout (binding = 9) readonly buffer BatchLens   { uint      data_batch_lens[]; };
+layout (binding = 10) writeonly buffer Out       { float     data_out[]; };
+
+layout (push_constant) uniform parameters {
+    uint head_dim;
+    uint n_heads;
+    uint n_heads_kv;
+    uint n_seq;
+    uint block_size;
+    uint max_blocks;
+    uint mode;
+
+    uint q_head_stride;
+    uint q_token_stride;
+    uint k_head_stride;
+    uint k_token_stride;
+    uint v_head_stride;
+    uint v_token_stride;
+    uint kv_token_stride;
+    uint kv_head_stride;
+    uint kv_block_stride;
+    uint out_head_stride;
+    uint out_token_stride;
+    float scale;
+} p;
+
+shared float reduce[PAGED_ATTN_LOCAL_SIZE];
+shared float reduced_qk;
+
+void write_cache() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+
+    if (head >= p.n_heads_kv || seq >= p.n_seq) {
+        return;
+    }
+
+    if (tid >= p.head_dim) {
+        return;
+    }
+
+    const uint seq_start = data_batch_offsets[seq];
+    const uint num_tokens = data_batch_lens[seq];
+
+    for (uint i = 0; i < num_tokens; ++i) {
+        const uint token = seq_start + i;
+        const uint slot = data_write_slots[token];
+        const uint block = slot / p.block_size;
+        const uint token_in_block = slot % p.block_size;
+        const uint cache_base = block * p.kv_block_stride + head * p.kv_head_stride + token_in_block * p.kv_token_stride + tid;
+        const uint input_k = token * p.k_token_stride + head * p.k_head_stride + tid;
+        const uint input_v = token * p.v_token_stride + head * p.v_head_stride + tid;
+
+        data_k_cache[cache_base] = float16_t(data_k_new[input_k]);
+        data_v_cache[cache_base + p.n_heads_kv * p.kv_head_stride] = float16_t(data_v_new[input_v]);
+    }
+}
+
+void decode() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+
+    if (head >= p.n_heads || seq >= p.n_seq) {
+        return;
+    }
+
+    const uint kv_head = head / (p.n_heads / p.n_heads_kv);
+    const bool lane_active = tid < p.head_dim;
+    const uint seq_start = data_batch_offsets[seq];
+    const uint num_new_tokens = data_batch_lens[seq];
+    const uint context_len = data_context_lens[seq];
+
+    for (uint i = 0; i < num_new_tokens; ++i) {
+        const uint token = seq_start + i;
+        float q_value = 0.0;
+        if (lane_active) {
+            q_value = data_q[token * p.q_token_stride + head * p.q_head_stride + tid] * p.scale;
+        }
+        float qk_max = -3.402823466e+38;
+        float exp_sum = 0.0;
+        float acc = 0.0;
+
+        const uint q_pos = context_len - num_new_tokens + i;
+        const uint num_blocks = q_pos / p.block_size + 1;
+
+        for (uint bid = 0; bid < num_blocks; ++bid) {
+            const uint physical_block = data_block_table[seq * p.max_blocks + bid];
+            const uint start_token = bid * p.block_size;
+            const uint end_token = min(start_token + p.block_size, q_pos + 1);
+
+            for (uint cached_token = start_token; cached_token < end_token; ++cached_token) {
+                const uint token_in_block = cached_token % p.block_size;
+                float k_value = 0.0;
+                float v_value = 0.0;
+                if (lane_active) {
+                    const uint cache_base = physical_block * p.kv_block_stride + kv_head * p.kv_head_stride + token_in_block * p.kv_token_stride + tid;
+                    k_value = float(data_k_cache[cache_base]);
+                    v_value = float(data_v_cache[cache_base + p.n_heads_kv * p.kv_head_stride]);
+                }
+
+                reduce[tid] = q_value * k_value;
+                barrier();
+                if (tid == 0) {
+                    float sum = 0.0;
+                    for (uint d = 0; d < p.head_dim; ++d) {
+                        sum += reduce[d];
+                    }
+                    reduced_qk = sum;
+                }
+                barrier();
+
+                const float qk = reduced_qk;
+                const float qk_max_new = max(qk_max, qk);
+                const float exp_old = exp(qk_max - qk_max_new);
+                const float exp_new = exp(qk - qk_max_new);
+
+                exp_sum = exp_sum * exp_old + exp_new;
+                acc = acc * exp_old + exp_new * v_value;
+                qk_max = qk_max_new;
+            }
+        }
+
+        if (lane_active) {
+            data_out[token * p.out_token_stride + head * p.out_head_stride + tid] = acc / (exp_sum + 1e-6);
+        }
+    }
+}
+
+void main() {
+    if (p.mode == 0) {
+        write_cache();
+    } else {
+        decode();
+    }
+}

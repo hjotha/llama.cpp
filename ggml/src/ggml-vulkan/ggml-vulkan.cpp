@@ -1083,6 +1083,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
+    vk_pipeline pipeline_paged_attn_f16_d128;
+    vk_pipeline pipeline_paged_attn_f16_d256;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -1385,6 +1387,30 @@ struct vk_flash_attn_push_constants {
     uint32_t k_num;
 };
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+
+struct vk_paged_attn_push_constants {
+    uint32_t head_dim;
+    uint32_t n_heads;
+    uint32_t n_heads_kv;
+    uint32_t n_seq;
+    uint32_t block_size;
+    uint32_t max_blocks;
+    uint32_t mode;
+
+    uint32_t q_head_stride;
+    uint32_t q_token_stride;
+    uint32_t k_head_stride;
+    uint32_t k_token_stride;
+    uint32_t v_head_stride;
+    uint32_t v_token_stride;
+    uint32_t kv_token_stride;
+    uint32_t kv_head_stride;
+    uint32_t kv_block_stride;
+    uint32_t out_head_stride;
+    uint32_t out_token_stride;
+    float scale;
+};
+static_assert(sizeof(vk_paged_attn_push_constants) <= 128, "sizeof(vk_paged_attn_push_constants) must be <= 128");
 
 struct vk_op_push_constants {
     uint32_t KX;
@@ -5469,6 +5495,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    if (device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d128, "paged_attn_f16_d128", paged_attn_f16_d128_len, paged_attn_f16_d128_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        if (device->max_workgroup_size_log2 >= 8) {
+            ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d256, "paged_attn_f16_d256", paged_attn_f16_d256_len, paged_attn_f16_d256_data, "main", 11, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
+        }
+    }
 
     for (auto &it : device->pipeline_fa_mask_opt) {
         auto BrBc = it.first;
@@ -11055,6 +11087,81 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 }
 
+static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q             = dst->src[0];
+    const ggml_tensor * k_new         = dst->src[1];
+    const ggml_tensor * v_new         = dst->src[2];
+    const ggml_tensor * k_cache       = dst->src[3];
+    const ggml_tensor * v_cache       = dst->src[4];
+    const ggml_tensor * block_table   = dst->src[5];
+    const ggml_tensor * write_slots   = dst->src[6];
+    const ggml_tensor * context_lens  = dst->src[7];
+    const ggml_tensor * batch_offsets = dst->src[8];
+    const ggml_tensor * batch_lens    = dst->src[9];
+
+    const float * op_params_f = (const float *) dst->op_params;
+    const int block_size      = ((const int32_t *) (op_params_f + 1))[0];
+    const int max_blocks      = ((const int32_t *) (op_params_f + 2))[0];
+
+    const uint32_t head_dim   = (uint32_t) q->ne[0];
+    const uint32_t n_heads    = (uint32_t) q->ne[1];
+    const uint32_t n_heads_kv = (uint32_t) k_new->ne[1];
+    const uint32_t n_seq      = (uint32_t) batch_lens->ne[0];
+
+    GGML_ASSERT(head_dim == 128 || head_dim == 256);
+    GGML_ASSERT(n_heads != 0 && n_heads_kv != 0 && n_heads % n_heads_kv == 0);
+    GGML_ASSERT(block_size > 0 && max_blocks > 0);
+    GGML_ASSERT(k_cache == v_cache);
+    GGML_ASSERT(k_cache->type == GGML_TYPE_F16 && v_cache->type == GGML_TYPE_F16);
+
+    vk_pipeline pipeline = head_dim == 256 ? ctx->device->pipeline_paged_attn_f16_d256 : ctx->device->pipeline_paged_attn_f16_d128;
+    GGML_ASSERT(pipeline);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
+
+    const vk_paged_attn_push_constants pc = {
+        head_dim, n_heads, n_heads_kv, n_seq, (uint32_t) block_size, (uint32_t) max_blocks, 0,
+        (uint32_t) (q->nb[1]             / sizeof(float)),
+        (uint32_t) (q->nb[2]             / sizeof(float)),
+        (uint32_t) (k_new->nb[1]         / sizeof(float)),
+        (uint32_t) (k_new->nb[2]         / sizeof(float)),
+        (uint32_t) (v_new->nb[1]         / sizeof(float)),
+        (uint32_t) (v_new->nb[2]         / sizeof(float)),
+        (uint32_t) (k_cache->nb[1]       / sizeof(ggml_fp16_t)),
+        (uint32_t) (k_cache->nb[2]       / sizeof(ggml_fp16_t)),
+        (uint32_t) (k_cache->nb[3]       / sizeof(ggml_fp16_t)),
+        (uint32_t) (dst->nb[1]           / sizeof(float)),
+        (uint32_t) (dst->nb[2]           / sizeof(float)),
+        op_params_f[0],
+    };
+
+    const vk_subbuffer q_buf             = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer k_new_buf         = ggml_vk_tensor_subbuffer(ctx, k_new);
+    const vk_subbuffer v_new_buf         = ggml_vk_tensor_subbuffer(ctx, v_new);
+    const vk_subbuffer k_cache_buf       = ggml_vk_tensor_subbuffer(ctx, k_cache);
+    const vk_subbuffer v_cache_buf       = ggml_vk_tensor_subbuffer(ctx, v_cache);
+    const vk_subbuffer block_table_buf   = ggml_vk_tensor_subbuffer(ctx, block_table);
+    const vk_subbuffer write_slots_buf   = ggml_vk_tensor_subbuffer(ctx, write_slots);
+    const vk_subbuffer context_lens_buf  = ggml_vk_tensor_subbuffer(ctx, context_lens);
+    const vk_subbuffer batch_offsets_buf = ggml_vk_tensor_subbuffer(ctx, batch_offsets);
+    const vk_subbuffer batch_lens_buf    = ggml_vk_tensor_subbuffer(ctx, batch_lens);
+    const vk_subbuffer dst_buf           = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const std::initializer_list<vk::DescriptorBufferInfo> buffers = {
+        q_buf, k_new_buf, v_new_buf, k_cache_buf, v_cache_buf,
+        block_table_buf, write_slots_buf, context_lens_buf,
+        batch_offsets_buf, batch_lens_buf, dst_buf,
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, pc,
+                              { n_heads_kv, n_seq, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    auto decode_pc = pc;
+    decode_pc.mode = 1;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, buffers, decode_pc,
+                              { n_heads, n_seq, 1 });
+}
+
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
     auto n_tiles = [&](vk_conv_shapes s) {
         return CEIL_DIV(K, vk_conv_block_sizes[s].K)
@@ -15284,6 +15391,17 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     break;
                 }
             }
+            if (cur_node->op == GGML_OP_PAGED_ATTN) {
+                for (int cache_idx : { 3, 4 }) {
+                    if (overlaps_unsynced(cur_node->src[cache_idx], ctx->unsynced_nodes_read)) {
+                        need_sync = true;
+                        break;
+                    }
+                }
+                if (need_sync) {
+                    break;
+                }
+            }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
                     continue;
@@ -15315,6 +15433,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
                 ctx->unsynced_nodes_written.push_back(cur_node);
+            }
+            if (cur_node->op == GGML_OP_PAGED_ATTN) {
+                ctx->unsynced_nodes_written.push_back(cur_node->src[3]);
+                ctx->unsynced_nodes_written.push_back(cur_node->src[4]);
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
@@ -15659,6 +15781,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+
+        break;
+
+    case GGML_OP_PAGED_ATTN:
+        ggml_vk_paged_attn(ctx, compute_ctx, node);
 
         break;
 
@@ -18145,6 +18272,60 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_PAGED_ATTN:
+            {
+                if (!device->fp16) {
+                    return false;
+                }
+                if (op->src[0]->type != GGML_TYPE_F32 ||
+                    op->src[1]->type != GGML_TYPE_F32 ||
+                    op->src[2]->type != GGML_TYPE_F32 ||
+                    op->src[3]->type != GGML_TYPE_F16 ||
+                    op->src[4]->type != GGML_TYPE_F16 ||
+                    op->src[5]->type != GGML_TYPE_I32 ||
+                    op->src[6]->type != GGML_TYPE_I32 ||
+                    op->src[7]->type != GGML_TYPE_I32 ||
+                    op->src[8]->type != GGML_TYPE_I32 ||
+                    op->src[9]->type != GGML_TYPE_I32 ||
+                    op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                const int block_size = ggml_get_op_params_i32(op, 1);
+                const int max_blocks = ggml_get_op_params_i32(op, 2);
+                auto contiguous = [](const ggml_tensor * t, size_t type_size) {
+                    return t->nb[0] == type_size &&
+                           t->nb[1] == t->nb[0] * t->ne[0] &&
+                           t->nb[2] == t->nb[1] * t->ne[1] &&
+                           t->nb[3] == t->nb[2] * t->ne[2];
+                };
+                if (block_size <= 0 || max_blocks <= 0 || op->src[3] != op->src[4] ||
+                    !contiguous(op->src[0], sizeof(float)) ||
+                    !contiguous(op->src[1], sizeof(float)) ||
+                    !contiguous(op->src[2], sizeof(float)) ||
+                    !contiguous(op, sizeof(float)) ||
+                    !contiguous(op->src[3], sizeof(ggml_fp16_t)) ||
+                    op->src[3]->ne[0] != op->src[0]->ne[0] ||
+                    op->src[3]->ne[1] != block_size ||
+                    op->src[3]->ne[2] < 2 * op->src[1]->ne[1] ||
+                    op->src[5]->nb[0] != sizeof(int32_t) ||
+                    op->src[5]->nb[1] != op->src[5]->nb[0] * op->src[5]->ne[0] ||
+                    op->src[5]->ne[0] < max_blocks ||
+                    op->src[5]->ne[1] != op->src[8]->ne[0] ||
+                    op->src[6]->nb[0] != sizeof(int32_t) ||
+                    op->src[7]->nb[0] != sizeof(int32_t) ||
+                    op->src[8]->nb[0] != sizeof(int32_t) ||
+                    op->src[9]->nb[0] != sizeof(int32_t)) {
+                    return false;
+                }
+                const uint64_t head_dim = op->src[0]->ne[0];
+                if (head_dim != 128 && (head_dim != 256 || device->max_workgroup_size_log2 < 8)) {
+                    return false;
+                }
+                return
+                       op->src[0]->ne[1] > 0 &&
+                       op->src[1]->ne[1] > 0 &&
+                       op->src[0]->ne[1] % op->src[1]->ne[1] == 0;
+            }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -19111,6 +19292,13 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             if (src_clone[4]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
             }
+        } else if (tensor->op == GGML_OP_PAGED_ATTN) {
+            const float * params = (const float *) tensor->op_params;
+            const int32_t * params_i = (const int32_t *) (params + 1);
+            tensor_clone = ggml_paged_attn(ggml_ctx,
+                                           src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4],
+                                           src_clone[5], src_clone[6], src_clone[7], src_clone[8], src_clone[9],
+                                           params[0], params_i[0], params_i[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

@@ -10,10 +10,12 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-paged.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -2088,7 +2090,9 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                            const std::vector<ggml_backend_t> & layer_backends,
+                                            ggml_backend_t backend_cpu) const {
     llama_memory_i * res;
 
     switch (arch) {
@@ -2322,6 +2326,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+                    } else if (cparams.kv_paged) {
+                        GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
+                        GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
+                        LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_memory_hybrid_paged.\n", __func__, cparams.kv_paged);
+                        res = new llama_memory_hybrid_paged(
+                            /* model             */ *this,
+                            /* attn_type_kv      */ params.type_k,
+                            /* attn_block_size   */ cparams.block_size,
+                            /* attn_n_gpu_blocks */ cparams.n_gpu_blocks,
+                            /* attn_n_cpu_blocks */ cparams.n_cpu_blocks,
+                            /* attn_watermark    */ cparams.kv_paged_watermark,
+                            /* attn_n_ubatch     */ cparams.n_ubatch,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* offload           */ cparams.offload_kqv,
+                            /* layer_backends    */ layer_backends,
+                            /* backend_cpu       */ backend_cpu,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr));
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2426,23 +2452,53 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
-                                *this,
-                                hparams,
+                        if (cparams.kv_paged) {
+                            GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
+                            GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
+                            LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
+                            const uint32_t head_dim   = hparams.n_embd_head_v();
+                            const uint32_t n_head     = hparams.n_head_kv();
+                            const uint32_t n_layers   = hparams.n_layer();
+                            const uint32_t block_size = cparams.block_size;
+
+                            const uint32_t n_gpu_blocks = cparams.n_gpu_blocks;
+                            const uint32_t n_cpu_blocks = cparams.n_cpu_blocks;
+                            const float    watermark    = cparams.kv_paged_watermark;
+
+                            const uint32_t n_ubatch   = cparams.n_ubatch;
+                            const uint32_t n_seq_max  = cparams.n_seq_max;
+
+                            auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
+                            GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
+
+                            paged_cache->init(
+                                layer_backends,
+                                backend_cpu,
                                 params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                filter,
-                                nullptr,
-                                nullptr);
+                                n_gpu_blocks,
+                                n_cpu_blocks,
+                                watermark);
+
+                            res = paged_cache;
+                        } else {
+                            res = new llama_kv_cache(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    filter,
+                                    nullptr,
+                                    nullptr);
+                        }
                     }
                 }
             }

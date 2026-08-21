@@ -46,8 +46,8 @@ class llama_kv_cache_paged : public llama_memory_i {
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
 
-    // Prepare the single-sequence context path used by llama-server. The
-    // scheduler path continues to provide its own llama_paged_batch_info.
+    // Prepare the llama-server context path. The scheduler path continues to
+    // provide its own llama_paged_batch_info.
     bool prepare_batch(const llama_batch & batch);
     bool build_batch_info(const llama_ubatch & ubatch, llama_paged_batch_info & info) const;
     void commit_batch(const llama_ubatch & ubatch);

@@ -429,87 +429,135 @@ bool llama_kv_cache_paged::prepare_batch(const llama_batch & batch) {
         return false;
     }
 
-    // ponytail: llama-server is configured with --parallel 1; keep this
-    // fallback narrow until the scheduler owns the server request lifecycle.
-    const llama_seq_id seq_id = batch.seq_id[0][0];
+    struct sequence_batch {
+        llama_pos previous_max = -1;
+        llama_pos last_pos     = -1;
+        int32_t   n_tokens     = 0;
+        size_t    old_size     = 0;
+        bool      initialized  = false;
+    };
+
+    std::unordered_map<llama_seq_id, sequence_batch> sequences;
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq_id) {
-            LLAMA_LOG_ERROR("%s: server-side paged KV currently supports one sequence per batch\n", __func__);
+        if (batch.n_seq_id[i] != 1) {
+            LLAMA_LOG_ERROR("%s: server-side paged KV does not support coupled sequences\n", __func__);
             return false;
         }
+
+        const llama_seq_id seq_id = batch.seq_id[i][0];
+        auto [it, inserted] = sequences.try_emplace(seq_id);
+        auto & sequence = it->second;
+        if (inserted) {
+            sequence.previous_max = seq_pos_max(seq_id);
+            sequence.last_pos = sequence.previous_max;
+        }
+
+        if (batch.pos[i] != sequence.last_pos + 1) {
+            LLAMA_LOG_ERROR("%s: non-contiguous sequence positions for seq %d: previous_max=%d current=%d\n",
+                            __func__, seq_id, sequence.last_pos, batch.pos[i]);
+            return false;
+        }
+        sequence.last_pos = batch.pos[i];
+        ++sequence.n_tokens;
     }
 
-    const llama_pos previous_max = seq_pos_max(seq_id);
-    const llama_pos first_pos = batch.pos[0];
-    if (previous_max >= 0 && first_pos != previous_max + 1) {
-        LLAMA_LOG_ERROR("%s: non-contiguous sequence positions for seq %d: previous_max=%d first=%d\n",
-                        __func__, seq_id, previous_max, first_pos);
+    for (auto & entry : sequences) {
+        const llama_seq_id seq_id = entry.first;
+        auto & sequence = entry.second;
+        auto & group = regular_groups[seq_id];
+        group.request_id = seq_id;
+        group.n_prompt = 0;
+        group.n_decoded = sequence.previous_max >= 0 ? sequence.previous_max + 1 : 0;
+        sequence.old_size = group.block_table.size();
+        sequence.initialized = true;
+
+        if (allocate(sequence.n_tokens, group)) {
+            continue;
+        }
+
+        for (auto & rollback_entry : sequences) {
+            const llama_seq_id rollback_seq_id = rollback_entry.first;
+            const size_t old_size = rollback_entry.second.old_size;
+            if (!rollback_entry.second.initialized) {
+                continue;
+            }
+            auto group_it = regular_groups.find(rollback_seq_id);
+            if (group_it == regular_groups.end() || group_it->second.block_table.size() <= old_size) {
+                continue;
+            }
+            auto & rollback_group = group_it->second;
+            llama_block_ids rollback(rollback_group.block_table.begin() + old_size, rollback_group.block_table.end());
+            release_gpu_blocks(rollback);
+            rollback_group.block_table.resize(old_size);
+            if (old_size == 0) {
+                regular_groups.erase(group_it);
+            }
+        }
         return false;
     }
 
-    for (int32_t i = 1; i < batch.n_tokens; ++i) {
-        if (batch.pos[i] != batch.pos[i - 1] + 1) {
-            LLAMA_LOG_ERROR("%s: server-side paged KV requires contiguous positions\n", __func__);
-            return false;
-        }
-    }
-
-    auto & group = regular_groups[seq_id];
-    group.request_id = seq_id;
-    group.n_prompt = 0;
-    group.n_decoded = previous_max >= 0 ? previous_max + 1 : 0;
-
-    const size_t old_size = group.block_table.size();
-    if (allocate(batch.n_tokens, group)) {
-        return true;
-    }
-
-    if (group.block_table.size() > old_size) {
-        llama_block_ids rollback(group.block_table.begin() + old_size, group.block_table.end());
-        release_gpu_blocks(rollback);
-        group.block_table.resize(old_size);
-    }
-    if (old_size == 0) {
-        regular_groups.erase(seq_id);
-    }
-    return false;
+    return true;
 }
 
 bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_paged_batch_info & info) const {
-    if (ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.n_pos < 1) {
+    if (ubatch.n_tokens == 0 || ubatch.n_seqs_unq == 0 || ubatch.n_pos < 1) {
         return false;
     }
 
-    const llama_seq_id seq_id = ubatch.seq_id_unq[0];
-    const auto it = regular_groups.find(seq_id);
-    if (it == regular_groups.end() || it->second.block_table.empty()) {
-        return false;
-    }
-
-    const auto & block_table = it->second.block_table;
     regular_write_slots.resize(ubatch.n_tokens);
-    regular_block_table.assign(num_gpu_blocks, 0);
-    std::copy(block_table.begin(), block_table.end(), regular_block_table.begin());
-    regular_context_lens.assign(1, 0);
-    regular_batch_offsets.assign(1, 0);
-    regular_batch_lens.assign(1, ubatch.n_tokens);
+    regular_context_lens.assign(ubatch.n_seqs_unq, 0);
+    regular_batch_offsets.assign(ubatch.n_seqs_unq, -1);
+    regular_batch_lens.assign(ubatch.n_seqs_unq, 0);
 
-    llama_pos max_pos = -1;
+    std::unordered_map<llama_seq_id, uint32_t> sequence_indices;
+    std::vector<const llama_block_ids *> block_tables(ubatch.n_seqs_unq, nullptr);
+    uint32_t max_blocks = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        const auto it = regular_groups.find(seq_id);
+        if (it == regular_groups.end() || it->second.block_table.empty()) {
+            return false;
+        }
+        sequence_indices.emplace(seq_id, s);
+        block_tables[s] = &it->second.block_table;
+        max_blocks = std::max(max_blocks, (uint32_t) it->second.block_table.size());
+    }
+    regular_block_table.assign((size_t) ubatch.n_seqs_unq * max_blocks, -1);
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        std::copy(block_tables[s]->begin(), block_tables[s]->end(), regular_block_table.begin() + s * max_blocks);
+    }
+
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return false;
+        }
+        const auto sequence_it = sequence_indices.find(ubatch.seq_id[i][0]);
+        if (sequence_it == sequence_indices.end()) {
+            return false;
+        }
+        const uint32_t s = sequence_it->second;
+        if (regular_batch_offsets[s] < 0) {
+            regular_batch_offsets[s] = i;
+        } else if ((uint32_t) regular_batch_offsets[s] + regular_batch_lens[s] != i) {
+            LLAMA_LOG_ERROR("%s: sequence tokens must be contiguous in a paged ubatch\n", __func__);
+            return false;
+        }
+
         // Qwen uses 4-position M-RoPE; the first position plane is the
         // sequential token position used by the paged KV block table.
         const llama_pos pos = ubatch.pos[i];
         const uint32_t block = pos / block_size;
+        const auto & block_table = *block_tables[s];
         if (block >= block_table.size()) {
             return false;
         }
         regular_write_slots[i] = block_table[block] * block_size + (pos % block_size);
-        max_pos = std::max(max_pos, pos);
+        regular_context_lens[s] = std::max(regular_context_lens[s], (int32_t) pos + 1);
+        ++regular_batch_lens[s];
     }
 
-    regular_context_lens[0] = max_pos + 1;
-    info.n_blocks_per_seq = num_gpu_blocks;
-    info.n_seq            = 1;
+    info.n_blocks_per_seq = max_blocks;
+    info.n_seq            = ubatch.n_seqs_unq;
     info.n_tokens         = ubatch.n_tokens;
     info.write_slots      = regular_write_slots.data();
     info.block_table      = regular_block_table.data();
@@ -520,14 +568,18 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
 }
 
 void llama_kv_cache_paged::commit_batch(const llama_ubatch & ubatch) {
-    if (ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1) {
+    if (ubatch.n_tokens == 0) {
         return;
     }
 
-    const llama_seq_id seq_id = ubatch.seq_id_unq[0];
-    auto & range = sequence_positions[seq_id];
-    range.min = range.min < 0 ? ubatch.pos[0] : range.min;
-    range.max = ubatch.pos[ubatch.n_tokens - 1];
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return;
+        }
+        auto & range = sequence_positions[ubatch.seq_id[i][0]];
+        range.min = range.min < 0 ? ubatch.pos[i] : std::min(range.min, ubatch.pos[i]);
+        range.max = std::max(range.max, ubatch.pos[i]);
+    }
 }
 
 void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {

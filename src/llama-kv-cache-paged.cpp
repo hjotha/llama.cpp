@@ -511,7 +511,6 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
 
     std::unordered_map<llama_seq_id, uint32_t> sequence_indices;
     std::vector<const llama_block_ids *> block_tables(ubatch.n_seqs_unq, nullptr);
-    uint32_t max_blocks = 0;
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
         const llama_seq_id seq_id = ubatch.seq_id_unq[s];
         const auto it = regular_groups.find(seq_id);
@@ -520,11 +519,10 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
         }
         sequence_indices.emplace(seq_id, s);
         block_tables[s] = &it->second.block_table;
-        max_blocks = std::max(max_blocks, (uint32_t) it->second.block_table.size());
     }
-    regular_block_table.assign((size_t) ubatch.n_seqs_unq * max_blocks, -1);
+    regular_block_table.assign((size_t) ubatch.n_seqs_unq * num_gpu_blocks, 0);
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-        std::copy(block_tables[s]->begin(), block_tables[s]->end(), regular_block_table.begin() + s * max_blocks);
+        std::copy(block_tables[s]->begin(), block_tables[s]->end(), regular_block_table.begin() + s * num_gpu_blocks);
     }
 
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -556,7 +554,7 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
         ++regular_batch_lens[s];
     }
 
-    info.n_blocks_per_seq = max_blocks;
+    info.n_blocks_per_seq = num_gpu_blocks;
     info.n_seq            = ubatch.n_seqs_unq;
     info.n_tokens         = ubatch.n_tokens;
     info.write_slots      = regular_write_slots.data();

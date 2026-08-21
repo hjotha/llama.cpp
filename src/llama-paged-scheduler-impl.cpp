@@ -1,5 +1,7 @@
 #include "llama-paged-scheduler-impl.h"
 
+#include <algorithm>
+
 #include "llama-impl.h"
 
 llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_ctx,

@@ -229,6 +229,8 @@ struct server_slot {
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
+    int32_t n_ctx_reservation = 0;
+    bool clear_context_on_release = false;
 
     size_t last_nl_pos = 0;
 
@@ -352,6 +354,7 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+        n_ctx_reservation = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -508,7 +511,7 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            if (clear_context_on_release || task->is_child()) {
                 prompt_clear();
             }
 
@@ -852,6 +855,7 @@ private:
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
+    bool elastic_paged_context = false;
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1121,6 +1125,7 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+        elastic_paged_context = params_base.kv_paged && params_base.kv_paged_dynamic && params_base.n_parallel > 1 && !has_spec;
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1211,6 +1216,9 @@ private:
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+        if (elastic_paged_context) {
+            n_ctx_slot = n_ctx;
+        }
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
@@ -1228,8 +1236,8 @@ private:
         }
 
         // setup slots
-        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
-                params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
+        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s', elastic_paged_context = %s\n",
+                params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false", elastic_paged_context ? "true" : "false");
 
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1266,6 +1274,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+            slot.clear_context_on_release = elastic_paged_context;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1497,7 +1506,33 @@ private:
         return nullptr;
     }
 
+    int64_t get_context_reservation(const server_task & task) const {
+        const int32_t n_predict = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        if (n_predict < 0) {
+            return n_ctx;
+        }
+
+        return (int64_t) task.n_tokens() + n_predict;
+    }
+
+    bool has_context_reservation(const server_task & task) const {
+        int64_t n_reserved = get_context_reservation(task);
+
+        for (const server_slot & slot : slots) {
+            if (slot.is_processing()) {
+                n_reserved += slot.n_ctx_reservation;
+            }
+        }
+
+        return n_reserved <= n_ctx;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
+        if (elastic_paged_context && !has_context_reservation(task)) {
+            return nullptr;
+        }
+
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1762,6 +1797,7 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+        slot.n_ctx_reservation = elastic_paged_context ? get_context_reservation(task) : 0;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2324,6 +2360,14 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (elastic_paged_context && get_context_reservation(task) > n_ctx) {
+                        send_error(task,
+                                   string_format("request (%d tokens plus output) exceeds the shared context size (%d tokens)",
+                                                 task.n_tokens(), n_ctx),
+                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 

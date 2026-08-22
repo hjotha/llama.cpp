@@ -344,6 +344,29 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // if ctx_other is provided, add devices from ctx_other model so shared tensors can run on their backends
+        if (cparams.ctx_other != nullptr) {
+            const auto * model_other = llama_get_model(cparams.ctx_other);
+            if (model_other != nullptr) {
+                for (const auto & dev : model_other->devices) {
+                    bool found = false;
+                    for (const auto & b : backends) {
+                        if (ggml_backend_get_device(b.get()) == dev.dev) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                        if (backend == nullptr) {
+                            throw std::runtime_error(format("failed to initialize %s backend from ctx_other", ggml_backend_dev_name(dev.dev)));
+                        }
+                        backends.emplace_back(backend);
+                    }
+                }
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -405,7 +428,16 @@ llama_context::llama_context(
             layer_backends.resize(model.hparams.n_layer(), backend_cpu);
             for (auto & b : backends) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    kv_backends.push_back(b.get());
+                    bool in_model = false;
+                    for (const auto & dev : model.devices) {
+                        if (dev.dev == ggml_backend_get_device(b.get())) {
+                            in_model = true;
+                            break;
+                        }
+                    }
+                    if (in_model) {
+                        kv_backends.push_back(b.get());
+                    }
                 }
             }
             for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {

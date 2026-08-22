@@ -18442,6 +18442,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     GGML_LOG_INFO("%s: rejecting PAGED_ATTN on Vulkan%zu: %s\n", __func__, ctx->device, reason);
                     return false;
                 };
+                if (!op->src[3]) {
+                    return reject("missing K cache tensor");
+                }
                 if (op->src[3]->buffer) {
                     const auto buft = op->src[3]->buffer->buft;
                     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name ||

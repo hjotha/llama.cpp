@@ -856,6 +856,7 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
     bool elastic_paged_context = false;
+    uint32_t paged_admission_blocks = 0;
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1126,6 +1127,7 @@ private:
 
         n_ctx = llama_n_ctx(ctx_tgt);
         elastic_paged_context = params_base.kv_paged && params_base.kv_paged_dynamic && params_base.n_parallel > 1 && !has_spec;
+        paged_admission_blocks = elastic_paged_context ? params_base.n_gpu_blocks_admission : 0;
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1518,18 +1520,30 @@ private:
 
     bool has_context_reservation(const server_task & task) const {
         int64_t n_reserved = get_context_reservation(task);
+        int32_t n_active = 0;
 
         for (const server_slot & slot : slots) {
             if (slot.is_processing()) {
                 n_reserved += slot.n_ctx_reservation;
+                ++n_active;
             }
         }
 
-        return n_reserved <= n_ctx;
+        if (n_reserved > n_ctx) {
+            return false;
+        }
+
+        if (n_active == 0 || paged_admission_blocks == 0) {
+            return true;
+        }
+
+        const uint64_t n_blocks = (n_reserved + params_base.block_size - 1) / params_base.block_size;
+        return n_blocks <= paged_admission_blocks;
     }
 
     server_slot * get_available_slot(const server_task & task) {
         if (elastic_paged_context && !has_context_reservation(task)) {
+            SRV_DBG("%s", "deferring task: paged KV reservation exceeds an active admission limit\n");
             return nullptr;
         }
 

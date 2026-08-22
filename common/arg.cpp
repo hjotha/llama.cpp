@@ -1735,6 +1735,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_PAGED_DYNAMIC").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
+        {"--kv-paged-admission-blocks"}, "N",
+        "limit total admitted paged-KV blocks while multiple requests are active (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("kv-paged-admission-blocks must be non-negative");
+            }
+            params.n_gpu_blocks_admission = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_ADMISSION_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--paged-attn-cuda"},
         "pin full-attention layers to the first offload device (use with --tensor-split for recurrent-only layers on the next device)",
         [](common_params & params) {

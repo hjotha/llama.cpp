@@ -1207,8 +1207,9 @@ ggml_tensor * build_attn_mha_paged(
                  int   block_size,
                  int   max_blocks,
                  int   active_context,
-         ggml_tensor * snapkv_scores,   // [max_blocks] page importance accumulator, nullable
-                 int   snapkv_capture_from) const;
+         ggml_tensor * snapkv_scores,   // [max_blocks, batch_size] page importance accumulator, nullable
+         ggml_tensor * snapkv_capture_from,
+         ggml_tensor * snapkv_score_slots) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -61,6 +61,10 @@ def prompt(tokens, task):
 
 
 def start(ctx, blocks, snap=None, binary=BIN):
+    subprocess.run(["pkill", "-9", "-f", f"--port {PORT}"], capture_output=True)
+    subprocess.run("echo amdk6x | sudo -S sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'",
+                   shell=True, capture_output=True)
+    time.sleep(4)
     cmd = [binary, "--model", MODEL, "--host", "127.0.0.1", "--port", str(PORT), "--ctx-size", str(ctx),
            "--batch-size", "128", "--ubatch-size", "128", "--parallel", "1", "--n-gpu-layers", "999",
            "--device", "CUDA0", "--flash-attn", "on", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
@@ -92,7 +96,7 @@ def run_case(name, ctx, blocks, snap, binary=BIN):
     try:
         source, facts = prompt(int(ctx * .80), "Responda somente com os tres fatos ALFA, BETA e GAMA.")
         payload = {"messages": [{"role": "system", "content": "Responda exatamente ao pedido do usuario."},
-                                {"role": "user", "content": source}], "temperature": 0, "max_tokens": 96}
+                                {"role": "user", "content": source}], "temperature": 0, "max_tokens": 256, "chat_template_kwargs": {"enable_thinking": False}}
         began = time.time()
         response = request("/v1/chat/completions", payload)
         wall = time.time() - began
@@ -100,7 +104,7 @@ def run_case(name, ctx, blocks, snap, binary=BIN):
         timing = response.get("timings", {})
         return {"name": name, "ctx": ctx, "blocks": blocks, "snap": snap, "prefill_tps": timing.get("prompt_per_second"),
                 "decode_tps": timing.get("predicted_per_second"), "ttft_ms": timing.get("prompt_ms"), "wall_s": wall,
-                "vram_mib": vram(), "quality": all(f.split(": ")[1] in answer for f in facts), "answer": answer[:500], **metrics()}
+                "vram_mib": vram(), "quality": all(k in answer for k in ("ORION-741", "97", "delta-coral")), "answer": answer[:500], **metrics()}
     finally:
         proc.terminate()
         proc.wait(timeout=30)
@@ -110,13 +114,20 @@ def run_case(name, ctx, blocks, snap, binary=BIN):
 def main():
     budget = 3072
     rows = []
+    def safe(name, fn):
+        try:
+            rows.append(fn())
+        except Exception as e:
+            rows.append({"name": name, "error": repr(e)[:200]})
+            print(f"CASE_FAILED {name}: {e!r}", flush=True)
+
     for ctx in (32768, 65536, 98304, 131072):
-        rows.append(run_case(f"paged-{ctx // 1024}k", ctx, ctx // 16, None))
-        rows.append(run_case(f"continuous-{ctx // 1024}k", ctx, budget,
+        safe(f"paged-{ctx // 1024}k", lambda ctx=ctx: run_case(f"paged-{ctx // 1024}k", ctx, ctx // 16, None))
+        safe(f"continuous-{ctx // 1024}k", lambda ctx=ctx: run_case(f"continuous-{ctx // 1024}k", ctx, budget,
                              {"window": 16384, "retention": .75}, CONTINUOUS_BIN))
         for retention in (1.0, .75, .5):
-            rows.append(run_case(f"episode-{ctx // 1024}k-r{retention}", ctx, budget,
-                                 {"window": 1024, "retention": retention}))
+            safe(f"episode-{ctx // 1024}k-r{retention}", lambda ctx=ctx, retention=retention: run_case(
+                f"episode-{ctx // 1024}k-r{retention}", ctx, budget, {"window": 1024, "retention": retention}))
         with open(OUT, "w") as result:
             json.dump(rows, result, indent=2)
     print(json.dumps(rows, indent=2))

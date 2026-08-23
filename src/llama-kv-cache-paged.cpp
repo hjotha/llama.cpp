@@ -552,7 +552,7 @@ void llama_kv_cache_paged::snapkv_schedule_capture(llama_sequence_group & group,
         return;
     }
     auto & state = snapkv_sequences[group.request_id];
-    if (!snapkv_score_slots.contains(group.request_id)) {
+    if (snapkv_score_slots.find(group.request_id) == snapkv_score_slots.end()) {
         std::vector<bool> used(n_seq_max, false);
         for (const auto & entry : snapkv_score_slots) {
             if (entry.second < used.size()) {

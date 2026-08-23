@@ -65,7 +65,8 @@ class llama_kv_cache_paged : public llama_memory_i {
     void set_max_logical_blocks(uint32_t n_logical_blocks);
     uint32_t get_max_logical_blocks() const { return max_logical_blocks; }
     struct ggml_tensor * get_snapkv_scores() const { return snapkv_capture_active ? snapkv_scores_tensor : nullptr; }
-    int32_t get_snapkv_capture_from() const;
+    struct ggml_tensor * get_snapkv_capture_from() const { return snapkv_capture_active ? snapkv_capture_from_tensor : nullptr; }
+    struct ggml_tensor * get_snapkv_score_slots() const { return snapkv_capture_active ? snapkv_score_slots_tensor : nullptr; }
     void snapkv_update_capture(const llama_ubatch & ubatch);
     bool ensure_pos_blocks(uint32_t max_pos, llama_sequence_group & group);
     bool ensure_batch_blocks(const llama_ubatch & ubatch);
@@ -142,8 +143,10 @@ class llama_kv_cache_paged : public llama_memory_i {
     bool ensure_physical_capacity(uint32_t required_blocks, bool rebalance = false);
     void maybe_restore_initial_storage();
     bool snapkv_sync_scores();
-    void snapkv_start_prefill(llama_pos prefill_end);
-    void snapkv_schedule_capture(llama_pos capture_end);
+    void snapkv_start_prefill(llama_sequence_group & group, llama_pos prefill_end);
+    void snapkv_schedule_capture(llama_sequence_group & group, llama_pos capture_end);
+    uint32_t snapkv_global_target(const llama_sequence_group & group) const;
+    float snapkv_score(const llama_sequence_group & group, uint32_t bid) const;
     uint32_t snapkv_evict_to_target(llama_sequence_group & group, uint32_t target_blocks);
     uint32_t snapkv_progressive_evict(llama_sequence_group & group, uint32_t num_blocks_needed);
     bool snapkv_migrate_cpu_to_gpu(llama_sequence_group & group);
@@ -198,15 +201,23 @@ class llama_kv_cache_paged : public llama_memory_i {
     float    snapkv_retention = 1.0f;
     uint32_t snapkv_budget_blocks = 0;
     uint32_t max_logical_blocks = 0;
+    struct snapkv_sequence_state {
+        bool pending_final_evict = false;
+        llama_pos capture_from = -1;
+        llama_pos capture_until = -1;
+    };
     bool     snapkv_capture_active = false;
-    bool     snapkv_pending_final_evict = false;
-    llama_pos snapkv_capture_from = -1;
-    llama_pos snapkv_capture_until = -1;
     ggml_context_ptr snapkv_ctx;
     ggml_backend_buffer_ptr snapkv_buf;
     ggml_backend_t snapkv_backend = nullptr;
     struct ggml_tensor * snapkv_scores_tensor = nullptr;
+    struct ggml_tensor * snapkv_capture_from_tensor = nullptr;
+    struct ggml_tensor * snapkv_score_slots_tensor = nullptr;
     std::vector<float> snapkv_scores_host;
+    std::vector<int32_t> snapkv_capture_from_host;
+    std::vector<int32_t> snapkv_score_slots_host;
+    std::unordered_map<llama_seq_id, snapkv_sequence_state> snapkv_sequences;
+    std::unordered_map<llama_seq_id, uint32_t> snapkv_score_slots;
 
     struct seq_range {
         llama_pos min = -1;
@@ -246,7 +257,8 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     int32_t * get_batch_lens() const;
 
     struct ggml_tensor * get_snapkv_scores() const { return manager ? manager->get_snapkv_scores() : nullptr; }
-    int32_t get_snapkv_capture_from() const { return manager ? manager->get_snapkv_capture_from() : -1; }
+    struct ggml_tensor * get_snapkv_capture_from() const { return manager ? manager->get_snapkv_capture_from() : nullptr; }
+    struct ggml_tensor * get_snapkv_score_slots() const { return manager ? manager->get_snapkv_score_slots() : nullptr; }
 
     void set_n_tokens(int32_t new_n_tokens);
     void set_batch_size(int32_t new_batch_size);

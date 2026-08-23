@@ -61,6 +61,10 @@ def prompt(tokens, task):
 
 
 def start(ctx, blocks, snap=None, binary=BIN):
+    subprocess.run(["pkill", "-9", "-f", f"--port {PORT}"], capture_output=True)
+    subprocess.run("echo amdk6x | sudo -S sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'",
+                   shell=True, capture_output=True)
+    time.sleep(4)
     cmd = [binary, "--model", MODEL, "--host", "127.0.0.1", "--port", str(PORT), "--ctx-size", str(ctx),
            "--batch-size", "128", "--ubatch-size", "128", "--parallel", "1", "--n-gpu-layers", "999",
            "--device", "CUDA0", "--flash-attn", "on", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",

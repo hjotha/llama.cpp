@@ -2862,7 +2862,9 @@ extern "C" {
                                                   float                 scale,
                                                   int                   block_size,
                                                   int                   max_blocks,
-                                                  int                   active_context);
+                                                  int                   active_context,
+                                                  struct ggml_tensor  * snapkv_scores,
+                                                  int                   snapkv_capture_from);
 
     //
     // quantization

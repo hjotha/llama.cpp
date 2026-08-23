@@ -427,6 +427,14 @@ extern "C" {
         uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
         float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
 
+        // SnapKV-style selective KV retention over the paged cache
+        bool     snapkv_enabled;           // enable selective page eviction after prefill
+        uint32_t snapkv_observation_window; // tokens used to score page importance (0 = disabled)
+        uint32_t snapkv_recent_tokens;     // always-retained trailing window in tokens
+        uint32_t snapkv_pinned_tokens;     // always-retained leading window in tokens
+        float    snapkv_retention;         // fraction of old (non-pinned/non-recent) pages retained [0, 1]
+        uint32_t snapkv_budget_blocks;     // max physical blocks retained per sequence (0 = full GPU pool)
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

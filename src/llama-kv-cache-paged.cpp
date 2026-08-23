@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 
 //
@@ -411,7 +412,7 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
 
     uint32_t required_blocks = required_gpu_capacity();
     if (!preview_ids.empty()) {
-        required_blocks = std::max(required_blocks, *std::max_element(preview_ids.begin(), preview_ids.end()) + 1);
+        required_blocks = std::max(required_blocks, (uint32_t) *std::max_element(preview_ids.begin(), preview_ids.end()) + 1);
     }
     if (!ensure_physical_capacity(required_blocks, allow_dynamic_spill && num_tokens <= 4)) {
         return false;
@@ -466,37 +467,119 @@ bool llama_kv_cache_paged::prepare_batch(const llama_batch & batch) {
         auto & sequence = entry.second;
         auto & group = regular_groups[seq_id];
         group.request_id = seq_id;
-        group.n_prompt = 0;
-        group.n_decoded = sequence.previous_max >= 0 ? sequence.previous_max + 1 : 0;
+        const uint32_t prev_decoded = group.n_decoded;
+        const uint32_t prev_n_prompt = group.n_prompt;
+        // keep the allocator invariant n_prompt + n_decoded == previous_max + 1:
+        // while prefilling n_prompt holds the cached tokens and n_decoded is 0;
+        // once decoding starts the roles flip.
+        group.n_prompt = sequence.previous_max >= 0 ? sequence.previous_max + 1 : 0;
+        group.n_decoded = 0;
+        if (sequence.n_tokens == 1 && sequence.previous_max >= 0) {
+            group.n_decoded = sequence.previous_max + 1;
+            group.n_prompt = 0;
+        }
         sequence.old_size = group.block_table.size();
         sequence.initialized = true;
+
+        if (sequence.previous_max < 0 && snapkv_enabled) {
+            snapkv_start_prefill(sequence.last_pos + 1);
+        }
+
+        // First decode after a prefill: run the final SnapKV eviction before
+        // allocating the decode block, while the attention scores are fresh.
+        const bool first_decode = snapkv_enabled && sequence.n_tokens == 1 &&
+                                  sequence.previous_max >= 0 && prev_decoded == 0 && prev_n_prompt > 0;
+        if (first_decode) {
+            end_prefill(group);
+        }
 
         if (allocate(sequence.n_tokens, group)) {
             continue;
         }
 
-        for (auto & rollback_entry : sequences) {
-            const llama_seq_id rollback_seq_id = rollback_entry.first;
-            const size_t old_size = rollback_entry.second.old_size;
-            if (!rollback_entry.second.initialized) {
-                continue;
+        if (!snapkv_enabled) {
+            for (auto & rollback_entry : sequences) {
+                const llama_seq_id rollback_seq_id = rollback_entry.first;
+                const size_t old_size = rollback_entry.second.old_size;
+                if (!rollback_entry.second.initialized) {
+                    continue;
+                }
+                auto group_it = regular_groups.find(rollback_seq_id);
+                if (group_it == regular_groups.end() || group_it->second.block_table.size() <= old_size) {
+                    continue;
+                }
+                auto & rollback_group = group_it->second;
+                llama_block_ids rollback(rollback_group.block_table.begin() + old_size, rollback_group.block_table.end());
+                release_gpu_blocks(rollback);
+                rollback_group.block_table.resize(old_size);
+                if (old_size == 0) {
+                    regular_groups.erase(group_it);
+                }
             }
-            auto group_it = regular_groups.find(rollback_seq_id);
-            if (group_it == regular_groups.end() || group_it->second.block_table.size() <= old_size) {
-                continue;
-            }
-            auto & rollback_group = group_it->second;
-            llama_block_ids rollback(rollback_group.block_table.begin() + old_size, rollback_group.block_table.end());
-            release_gpu_blocks(rollback);
-            rollback_group.block_table.resize(old_size);
-            if (old_size == 0) {
-                regular_groups.erase(group_it);
-            }
+            return false;
         }
-        return false;
+
+        // SnapKV streaming prefill: allocate physical pages up to last_pos,
+        // evicting old low-importance pages first when the pool is exhausted.
+        if (!ensure_pos_blocks((uint32_t) sequence.last_pos, group)) {
+            LLAMA_LOG_ERROR("%s: snapkv streaming prefill could not cover pos %d for seq %d\n",
+                            __func__, (int) sequence.last_pos, seq_id);
+            return false;
+        }
     }
 
     return true;
+}
+
+bool llama_kv_cache_paged::ensure_batch_blocks(const llama_ubatch & ubatch) {
+    if (!snapkv_enabled || ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1) {
+        return true;
+    }
+    llama_pos max_pos = ubatch.pos[0];
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        max_pos = std::max(max_pos, ubatch.pos[i]);
+    }
+    auto it = regular_groups.find(ubatch.seq_id_unq[0]);
+    if (it == regular_groups.end()) {
+        return true;
+    }
+    return ensure_pos_blocks((uint32_t) max_pos, it->second);
+}
+
+void llama_kv_cache_paged::snapkv_schedule_capture(llama_pos capture_end) {
+    if (snapkv_scores_tensor == nullptr) {
+        return;
+    }
+    std::fill(snapkv_scores_host.begin(), snapkv_scores_host.end(), 0.0f);
+    ggml_backend_tensor_set(snapkv_scores_tensor, snapkv_scores_host.data(), 0,
+                            snapkv_scores_host.size() * sizeof(float));
+    snapkv_capture_until = std::max<decltype(capture_end)>(0, capture_end);
+    snapkv_capture_from = std::max<decltype(capture_end)>(0, snapkv_capture_until - (llama_pos) snapkv_observation_window);
+    snapkv_capture_active = false;
+}
+
+void llama_kv_cache_paged::snapkv_start_prefill(llama_pos prefill_end) {
+    if (snapkv_scores_tensor == nullptr) {
+        return;
+    }
+    const llama_pos budget_end = (llama_pos) (snapkv_budget_blocks > 0 ? snapkv_budget_blocks : num_gpu_blocks) * block_size;
+    snapkv_schedule_capture(std::min(prefill_end, budget_end));
+    snapkv_pending_final_evict = true;
+}
+
+void llama_kv_cache_paged::snapkv_update_capture(const llama_ubatch & ubatch) {
+    if (!snapkv_pending_final_evict || snapkv_scores_tensor == nullptr || ubatch.n_tokens == 0 ||
+        snapkv_capture_from < 0 || snapkv_capture_until <= snapkv_capture_from) {
+        snapkv_capture_active = false;
+        return;
+    }
+    llama_pos first = ubatch.pos[0];
+    llama_pos last = first;
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        first = std::min(first, ubatch.pos[i]);
+        last  = std::max(last, ubatch.pos[i]);
+    }
+    snapkv_capture_active = first < snapkv_capture_until && last >= snapkv_capture_from;
 }
 
 bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_paged_batch_info & info) const {
@@ -520,9 +603,12 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
         sequence_indices.emplace(seq_id, s);
         block_tables[s] = &it->second.block_table;
     }
-    regular_block_table.assign((size_t) ubatch.n_seqs_unq * num_gpu_blocks, 0);
+    const uint32_t table_width = max_logical_blocks > 0 ? max_logical_blocks : num_gpu_blocks;
+    regular_block_table.assign((size_t) ubatch.n_seqs_unq * table_width, -1);
     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-        std::copy(block_tables[s]->begin(), block_tables[s]->end(), regular_block_table.begin() + s * num_gpu_blocks);
+        GGML_ASSERT(block_tables[s]->size() <= table_width && "group block table exceeds logical width");
+        std::copy(block_tables[s]->begin(), block_tables[s]->end(),
+                  regular_block_table.begin() + s * table_width);
     }
 
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -546,7 +632,9 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
         const llama_pos pos = ubatch.pos[i];
         const uint32_t block = pos / block_size;
         const auto & block_table = *block_tables[s];
-        if (block >= block_table.size()) {
+        if (block >= block_table.size() || block_table[block] < 0) {
+            LLAMA_LOG_ERROR("%s: cannot write pos %lld: block %u out of range or evicted (table size %zu)\n",
+                            __func__, (long long) pos, block, block_table.size());
             return false;
         }
         regular_write_slots[i] = block_table[block] * block_size + (pos % block_size);
@@ -554,7 +642,7 @@ bool llama_kv_cache_paged::build_batch_info(const llama_ubatch & ubatch, llama_p
         ++regular_batch_lens[s];
     }
 
-    info.n_blocks_per_seq = num_gpu_blocks;
+    info.n_blocks_per_seq = max_logical_blocks > 0 ? max_logical_blocks : num_gpu_blocks;
     info.n_seq            = ubatch.n_seqs_unq;
     info.n_tokens         = ubatch.n_tokens;
     info.write_slots      = regular_write_slots.data();
@@ -586,10 +674,13 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
     }
 
     llama_block_ids blocks_to_free_gpu;
-    llama_block_ids blocks_to_free_cpu;
+    std::vector<uint32_t> blocks_to_free_cpu;
 
-    for (uint32_t block_id : group.block_table) {
-        if (block_manager.is_gpu(block_id)) {
+    for (int32_t block_id : group.block_table) {
+        if (block_id < 0) {
+            continue;
+        }
+        if (block_manager.is_gpu((uint32_t) block_id)) {
             blocks_to_free_gpu.push_back(block_id);
         } else {
             blocks_to_free_cpu.push_back(block_id);
@@ -616,6 +707,8 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     const uint32_t num_blocks = src_ids.size();
     LLAMA_LOG_DEBUG("%s: num_blocks_size=%d, new_ids_size=%ld\n", __func__, num_blocks, new_ids.size());
     GGML_ASSERT(num_blocks == new_ids.size() && "src_ids and new_ids do not have the same size.");
+    GGML_ASSERT(std::all_of(src_ids.begin(), src_ids.end(), [](int32_t id) { return id >= 0; }) &&
+                "do_block_copy requires valid block ids");
 
     GGML_ASSERT(kv_cpu_layers.size() == attn_layer_ids.size() && "CPU and attention layer counts differ.");
 
@@ -661,6 +754,12 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
     if (num_blocks == 0) {
         return true;
     }
+    if (std::any_of(group.block_table.begin(), group.block_table.end(), [](int32_t id) { return id < 0; })) {
+        // evicted pages cannot be swapped back in; the server path never hits this
+        LLAMA_LOG_WARN("%s: swap_in with evicted pages not supported, freeing instead\n", __func__);
+        free_blocks(group);
+        return true;
+    }
 
     // A potential optimization to reduce thrashing is to have a heuristic to check if
     // if we can continue decoding after swap_in.
@@ -675,7 +774,7 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
 
     uint32_t required_blocks = required_gpu_capacity();
     if (!preview_ids.empty()) {
-        required_blocks = std::max(required_blocks, *std::max_element(preview_ids.begin(), preview_ids.end()) + 1);
+        required_blocks = std::max(required_blocks, (uint32_t) *std::max_element(preview_ids.begin(), preview_ids.end()) + 1);
     }
     if (!ensure_physical_capacity(required_blocks)) {
         return false;
@@ -694,12 +793,17 @@ bool llama_kv_cache_paged::swap_out(llama_sequence_group & group) {
     if (num_blocks == 0) {
         return true;
     }
+    if (std::any_of(group.block_table.begin(), group.block_table.end(), [](int32_t id) { return id < 0; })) {
+        LLAMA_LOG_WARN("%s: swap_out with evicted pages not supported\n", __func__);
+        return false;
+    }
 
     if (!block_manager.has_free_cpu_blocks(num_blocks)) {
         return false;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_cpu_blocks(num_blocks);
+    std::vector<uint32_t> cpu_ids = block_manager.checkout_cpu_blocks(num_blocks);
+    llama_block_ids new_ids(cpu_ids.begin(), cpu_ids.end());
     do_block_copy(group.block_table, new_ids, /*to_gpu=*/false);
 
     free_blocks(group);
@@ -713,6 +817,333 @@ void llama_kv_cache_paged::set_paged_batch_info(const llama_paged_batch_info * i
 
 uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
     return num_gpu_blocks;
+}
+
+void llama_kv_cache_paged::set_max_logical_blocks(uint32_t n_logical_blocks) {
+    if (n_logical_blocks == 0) {
+        return;
+    }
+    const bool need_alloc = snapkv_scores_tensor != nullptr && n_logical_blocks > max_logical_blocks;
+    if (need_alloc) {
+        // a reused decode graph carries the old accumulator pointer in op_params;
+        // reallocating would leave a dangling pointer, so refuse to grow post-alloc
+        GGML_ASSERT(false && "snapkv scores buffer must not grow after allocation");
+    }
+    max_logical_blocks = std::max(max_logical_blocks, n_logical_blocks);
+}
+
+void llama_kv_cache_paged::configure_snapkv(bool enabled, uint32_t observation_window, uint32_t recent_tokens,
+                                            uint32_t pinned_tokens, float retention, uint32_t budget_blocks) {
+    snapkv_enabled            = enabled;
+    snapkv_observation_window = observation_window;
+    snapkv_recent_tokens      = recent_tokens;
+    snapkv_pinned_tokens      = pinned_tokens;
+    snapkv_retention          = std::clamp(retention, 0.0f, 1.0f);
+    snapkv_budget_blocks      = budget_blocks;
+    if (!enabled) {
+        return;
+    }
+    if (max_logical_blocks == 0) {
+        max_logical_blocks = num_gpu_blocks;
+    }
+    if (snapkv_scores_tensor != nullptr) {
+        return;
+    }
+    ggml_backend_t backend = nullptr;
+    for (const uint32_t il : attn_layer_ids) {
+        if (kv_gpu_layers[il].backend != nullptr) {
+            backend = kv_gpu_layers[il].backend;
+            break;
+        }
+    }
+    if (backend == nullptr) {
+        LLAMA_LOG_WARN("%s: no attention layer backend for snapkv scores; snapkv disabled\n", __func__);
+        snapkv_enabled = false;
+        return;
+    }
+    struct ggml_init_params params = {};
+    params.mem_size = ggml_tensor_overhead() * 4;
+    params.mem_buffer = NULL;
+    params.no_alloc = true;
+    snapkv_ctx.reset(ggml_init(params));
+    snapkv_scores_tensor = ggml_new_tensor_1d(snapkv_ctx.get(), GGML_TYPE_F32, max_logical_blocks);
+    snapkv_buf.reset(ggml_backend_alloc_ctx_tensors(snapkv_ctx.get(), backend));
+    if (!snapkv_buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate snapkv scores buffer; snapkv disabled\n", __func__);
+        snapkv_enabled = false;
+        return;
+    }
+    snapkv_backend = backend;
+    ggml_backend_buffer_clear(snapkv_buf.get(), 0);
+    snapkv_scores_host.assign(max_logical_blocks, 0.0f);
+    LLAMA_LOG_INFO("%s: snapkv enabled: observation_window=%u recent=%u pinned=%u retention=%.2f budget_blocks=%u logical_blocks=%u\n",
+        __func__, observation_window, recent_tokens, pinned_tokens, snapkv_retention, budget_blocks, max_logical_blocks);
+}
+
+int32_t llama_kv_cache_paged::get_snapkv_capture_from() const {
+    if (!snapkv_enabled || !snapkv_capture_active || snapkv_capture_from < 0) {
+        return -1;
+    }
+    return snapkv_capture_from;
+}
+
+bool llama_kv_cache_paged::snapkv_sync_scores() {
+    if (snapkv_scores_tensor == nullptr) {
+        return false;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    snapkv_scores_host.assign(max_logical_blocks, 0.0f);
+    ggml_backend_synchronize(snapkv_backend);
+    ggml_backend_tensor_get(snapkv_scores_tensor, snapkv_scores_host.data(), 0,
+                            snapkv_scores_host.size() * sizeof(float));
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(stderr, "SNAPKVDBG score_sync_ms=%.3f\n", elapsed);
+    return true;
+}
+
+// Evict pages with the lowest accumulated attention score until the group's
+// block table fits target_blocks. Pinned and recent pages are never evicted.
+// Logical positions are preserved: evicted slots become -1 in the block table.
+uint32_t llama_kv_cache_paged::snapkv_evict_to_target(llama_sequence_group & group, uint32_t target_blocks) {
+    const uint32_t total = group.block_table.size();
+    if (total <= target_blocks || total == 0) {
+        return 0;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    snapkv_sync_scores();
+    const uint32_t ctx_len  = group.n_decoded > 0 ? group.n_decoded : group.n_prompt;
+    const uint32_t pinned_b = std::min(total, (snapkv_pinned_tokens + block_size - 1) / block_size);
+    const uint32_t recent_b = std::min(total, (snapkv_recent_tokens + block_size - 1) / block_size);
+    const uint32_t old_start = std::min(total, pinned_b);
+    const uint32_t old_end   = total > recent_b ? total - recent_b : 0;
+
+    struct candidate {
+        int32_t bid;
+        float   score;
+    };
+    std::vector<candidate> candidates;
+    candidates.reserve(total);
+    for (uint32_t bid = old_start; bid < old_end; ++bid) {
+        if (group.block_table[bid] < 0) {
+            continue;
+        }
+        const float score = bid < snapkv_scores_host.size() ? snapkv_scores_host[bid] : 0.0f;
+        candidates.push_back({ (int32_t) bid, score });
+    }
+    if (candidates.empty()) {
+        return 0;
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const candidate & a, const candidate & b) { return a.score < b.score; });
+
+    uint32_t n_evicted = 0;
+    for (const candidate & cand : candidates) {
+        if (total - n_evicted <= target_blocks) {
+            break;
+        }
+        const int32_t physical = group.block_table[cand.bid];
+        if (physical >= 0) {
+            if (block_manager.is_gpu((uint32_t) physical)) {
+                release_gpu_blocks(llama_block_ids{ (uint32_t) physical });
+            } else {
+                block_manager.release_cpu_blocks({ (uint32_t) physical });
+            }
+            group.block_table[cand.bid] = -1;
+            ++n_evicted;
+        }
+    }
+    fprintf(stderr, "SNAPKVDBG evicted %u of %u pages (target %u), kept=%u\n", n_evicted, total, target_blocks, total - n_evicted);
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(stderr, "SNAPKVDBG select_evict_ms=%.3f\n", elapsed);
+    return n_evicted;
+}
+
+// Free enough old pages so that `num_blocks_needed` new physical blocks can be
+// allocated while the prefill is still streaming. Uses the partial attention
+// scores accumulated so far; pages outside the pinned/recent windows only.
+uint32_t llama_kv_cache_paged::snapkv_progressive_evict(llama_sequence_group & group, uint32_t num_blocks_needed) {
+    if (group.block_table.empty()) {
+        return 0;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    snapkv_sync_scores();
+
+    llama_pos progress = -1;
+    auto it = sequence_positions.find(group.request_id);
+    if (it != sequence_positions.end()) {
+        progress = it->second.max;
+    }
+    const llama_pos recent_start = progress >= (llama_pos) snapkv_recent_tokens
+                                       ? progress - snapkv_recent_tokens : 0;
+    const uint32_t pinned_b = std::min((uint32_t) group.block_table.size(),
+                                       (snapkv_pinned_tokens + block_size - 1) / block_size);
+
+    struct candidate {
+        int32_t bid;
+        float   score;
+    };
+    std::vector<candidate> candidates;
+    for (uint32_t bid = pinned_b; bid < group.block_table.size(); ++bid) {
+        if (group.block_table[bid] < 0) {
+            continue;
+        }
+        const llama_pos token_start = (llama_pos) bid * block_size;
+        if (token_start >= recent_start) {
+            continue;
+        }
+        const float score = bid < snapkv_scores_host.size() ? snapkv_scores_host[bid] : 0.0f;
+        candidates.push_back({ (int32_t) bid, score });
+    }
+    if (candidates.empty()) {
+        return 0;
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const candidate & a, const candidate & b) { return a.score < b.score; });
+
+    uint32_t n_evicted = 0;
+    for (const candidate & cand : candidates) {
+        if (n_evicted >= num_blocks_needed) {
+            break;
+        }
+        const int32_t physical = group.block_table[cand.bid];
+        if (physical >= 0) {
+            if (block_manager.is_gpu((uint32_t) physical)) {
+                release_gpu_blocks(llama_block_ids{ (uint32_t) physical });
+            } else {
+                block_manager.release_cpu_blocks({ (uint32_t) physical });
+            }
+            group.block_table[cand.bid] = -1;
+            ++n_evicted;
+        }
+    }
+    LLAMA_LOG_DEBUG("%s: progressive evict freed %u pages for seq %d\n", __func__, n_evicted, group.request_id);
+    if (n_evicted > 0 && snapkv_observation_window > 0) {
+        // Capture only in the last window before the space just freed is used.
+        snapkv_schedule_capture(progress + 1 + (llama_pos) n_evicted * block_size);
+    }
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(stderr, "SNAPKVDBG progressive_evict_ms=%.3f\n", elapsed);
+    return n_evicted;
+}
+
+// Move the highest-scored pages still on CPU back to GPU after the final eviction.
+bool llama_kv_cache_paged::snapkv_migrate_cpu_to_gpu(llama_sequence_group & group) {
+    const uint32_t num_cpu = (uint32_t) std::count_if(group.block_table.begin(), group.block_table.end(),
+        [this](int32_t id) { return id >= 0 && !block_manager.is_gpu((uint32_t) id); });
+    if (num_cpu == 0) {
+        return true;
+    }
+    std::vector<int32_t> bids;
+    for (uint32_t bid = 0; bid < group.block_table.size(); ++bid) {
+        const int32_t id = group.block_table[bid];
+        if (id >= 0 && !block_manager.is_gpu((uint32_t) id)) {
+            bids.push_back((int32_t) bid);
+        }
+    }
+    std::stable_sort(bids.begin(), bids.end(), [this](int32_t a, int32_t b) {
+        const float sa = (uint32_t) a < snapkv_scores_host.size() ? snapkv_scores_host[a] : 0.0f;
+        const float sb = (uint32_t) b < snapkv_scores_host.size() ? snapkv_scores_host[b] : 0.0f;
+        return sa > sb;
+    });
+
+    uint32_t migrated = 0;
+    for (const int32_t bid : bids) {
+        if (!has_free_gpu_blocks(1, /*ignore_watermark=*/true)) {
+            break;
+        }
+        llama_block_ids new_ids = checkout_gpu_blocks(1);
+        if (new_ids.size() != 1) {
+            break;
+        }
+        const int32_t old_id = group.block_table[bid];
+        do_block_copy({ (uint32_t) old_id }, { (uint32_t) new_ids[0] }, /*to_gpu=*/true);
+        block_manager.release_cpu_blocks({ (uint32_t) old_id });
+        group.block_table[bid] = new_ids[0];
+        ++migrated;
+    }
+    if (migrated > 0) {
+        fprintf(stderr, "SNAPKVDBG migrated %u pages CPU->GPU for seq %d\n", migrated, group.request_id);
+    }
+    return true;
+}
+
+bool llama_kv_cache_paged::ensure_pos_blocks(uint32_t max_pos, llama_sequence_group & group) {
+    if (!snapkv_enabled) {
+        return true;
+    }
+    const uint32_t blocks_needed = max_pos / block_size + 1;
+    if (blocks_needed <= group.block_table.size()) {
+        return true;
+    }
+    uint32_t to_alloc = blocks_needed - (uint32_t) group.block_table.size();
+    while (to_alloc > 0) {
+        if (has_free_gpu_blocks(to_alloc, /*ignore_watermark=*/true)) {
+            uint32_t required_blocks = required_gpu_capacity();
+            llama_block_ids preview_ids = preview_gpu_blocks(to_alloc);
+            if (!preview_ids.empty()) {
+                required_blocks = std::max(required_blocks, (uint32_t) *std::max_element(preview_ids.begin(), preview_ids.end()) + 1);
+            }
+            if (!ensure_physical_capacity(required_blocks)) {
+                return false;
+            }
+            llama_block_ids new_ids = checkout_gpu_blocks(to_alloc);
+            if (new_ids.size() != to_alloc) {
+                return false;
+            }
+            concat_block_ids(group.block_table, new_ids);
+            break;
+        }
+        const uint32_t observation_blocks = (snapkv_observation_window + block_size - 1) / block_size;
+        const uint32_t freed = snapkv_progressive_evict(group, std::max(to_alloc, 2 * observation_blocks));
+        if (freed == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache_paged::end_prefill(llama_sequence_group & group) {
+    if (!snapkv_enabled) {
+        return;
+    }
+    const uint32_t total = (uint32_t) group.block_table.size();
+    const uint32_t ctx_len = group.n_decoded > 0 ? group.n_decoded : group.n_prompt;
+    const uint32_t pinned_b = std::min(total, (snapkv_pinned_tokens + block_size - 1) / block_size);
+    const uint32_t recent_b = std::min(total, (snapkv_recent_tokens + block_size - 1) / block_size);
+    const uint32_t old_blocks = total > pinned_b + recent_b ? total - pinned_b - recent_b : 0;
+    const uint32_t keep_old  = (uint32_t) std::ceil(old_blocks * snapkv_retention);
+
+    uint32_t target = snapkv_budget_blocks > 0 ? snapkv_budget_blocks : num_gpu_blocks;
+    target = std::min(target, total);
+    target = std::min(target, pinned_b + recent_b + keep_old);
+    target = std::max(target, (uint32_t) 1);
+
+    if (total > target) {
+        snapkv_evict_to_target(group, target);
+    } else {
+        snapkv_sync_scores();
+    }
+
+    float total_mass = 0.0f;
+    float kept_mass  = 0.0f;
+    for (uint32_t bid = 0; bid < total; ++bid) {
+        const float s = bid < snapkv_scores_host.size() ? snapkv_scores_host[bid] : 0.0f;
+        total_mass += s;
+        if (group.block_table[bid] >= 0) {
+            kept_mass += s;
+        }
+    }
+    fprintf(stderr, "SNAPKVDBG mass %.4f pct=%.2f pages_kept=%u total_pages=%u\n",
+            total_mass > 0.0f ? kept_mass / total_mass : 1.0f, total_mass > 0.0f ? 100.0f * kept_mass / total_mass : 100.0f,
+            (uint32_t) group.block_table.size(), total);
+
+    snapkv_migrate_cpu_to_gpu(group);
+
+    snapkv_capture_active = false;
+    snapkv_pending_final_evict = false;
+    fprintf(stderr, "SNAPKVDBG prefill_ended seq=%d ctx_len=%u pages_before=%u pages_after=%u\n",
+            group.request_id, ctx_len, total, (uint32_t) group.block_table.size());
 }
 
 void llama_kv_cache_paged::concat_block_ids(llama_block_ids &       to_block_table,
@@ -777,7 +1208,7 @@ llama_memory_context_ptr llama_kv_cache_paged::init_full() {
 
     ctx->set_batch_size(n_seq_max);       // maximum possible sequences
     ctx->set_n_tokens(n_ubatch);          // representative token count
-    ctx->set_max_blocks(num_gpu_blocks);  // every block could theoretically belong to one seq
+    ctx->set_max_blocks(max_logical_blocks > 0 ? max_logical_blocks : num_gpu_blocks);
 
     return ctx;
 }
@@ -796,9 +1227,16 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
     for (auto & entry : regular_groups) {
         if (!entry.second.block_table.empty()) {
             llama_block_ids released_gpu;
-            llama_block_ids released_cpu;
-            for (const uint32_t block : entry.second.block_table) {
-                (block_manager.is_gpu(block) ? released_gpu : released_cpu).push_back(block);
+            std::vector<uint32_t> released_cpu;
+            for (const int32_t block : entry.second.block_table) {
+                if (block < 0) {
+                    continue;
+                }
+                if (block_manager.is_gpu((uint32_t) block)) {
+                    released_gpu.push_back(block);
+                } else {
+                    released_cpu.push_back((uint32_t) block);
+                }
             }
             if (!released_gpu.empty()) {
                 release_gpu_blocks(released_gpu);
@@ -831,9 +1269,16 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos /
         llama_block_ids released(group.block_table.begin() + keep_blocks, group.block_table.end());
         if (!released.empty()) {
             llama_block_ids released_gpu;
-            llama_block_ids released_cpu;
-            for (const uint32_t block : released) {
-                (block_manager.is_gpu(block) ? released_gpu : released_cpu).push_back(block);
+            std::vector<uint32_t> released_cpu;
+            for (const int32_t block : released) {
+                if (block < 0) {
+                    continue;
+                }
+                if (block_manager.is_gpu((uint32_t) block)) {
+                    released_gpu.push_back(block);
+                } else {
+                    released_cpu.push_back((uint32_t) block);
+                }
             }
             if (!released_gpu.empty()) {
                 release_gpu_blocks(released_gpu);
@@ -904,7 +1349,9 @@ void llama_kv_cache_paged_context::set_batch_data(const llama_paged_batch_info &
 
 void llama_kv_cache_paged_context::set_batch_data(const llama_ubatch & ubatch) {
     llama_paged_batch_info info = {};
-    GGML_ASSERT(manager && manager->build_batch_info(ubatch, info));
+    GGML_ASSERT(manager);
+    manager->snapkv_update_capture(ubatch);
+    GGML_ASSERT(manager->build_batch_info(ubatch, info));
     set_batch_data(info);
 }
 
@@ -912,6 +1359,11 @@ bool llama_kv_cache_paged_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     manager->commit_batch(ubatches[i_cur]);
     if (++i_cur >= ubatches.size()) {
+        return false;
+    }
+    // SnapKV streaming prefill: make sure the next ubatch has physical pages,
+    // evicting old low-importance pages first if the pool is exhausted.
+    if (!manager->ensure_batch_blocks(ubatches[i_cur])) {
         return false;
     }
     set_batch_data(ubatches[i_cur]);

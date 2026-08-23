@@ -1192,21 +1192,23 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    ggml_tensor * build_attn_mha_paged(
-             ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
-             ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]
-             ggml_tensor * v_cur,           // [n_embd_head, n_head_kv, n_tokens]
-             ggml_tensor * k_cache,         // master K buffer
-             ggml_tensor * v_cache,         // master V buffer
-             ggml_tensor * block_table,     // [max_blocks, batch_size]
-             ggml_tensor * write_slots,     // [n_tokens]
-             ggml_tensor * context_lens,    // [batch_size]
-             ggml_tensor * batch_offsets,   // [batch_size]
-             ggml_tensor * batch_lens,      // [batch_size]
-                   float   kq_scale,
-                     int   block_size,
-                     int   max_blocks,
-                     int   active_context) const;
+ggml_tensor * build_attn_mha_paged(
+         ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
+         ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]
+         ggml_tensor * v_cur,           // [n_embd_head, n_head_kv, n_tokens]
+         ggml_tensor * k_cache,         // master K buffer
+         ggml_tensor * v_cache,         // master V buffer
+         ggml_tensor * block_table,     // [max_blocks, batch_size]
+         ggml_tensor * write_slots,     // [n_tokens]
+         ggml_tensor * context_lens,    // [batch_size]
+         ggml_tensor * batch_offsets,   // [batch_size]
+         ggml_tensor * batch_lens,      // [batch_size]
+               float   kq_scale,
+                 int   block_size,
+                 int   max_blocks,
+                 int   active_context,
+         ggml_tensor * snapkv_scores,   // [max_blocks] page importance accumulator, nullable
+                 int   snapkv_capture_from) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -25,6 +25,13 @@ struct llama_cparams {
     uint32_t n_cpu_blocks;
     float    kv_paged_watermark;
 
+    bool     snapkv_enabled;
+    uint32_t snapkv_observation_window;
+    uint32_t snapkv_recent_tokens;
+    uint32_t snapkv_pinned_tokens;
+    float    snapkv_retention;
+    uint32_t snapkv_budget_blocks;
+
     int32_t  nextn_layer_offset = 0;
 
     float rope_freq_base;

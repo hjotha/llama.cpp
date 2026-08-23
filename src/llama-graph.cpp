@@ -2601,7 +2601,9 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
                float   kq_scale,
                  int   block_size,
                  int   max_blocks,
-                 int   active_context) const {
+                 int   active_context,
+         ggml_tensor * snapkv_scores,   // [max_blocks] page importance accumulator, nullable
+                 int   snapkv_capture_from) const {
 
     // Paged attention kernel (write) assumes dense layout [n_tokens. n_heads_kv, head_dim].
     // Architectures like (Falcon, GPT-2, etc.) produce KV as views into a fused QKV tensor
@@ -2614,7 +2616,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
     ggml_tensor * cur = ggml_paged_attn(ctx0,
                                         q, k_cur, v_cur, k_cache, v_cache,
                                         block_table, write_slots, context_lens, batch_offsets, batch_lens,
-                                        kq_scale, block_size, max_blocks, active_context);
+                                        kq_scale, block_size, max_blocks, active_context,
+                                        snapkv_scores, snapkv_capture_from);
     return cur;
 }
 
@@ -2866,7 +2869,8 @@ ggml_tensor * llm_graph_context::build_attn(
         inp->paged_context_lens,
         inp->paged_batch_offsets,
         inp->paged_batch_lens,
-        kq_scale, cparams.block_size, max_blocks, active_context);
+        kq_scale, cparams.block_size, max_blocks, active_context,
+        paged_mctx->get_snapkv_scores(), paged_mctx->get_snapkv_capture_from());
     cb(cur, "kqv_out", il);
 
     // Reshape to [n_embd_head * n_head, n_tokens] (just a view)

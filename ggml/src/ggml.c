@@ -8067,7 +8067,9 @@ struct ggml_tensor * ggml_paged_attn(
     float                 scale,
     int                   block_size,
     int                   max_blocks,
-    int                   active_context) {
+    int                   active_context,
+    struct ggml_tensor  * snapkv_scores,
+    int                   snapkv_capture_from) {
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), q->ne);
     result->op = GGML_OP_PAGED_ATTN;
@@ -8089,6 +8091,12 @@ struct ggml_tensor * ggml_paged_attn(
     op_params_i[0] = block_size;
     op_params_i[1] = max_blocks;
     op_params_i[2] = active_context;
+    op_params_i[3] = snapkv_capture_from;
+    // GGML_MAX_SRC is 10, so the optional SnapKV accumulator is passed as a
+    // pointer in op_params instead of an 11th source tensor.
+    uintptr_t snapkv_addr = snapkv_scores != NULL ? (uintptr_t) snapkv_scores->data : 0;
+    op_params_i[4] = (int32_t) (snapkv_addr & 0xffffffffu);
+    op_params_i[5] = (int32_t) (snapkv_addr >> 32);
 
     return result;
 }

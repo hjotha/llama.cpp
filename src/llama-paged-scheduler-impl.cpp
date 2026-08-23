@@ -305,7 +305,7 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
 }
 
 int32_t llama_paged_scheduler_impl::calculate_global_slot_index(int32_t                 token_pos,
-                                                                std::vector<uint32_t> & block_table) {
+                                                                llama_block_ids &       block_table) {
     GGML_ASSERT(block_size && "block_size needs to be greater than 0");
     const int32_t block_table_id = token_pos / block_size;
     const int32_t offset         = token_pos % block_size;

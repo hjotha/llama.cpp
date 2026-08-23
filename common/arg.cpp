@@ -1745,6 +1745,57 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_PAGED_ADMISSION_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--snapkv"}, "OW",
+        "enable SnapKV selective page retention with observation window OW (tokens)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv observation window must be non-negative");
+            }
+            params.snapkv_observation_window = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-recent"}, "N",
+        "always-retained trailing window in tokens (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv-recent must be non-negative");
+            }
+            params.snapkv_recent_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_RECENT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-pinned"}, "N",
+        "always-retained leading window in tokens (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv-pinned must be non-negative");
+            }
+            params.snapkv_pinned_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_PINNED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-retention"}, "PCT",
+        "fraction [0,1] of old (non-pinned/non-recent) pages retained after prefill (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            float retention = std::stof(value);
+            if (retention < 0.0f || retention > 1.0f) {
+                throw std::invalid_argument("snapkv-retention must be in [0, 1]");
+            }
+            params.snapkv_retention = retention;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_RETENTION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-budget-blocks"}, "N",
+        "max physical blocks retained per sequence after prefill (0 = full GPU pool)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv-budget-blocks must be non-negative");
+            }
+            params.snapkv_budget_blocks = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_BUDGET_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--paged-attn-cuda"},
         "pin full-attention layers to the first offload device (use with --tensor-split for recurrent-only layers on the next device)",
         [](common_params & params) {

@@ -575,6 +575,12 @@ struct common_params {
     uint32_t n_checkpoint    = 0;   // print TPS checkpoint every N decoded tokens (0 = disabled)
     bool     no_eos          = false; // ignore EOS tokens and keep generating until n_predict
 
+    uint32_t snapkv_observation_window = 0;  // SnapKV observation window in tokens (0 = disabled)
+    uint32_t snapkv_recent_tokens      = 0;  // always-retained trailing window in tokens
+    uint32_t snapkv_pinned_tokens      = 0;  // always-retained leading window in tokens
+    float    snapkv_retention          = 1.0f; // fraction of old pages retained after prefill [0, 1]
+    uint32_t snapkv_budget_blocks      = 0;  // max physical blocks retained per sequence (0 = full pool)
+
     float cpu_to_gpu_blocks_ratio = 0.25;
     float kv_paged_watermark      = 0.05;  // percentage
 

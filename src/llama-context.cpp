@@ -278,6 +278,12 @@ llama_context::llama_context(
     cparams.n_gpu_blocks_initial = params.n_gpu_blocks_initial;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.snapkv_enabled = params.snapkv_enabled;
+    cparams.snapkv_observation_window = params.snapkv_observation_window;
+    cparams.snapkv_recent_tokens = params.snapkv_recent_tokens;
+    cparams.snapkv_pinned_tokens = params.snapkv_pinned_tokens;
+    cparams.snapkv_retention = params.snapkv_retention;
+    cparams.snapkv_budget_blocks = params.snapkv_budget_blocks;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -3584,6 +3590,12 @@ llama_context_params llama_context_default_params() {
         /*.n_gpu_blocks_initial        =*/ 0,
         /*.n_cpu_blocks                =*/ 0,
         /*.kv_paged_watermark          =*/ 0.05f,
+        /*.snapkv_enabled              =*/ false,
+        /*.snapkv_observation_window   =*/ 0,
+        /*.snapkv_recent_tokens        =*/ 0,
+        /*.snapkv_pinned_tokens        =*/ 0,
+        /*.snapkv_retention            =*/ 1.0f,
+        /*.snapkv_budget_blocks        =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

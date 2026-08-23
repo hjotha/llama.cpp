@@ -9,7 +9,7 @@
 
 enum class llama_sequence_group_status { PENDING, WAITING, RUNNING, SWAPPED, FINISHED };
 
-using llama_block_ids = std::vector<uint32_t>;
+using llama_block_ids = std::vector<int32_t>;
 
 struct llama_sequence_group {
     int32_t                     request_id = -1;

@@ -2361,6 +2361,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* dynamic_spill     */ cparams.kv_paged_dynamic,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+                        if (cparams.snapkv_enabled) {
+                            auto * hybrid = static_cast<llama_memory_hybrid_paged *>(res);
+                            auto * paged_cache = hybrid->get_mem_attn();
+                            paged_cache->set_max_logical_blocks(
+                                (cparams.n_ctx_seq + cparams.block_size - 1) / cparams.block_size);
+                            paged_cache->configure_snapkv(
+                                true,
+                                cparams.snapkv_observation_window,
+                                cparams.snapkv_recent_tokens,
+                                cparams.snapkv_pinned_tokens,
+                                cparams.snapkv_retention,
+                                cparams.snapkv_budget_blocks);
+                        }
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2494,6 +2507,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 watermark,
                                 cparams.n_gpu_blocks_initial,
                                 cparams.kv_paged_dynamic);
+
+                            if (cparams.snapkv_enabled) {
+                                paged_cache->set_max_logical_blocks(
+                                    (cparams.n_ctx_seq + block_size - 1) / block_size);
+                                paged_cache->configure_snapkv(
+                                    true,
+                                    cparams.snapkv_observation_window,
+                                    cparams.snapkv_recent_tokens,
+                                    cparams.snapkv_pinned_tokens,
+                                    cparams.snapkv_retention,
+                                    cparams.snapkv_budget_blocks);
+                            }
 
                             res = paged_cache;
                         } else {

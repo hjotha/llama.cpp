@@ -1853,6 +1853,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         : params.n_gpu_blocks_initial;
     cparams.n_cpu_blocks      = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.snapkv_enabled        = params.snapkv_observation_window > 0;
+    cparams.snapkv_observation_window = params.snapkv_observation_window;
+    cparams.snapkv_recent_tokens  = params.snapkv_recent_tokens;
+    cparams.snapkv_pinned_tokens  = params.snapkv_pinned_tokens;
+    cparams.snapkv_retention      = params.snapkv_retention;
+    cparams.snapkv_budget_blocks  = params.snapkv_budget_blocks;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

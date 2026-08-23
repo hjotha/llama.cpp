@@ -42,7 +42,7 @@ class llama_paged_scheduler_impl {
 
     void swap_out_or_recompute(llama_sequence_group_ptr group_ptr);
 
-    int32_t calculate_global_slot_index(int32_t token_pos, std::vector<uint32_t> & block_table);
+    int32_t calculate_global_slot_index(int32_t token_pos, llama_block_ids & block_table);
 
     void clear_batch(llama_batch & batch);
     void populate_batch_from(const llama_sequence_group_raw_list & candidates, llama_batch & batch);

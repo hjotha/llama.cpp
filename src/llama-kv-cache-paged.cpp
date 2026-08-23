@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 
 //
@@ -890,10 +891,13 @@ bool llama_kv_cache_paged::snapkv_sync_scores() {
     if (snapkv_scores_tensor == nullptr) {
         return false;
     }
+    const auto start = std::chrono::steady_clock::now();
     snapkv_scores_host.assign(max_logical_blocks, 0.0f);
     ggml_backend_synchronize(snapkv_backend);
     ggml_backend_tensor_get(snapkv_scores_tensor, snapkv_scores_host.data(), 0,
                             snapkv_scores_host.size() * sizeof(float));
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(stderr, "SNAPKVDBG score_sync_ms=%.3f\n", elapsed);
     return true;
 }
 
@@ -906,6 +910,7 @@ uint32_t llama_kv_cache_paged::snapkv_evict_to_target(llama_sequence_group & gro
         return 0;
     }
 
+    const auto start = std::chrono::steady_clock::now();
     snapkv_sync_scores();
     const uint32_t ctx_len  = group.n_decoded > 0 ? group.n_decoded : group.n_prompt;
     const uint32_t pinned_b = std::min(total, (snapkv_pinned_tokens + block_size - 1) / block_size);
@@ -949,6 +954,8 @@ uint32_t llama_kv_cache_paged::snapkv_evict_to_target(llama_sequence_group & gro
         }
     }
     fprintf(stderr, "SNAPKVDBG evicted %u of %u pages (target %u), kept=%u\n", n_evicted, total, target_blocks, total - n_evicted);
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(stderr, "SNAPKVDBG select_evict_ms=%.3f\n", elapsed);
     return n_evicted;
 }
 
@@ -959,6 +966,7 @@ uint32_t llama_kv_cache_paged::snapkv_progressive_evict(llama_sequence_group & g
     if (group.block_table.empty()) {
         return 0;
     }
+    const auto start = std::chrono::steady_clock::now();
     snapkv_sync_scores();
 
     llama_pos progress = -1;
@@ -1014,6 +1022,8 @@ uint32_t llama_kv_cache_paged::snapkv_progressive_evict(llama_sequence_group & g
         // Capture only in the last window before the space just freed is used.
         snapkv_schedule_capture(progress + 1 + (llama_pos) n_evicted * block_size);
     }
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    fprintf(stderr, "SNAPKVDBG progressive_evict_ms=%.3f\n", elapsed);
     return n_evicted;
 }
 

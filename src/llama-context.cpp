@@ -822,6 +822,12 @@ uint32_t llama_context::n_ctx_seq() const {
     return cparams.n_ctx_seq;
 }
 
+void llama_context::set_n_ctx(uint32_t n_ctx) {
+    GGML_ASSERT(n_ctx > 0 && n_ctx <= cparams.n_ctx);
+    cparams.n_ctx = n_ctx;
+    cparams.n_ctx_seq = n_ctx;
+}
+
 uint32_t llama_context::n_batch() const {
     return cparams.n_batch;
 }

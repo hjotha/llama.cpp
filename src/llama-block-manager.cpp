@@ -12,6 +12,11 @@ void llama_block_manager::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) 
     total_num_gpu_blocks = n_gpu;
     total_num_cpu_blocks = n_cpu;
 
+    gpu_registry.clear();
+    cpu_registry.clear();
+    free_gpu_ids.clear();
+    free_cpu_ids.clear();
+
     watermark_gpu_safety_num_blocks = std::ceil(total_num_gpu_blocks * watermark);
     watermark_cpu_safety_num_blocks = std::ceil(total_num_cpu_blocks * watermark);
 

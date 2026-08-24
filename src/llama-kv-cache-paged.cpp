@@ -858,6 +858,39 @@ uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
     return num_gpu_blocks;
 }
 
+uint32_t llama_kv_cache_paged::freeze_physical_capacity() {
+    if (attn_layer_ids.empty()) {
+        return 0;
+    }
+
+    uint32_t capacity = UINT32_MAX;
+    for (const uint32_t il : attn_layer_ids) {
+        capacity = std::min(capacity, kv_gpu_layers[il].capacity);
+    }
+    if (capacity == 0 || capacity == UINT32_MAX) {
+        return 0;
+    }
+
+    // Stop clear() from restoring the small calibration pool, then discard the
+    // synthetic sequence before rebuilding the free block registries.
+    allow_dynamic_spill = false;
+    initial_num_gpu_blocks = capacity;
+    growth_num_gpu_blocks  = capacity;
+    clear(false);
+
+    const float watermark = num_gpu_blocks > 0
+        ? (float) gpu_watermark_num_blocks / num_gpu_blocks
+        : 0.0f;
+    num_gpu_blocks = capacity;
+    gpu_watermark_num_blocks = std::ceil(num_gpu_blocks * watermark);
+    max_logical_blocks = capacity;
+    free_gpu_ids.resize(capacity);
+    std::iota(free_gpu_ids.begin(), free_gpu_ids.end(), 0);
+    gpu_block_ref_counts.assign(capacity, 0);
+    block_manager.init(capacity, num_cpu_blocks, watermark);
+    return capacity;
+}
+
 void llama_kv_cache_paged::set_max_logical_blocks(uint32_t n_logical_blocks) {
     if (n_logical_blocks == 0) {
         return;

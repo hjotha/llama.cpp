@@ -57,6 +57,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     const llama_paged_batch_info * get_paged_batch_info() const { return last_paged_info; }
 
     uint32_t get_num_gpu_blocks() const;
+    uint32_t freeze_physical_capacity();
     uint64_t get_storage_generation() const { return storage_generation; }
 
     // SnapKV-style selective page retention.

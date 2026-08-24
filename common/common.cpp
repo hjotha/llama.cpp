@@ -7,6 +7,8 @@
 #include "log.h"
 #include "llama.h"
 #include "../src/llama-model.h"
+#include "../src/llama-context.h"
+#include "../src/llama-memory-hybrid-paged.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1383,7 +1385,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
     const size_t margin = params.kv_paged_prealloc_max
-        ? std::max(requested_margin, (size_t)(total_vram * 0.05f) + extra_recurrent_vram)
+        ? requested_margin + extra_recurrent_vram
         : requested_margin;
 
     if (free_vram <= margin) {
@@ -1413,20 +1415,27 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     if (params.kv_paged_prealloc_max) {
         const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;
         const uint32_t logical_blocks = (requested_ctx + params.block_size - 1) / params.block_size;
-        const uint32_t fixed_blocks = std::min(n_gpu_blocks, logical_blocks);
+        const uint32_t growth_blocks = 64;
+        const uint32_t aligned_blocks = std::min(n_gpu_blocks, logical_blocks) / growth_blocks * growth_blocks;
+        // Leave one whole physical growth step for allocator granularity. The
+        // startup calibration fills and freezes this candidate before health.
+        const uint32_t fixed_blocks = aligned_blocks > growth_blocks
+            ? aligned_blocks - growth_blocks
+            : aligned_blocks;
 
         if (fixed_blocks == 0) {
             LOG_ERR("%s: no paged KV blocks fit in the selected GPU budget.\n", __func__);
             return;
         }
 
+        params.kv_paged_dynamic = true;
         params.n_ctx = fixed_blocks * params.block_size;
         params.n_gpu_blocks = fixed_blocks;
-        params.n_gpu_blocks_initial = fixed_blocks;
-        params.n_gpu_blocks_growth = fixed_blocks;
+        params.n_gpu_blocks_initial = std::min(growth_blocks, fixed_blocks);
+        params.n_gpu_blocks_growth = std::min(growth_blocks, fixed_blocks);
         params.n_gpu_blocks_admission = fixed_blocks;
-        LOG_INF("%s: fixed paged KV pool: ctx=%u, blocks=%u, admission=%u, no request-time growth\n",
-                __func__, params.n_ctx, fixed_blocks, fixed_blocks);
+        LOG_INF("%s: paged KV calibration candidate: ctx=%u, blocks=%u, initial=%u, growth=%u\n",
+                __func__, params.n_ctx, fixed_blocks, params.n_gpu_blocks_initial, params.n_gpu_blocks_growth);
     } else if (params.kv_paged_dynamic) {
         params.n_gpu_blocks_initial = n_gpu_blocks;
         params.n_gpu_blocks = std::max({ params.n_gpu_blocks, n_gpu_blocks,
@@ -1664,6 +1673,57 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     if (!params.lora_init_without_apply) {
         common_set_adapter_lora(lctx, params.lora_adapters);
+    }
+
+    if (params.kv_paged_prealloc_max) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid_paged *>(llama_get_memory(lctx));
+        auto * paged = hybrid != nullptr
+            ? hybrid->get_mem_attn()
+            : dynamic_cast<llama_kv_cache_paged *>(llama_get_memory(lctx));
+        if (paged == nullptr) {
+            COM_ERR("%s", "paged KV max calibration requires paged memory\n");
+            return res;
+        }
+
+        const uint32_t target_tokens = params.n_ctx > 0 ? params.n_ctx - 1 : 0;
+        const uint32_t chunk_size = (uint32_t) std::max(1, std::min(params.n_batch, params.n_ubatch));
+        llama_token token = llama_vocab_bos(vocab);
+        if (token == LLAMA_TOKEN_NULL) {
+            token = 0;
+        }
+        std::vector<llama_token> tokens(chunk_size, token);
+
+        uint32_t processed = 0;
+        while (processed < target_tokens) {
+            const uint32_t count = std::min(chunk_size, target_tokens - processed);
+            const int rc = llama_decode(lctx, llama_batch_get_one(tokens.data(), count));
+            if (rc != 0) {
+                COM_INF("%s: calibration stopped at %u/%u tokens (decode=%d)\n",
+                        __func__, processed, target_tokens, rc);
+                break;
+            }
+            processed += count;
+        }
+        llama_synchronize(lctx);
+
+        const uint32_t blocks = paged->freeze_physical_capacity();
+        if (blocks == 0) {
+            COM_ERR("%s", "paged KV max calibration found no usable GPU capacity\n");
+            return res;
+        }
+
+        const uint32_t calibrated_ctx = blocks * params.block_size;
+        lctx->set_n_ctx(calibrated_ctx);
+        params.n_ctx = calibrated_ctx;
+        params.n_gpu_blocks = blocks;
+        params.n_gpu_blocks_initial = blocks;
+        params.n_gpu_blocks_growth = blocks;
+        params.n_gpu_blocks_admission = blocks;
+        llama_memory_clear(llama_get_memory(lctx), true);
+        llama_synchronize(lctx);
+        llama_perf_context_reset(lctx);
+        COM_INF("%s: calibrated fixed paged KV pool: ctx=%u, blocks=%u, initial=%u, admission=%u\n",
+                __func__, calibrated_ctx, blocks, blocks, blocks);
     }
 
     if (params.warmup) {

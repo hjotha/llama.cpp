@@ -17,6 +17,78 @@
 
 </div>
 
+## About this fork
+
+This fork is an experimental long-context serving branch built around a shared,
+paged KV cache. It keeps the upstream `llama.cpp` interface while adding the
+pieces needed to run long, concurrent Qwen requests on memory-constrained GPUs.
+
+The main additions are:
+
+- paged KV pools for CUDA and Vulkan, including quantized paged attention;
+- shared physical KV pages across server slots instead of a fixed KV partition
+  per slot;
+- multi-sequence scheduling, physical-budget admission control, CPU/GPU pools,
+  and dynamic page growth;
+- CUDA Flash Decode / DFlash2 support for paged attention;
+- optional SnapKV page scoring, selective retention, per-sequence score state,
+  eviction timing, and a repeatable quality benchmark;
+- `--kv-paged-prealloc-max`, which measures the usable GPU budget, runs one
+  synthetic long prefill before the health endpoint becomes ready, and freezes
+  the largest validated page pool for the lifetime of the server.
+
+The last mode avoids allocations and page-table migrations in live prefill. A
+server started with `--ctx-size 0` therefore publishes the physical context
+that was actually calibrated, rather than a larger optimistic value that can
+fail later under load. Slots draw from one shared pool: `--parallel` limits
+simultaneous sequences but does not divide the pool into fixed per-slot quotas.
+Pages released by a completed request can be reused by requests that remain.
+
+### RTX 4070 12 GB result
+
+The current production profile was measured on a GeForce RTX 4070 12 GB with
+Qwen3.8-27B `UD-IQ3_XXS`, Q4_0 K/V cache, CUDA Flash Attention, and three server
+slots. CUDA reported 12,480,282,624 usable bytes. Startup calibration selected
+4,032 pages of 16 tokens, or 64,512 physical tokens, and took about 133 seconds
+before the health endpoint became ready.
+
+```sh
+llama-server \
+  --model Qwen3.8-27B-UD-IQ3_XXS.gguf \
+  --ctx-size 0 --parallel 3 \
+  --batch-size 128 --ubatch-size 128 \
+  --n-gpu-layers 999 --device CUDA0 --flash-attn on \
+  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --kv-paged-prealloc-max --fit off \
+  --n-cpu-blocks 1024 --kv-block-size 16
+```
+
+Measured OpenAI-compatible completion results:
+
+| Workload | Prefill | Decode | Wall time |
+| --- | ---: | ---: | ---: |
+| 30,052 prompt + 256 output, first request | 1,103.9 tok/s | 27.0 tok/s | 36.7 s |
+| distinct 30,052 prompt + 256 output, next request | 1,100.2 tok/s | 27.0 tok/s | 36.8 s |
+| 64,511 prompt + 1 output | 1,100.5 tok/s | - | 58.6 s |
+| 60,416 prompt + 4,096 output | 1,098.4 tok/s | 21.3 tok/s | 247.1 s |
+
+Three concurrent requests of 20,052 prompt + 256 output tokens also completed
+successfully. Together they reserved 3,810/4,032 pages (94.5% of the pool) and
+finished in 88.8 seconds. Per-request prefill was 638.9, 1,031.0, and 640.3
+tok/s because GPU compute was shared while the requests overlapped.
+
+The two distinct sequential prompts are the fragmentation check: prefill
+changed by only 0.34%, so the fixed pool did not degrade after the first
+request. By comparison, the earlier dynamic-growth profile delivered roughly
+522-543 prompt tok/s at long context because page allocation and migration
+occurred in the request's critical path.
+
+SnapKV is available but was disabled for these production measurements. The
+64,512-token limit is therefore exact full KV capacity, not a larger logical
+context obtained through eviction. Results are hardware-, model-, build-, and
+cache-type-specific; the automatic calibration is intended to determine the
+corresponding safe value on another system.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

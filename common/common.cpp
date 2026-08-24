@@ -1875,6 +1875,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_gpu_blocks_initial = params.kv_paged_dynamic && params.n_gpu_blocks_initial == 0
         ? params.n_gpu_blocks
         : params.n_gpu_blocks_initial;
+    cparams.n_gpu_blocks_growth = params.n_gpu_blocks_growth;
     cparams.n_cpu_blocks      = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
     cparams.snapkv_enabled        = params.snapkv_observation_window > 0;

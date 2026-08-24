@@ -29,6 +29,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(uint32_t head_dim,
     num_gpu_blocks(0),
     num_cpu_blocks(0),
     initial_num_gpu_blocks(0),
+    growth_num_gpu_blocks(0),
     gpu_watermark_num_blocks(0),
     block_bytes(0),
     allow_dynamic_spill(false),
@@ -42,6 +43,7 @@ void llama_kv_cache_paged::init(const std::vector<ggml_backend_t> & layer_backen
                                 uint32_t       n_cpu_blocks,
                                 float          watermark,
                                 uint32_t       initial_gpu_blocks,
+                                uint32_t       growth_gpu_blocks,
                                 bool           dynamic_spill) {
     GGML_ASSERT(backend_cpu && "backend_cpu is nullptr");
 
@@ -49,12 +51,15 @@ void llama_kv_cache_paged::init(const std::vector<ggml_backend_t> & layer_backen
     GGML_ASSERT(n_cpu_blocks && "n_cpu_blocks need to be greater than 0.");
 
     LLAMA_LOG_INFO(
-        "%s: initializing paged KV cache. n_gpu_blocks=%d, n_cpu_blocks=%d, block_size=%d, watermark=%0.2f, initial_gpu_blocks=%d, dynamic_spill=%d\n",
-        __func__, n_gpu_blocks, n_cpu_blocks, block_size, watermark, initial_gpu_blocks, dynamic_spill);
+        "%s: initializing paged KV cache. n_gpu_blocks=%d, n_cpu_blocks=%d, block_size=%d, watermark=%0.2f, initial_gpu_blocks=%d, growth_gpu_blocks=%d, dynamic_spill=%d\n",
+        __func__, n_gpu_blocks, n_cpu_blocks, block_size, watermark, initial_gpu_blocks, growth_gpu_blocks, dynamic_spill);
     num_gpu_blocks = n_gpu_blocks;
     num_cpu_blocks = n_cpu_blocks;
     allow_dynamic_spill = dynamic_spill;
     initial_num_gpu_blocks = dynamic_spill ? std::max((uint32_t) 1, std::min(initial_gpu_blocks, n_gpu_blocks))
+                                           : n_gpu_blocks;
+    growth_num_gpu_blocks = dynamic_spill ? std::max((uint32_t) 1, std::min(
+        growth_gpu_blocks == 0 ? initial_num_gpu_blocks : growth_gpu_blocks, n_gpu_blocks))
                                            : n_gpu_blocks;
     gpu_watermark_num_blocks = std::ceil(num_gpu_blocks * watermark);
     kv_type        = type;
@@ -299,15 +304,14 @@ bool llama_kv_cache_paged::ensure_physical_capacity(uint32_t required_blocks, bo
         return true;
     }
 
-    const uint32_t growth_step = std::max((uint32_t) 1, initial_num_gpu_blocks);
-    const uint32_t target_blocks = std::min(num_gpu_blocks,
-        ((required_blocks + growth_step - 1) / growth_step) * growth_step);
+    const uint32_t growth_step = growth_num_gpu_blocks;
+    const uint32_t target_blocks = required_blocks <= initial_num_gpu_blocks ? initial_num_gpu_blocks :
+        (uint32_t) std::min((uint64_t) num_gpu_blocks, (uint64_t) initial_num_gpu_blocks +
+            ((uint64_t) (required_blocks - initial_num_gpu_blocks) + growth_step - 1) / growth_step * growth_step);
     if (target_blocks <= initial_num_gpu_blocks && !rebalance) {
         return true;
     }
 
-    // ponytail: the initial pool is the existing hardware calibration knob;
-    // expose a separate VRAM budget only if another device needs independent tuning.
     const uint32_t original_budget_blocks = std::min(num_gpu_blocks,
         initial_num_gpu_blocks * 2);
     const size_t max_original_layers = std::min(attn_layer_ids.size(),

@@ -29,6 +29,7 @@ public:
                  uint32_t   block_size,
                  uint32_t   n_gpu_blocks,
                  uint32_t   initial_gpu_blocks,
+                 uint32_t   growth_gpu_blocks,
                  uint32_t   n_cpu_blocks,
                    float    watermark,
                  uint32_t   n_ubatch,

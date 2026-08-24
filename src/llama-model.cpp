@@ -2423,6 +2423,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_block_size   */ cparams.block_size,
                             /* attn_n_gpu_blocks */ cparams.n_gpu_blocks,
                             /* attn_initial_blocks */ cparams.n_gpu_blocks_initial,
+                            /* attn_growth_blocks */ cparams.n_gpu_blocks_growth,
                             /* attn_n_cpu_blocks */ cparams.n_cpu_blocks,
                             /* attn_watermark    */ cparams.kv_paged_watermark,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
@@ -2583,6 +2584,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 n_cpu_blocks,
                                 watermark,
                                 cparams.n_gpu_blocks_initial,
+                                cparams.n_gpu_blocks_growth,
                                 cparams.kv_paged_dynamic);
 
                             if (cparams.snapkv_enabled) {

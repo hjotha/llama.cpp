@@ -424,6 +424,7 @@ extern "C" {
         uint32_t block_size;         // tokens per physical KV block
         uint32_t n_gpu_blocks;       // GPU block pool size
         uint32_t n_gpu_blocks_initial; // initially allocated GPU blocks (0 = full pool)
+        uint32_t n_gpu_blocks_growth;  // dynamic pool growth step (0 = initial allocation)
         uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
         float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
 

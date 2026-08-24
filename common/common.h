@@ -570,6 +570,7 @@ struct common_params {
 
     uint32_t n_gpu_blocks    = 1;
     uint32_t n_gpu_blocks_initial = 0; // 0 = allocate the full pool at startup
+    uint32_t n_gpu_blocks_growth = 0; // 0 = grow by the initial allocation
     uint32_t n_gpu_blocks_admission = 0; // 0 = use the logical context limit only
     uint32_t n_cpu_blocks    = 1;
     uint32_t n_checkpoint    = 0;   // print TPS checkpoint every N decoded tokens (0 = disabled)

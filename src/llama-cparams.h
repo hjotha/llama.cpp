@@ -22,6 +22,7 @@ struct llama_cparams {
     uint32_t block_size;
     uint32_t n_gpu_blocks;
     uint32_t n_gpu_blocks_initial;
+    uint32_t n_gpu_blocks_growth;
     uint32_t n_cpu_blocks;
     float    kv_paged_watermark;
 

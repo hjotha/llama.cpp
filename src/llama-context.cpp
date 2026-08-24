@@ -276,6 +276,7 @@ llama_context::llama_context(
     cparams.block_size = params.block_size;
     cparams.n_gpu_blocks = params.n_gpu_blocks;
     cparams.n_gpu_blocks_initial = params.n_gpu_blocks_initial;
+    cparams.n_gpu_blocks_growth = params.n_gpu_blocks_growth;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
     cparams.snapkv_enabled = params.snapkv_enabled;
@@ -3622,6 +3623,7 @@ llama_context_params llama_context_default_params() {
         /*.block_size                  =*/ 16,
         /*.n_gpu_blocks                =*/ 0,
         /*.n_gpu_blocks_initial        =*/ 0,
+        /*.n_gpu_blocks_growth         =*/ 0,
         /*.n_cpu_blocks                =*/ 0,
         /*.kv_paged_watermark          =*/ 0.05f,
         /*.snapkv_enabled              =*/ false,
@@ -3692,6 +3694,11 @@ llama_context * llama_init_from_model(
     if (params.kv_paged_dynamic &&
         (params.n_gpu_blocks_initial == 0 || params.n_gpu_blocks_initial > params.n_gpu_blocks)) {
         LLAMA_LOG_ERROR("%s: dynamic paged KV requires 0 < n_gpu_blocks_initial <= n_gpu_blocks\n", __func__);
+        return nullptr;
+    }
+
+    if (params.kv_paged_dynamic && params.n_gpu_blocks_growth > params.n_gpu_blocks) {
+        LLAMA_LOG_ERROR("%s: dynamic paged KV requires n_gpu_blocks_growth <= n_gpu_blocks\n", __func__);
         return nullptr;
     }
 

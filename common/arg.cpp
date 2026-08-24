@@ -1840,6 +1840,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
+        {"--n-gpu-blocks-growth"}, "N",
+        "number of paged KV GPU blocks added per dynamic growth (default: 0 = initial pool)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--n-gpu-blocks-growth must be non-negative");
+            }
+            params.n_gpu_blocks_growth = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
         {"-kvbls", "--kv-block-size"}, "N",
         "fixed number of tokens for a given paged block (default: 16)",
         [](common_params & params, int value) {

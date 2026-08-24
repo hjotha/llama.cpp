@@ -15,6 +15,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
                  uint32_t   block_size,
                  uint32_t   n_gpu_blocks,
                  uint32_t   initial_gpu_blocks,
+                 uint32_t   growth_gpu_blocks,
                  uint32_t   n_cpu_blocks,
                    float    watermark,
                  uint32_t   n_ubatch,
@@ -60,7 +61,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
     )) {
     mem_attn->init(
         layer_backends, kv_backends, backend_cpu, type_kv,
-        n_gpu_blocks, n_cpu_blocks, watermark, initial_gpu_blocks, dynamic_spill);
+        n_gpu_blocks, n_cpu_blocks, watermark, initial_gpu_blocks, growth_gpu_blocks, dynamic_spill);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_paged::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

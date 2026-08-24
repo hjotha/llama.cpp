@@ -30,6 +30,7 @@ class llama_kv_cache_paged : public llama_memory_i {
               uint32_t       n_cpu_blocks,
               float          watermark,  // percentage
               uint32_t       initial_gpu_blocks,
+              uint32_t       growth_gpu_blocks,
               bool           dynamic_spill);
 
     void init(const std::vector<ggml_backend_t> & layer_backends,
@@ -38,7 +39,7 @@ class llama_kv_cache_paged : public llama_memory_i {
               uint32_t       n_gpu_blocks,
               uint32_t       n_cpu_blocks,
               float          watermark) {  // percentage
-        init(layer_backends, {}, backend_cpu, type, n_gpu_blocks, n_cpu_blocks, watermark, n_gpu_blocks, false);
+        init(layer_backends, {}, backend_cpu, type, n_gpu_blocks, n_cpu_blocks, watermark, n_gpu_blocks, n_gpu_blocks, false);
     }
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
@@ -183,6 +184,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t       num_gpu_blocks;
     uint32_t       num_cpu_blocks;
     uint32_t       initial_num_gpu_blocks;
+    uint32_t       growth_num_gpu_blocks;
     uint32_t       gpu_watermark_num_blocks;
     size_t         block_bytes;
     bool           allow_dynamic_spill;

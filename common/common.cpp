@@ -1357,6 +1357,22 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const size_t bytes_per_row   = ggml_row_size(params.cache_type_k, head_dim);
     const size_t bytes_per_block = (size_t) 2 * bytes_per_row * n_heads_kv * block_size * n_layers;
 
+    // The base margin already covers one sequence. Hybrid models allocate an
+    // R/S state per additional GPU sequence before the paged KV pool exists.
+    size_t extra_recurrent_vram = 0;
+    if (params.kv_paged_prealloc_max && params.n_parallel > 1 && !params.no_kv_offload) {
+        const size_t rows_per_sequence = 1 + params.speculative.need_n_rs_seq();
+        const size_t bytes_per_recurrent_sequence = rows_per_sequence * sizeof(float) *
+            (model->hparams.n_embd_r() + model->hparams.n_embd_s());
+
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (model->hparams.is_recr(il) &&
+                ggml_backend_dev_type(model->dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                extra_recurrent_vram += bytes_per_recurrent_sequence * (params.n_parallel - 1);
+            }
+        }
+    }
+
     if (n_layers == 0 || bytes_per_row == 0) {
         LOG_ERR("%s: model has no paged-attention layers or an invalid KV type (%s).\n",
                 __func__, ggml_type_name(params.cache_type_k));
@@ -1367,7 +1383,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
     const size_t margin = params.kv_paged_prealloc_max
-        ? std::max(requested_margin, (size_t)(total_vram * 0.05f))
+        ? std::max(requested_margin, (size_t)(total_vram * 0.05f) + extra_recurrent_vram)
         : requested_margin;
 
     if (free_vram <= margin) {
@@ -1390,9 +1406,9 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
     const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
 
-    LOG_INF("%s: free_vram=%0.1f MiB, type=%s, head_dim=%u, attention_layers=%u, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u\n",
+    LOG_INF("%s: free_vram=%0.1f MiB, type=%s, head_dim=%u, attention_layers=%u, extra_recurrent_vram=%0.1f MiB, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u\n",
             __func__, free_vram / 1024.0f / 1024.0f, ggml_type_name(params.cache_type_k), head_dim, n_layers,
-            bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+            extra_recurrent_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
 
     if (params.kv_paged_prealloc_max) {
         const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;

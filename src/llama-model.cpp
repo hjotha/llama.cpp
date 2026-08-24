@@ -2442,7 +2442,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             auto * hybrid = static_cast<llama_memory_hybrid_paged *>(res);
                             auto * paged_cache = hybrid->get_mem_attn();
                             paged_cache->set_max_logical_blocks(
-                                (cparams.n_ctx_seq + cparams.block_size - 1) / cparams.block_size);
+                                ((cparams.kv_paged_dynamic ? cparams.n_ctx : cparams.n_ctx_seq) + cparams.block_size - 1) / cparams.block_size);
                             paged_cache->configure_snapkv(
                                 true,
                                 cparams.snapkv_observation_window,
@@ -2587,7 +2587,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             if (cparams.snapkv_enabled) {
                                 paged_cache->set_max_logical_blocks(
-                                    (cparams.n_ctx_seq + block_size - 1) / block_size);
+                                    ((cparams.kv_paged_dynamic ? cparams.n_ctx : cparams.n_ctx_seq) + block_size - 1) / block_size);
                                 paged_cache->configure_snapkv(
                                     true,
                                     cparams.snapkv_observation_window,

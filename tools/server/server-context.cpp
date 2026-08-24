@@ -207,6 +207,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<common_speculative_token_dist> spec_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -227,6 +228,8 @@ struct server_slot {
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
+    int32_t n_ctx_reservation = 0;
+    bool clear_context_on_release = false;
 
     size_t last_nl_pos = 0;
 
@@ -335,6 +338,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -350,6 +354,7 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+        n_ctx_reservation = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -506,7 +511,7 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            if (clear_context_on_release || task->is_child()) {
                 prompt_clear();
             }
 
@@ -850,6 +855,8 @@ private:
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
+    bool elastic_paged_context = false;
+    uint32_t paged_admission_blocks = 0;
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1066,6 +1073,8 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+        elastic_paged_context = params_base.kv_paged && params_base.kv_paged_dynamic && params_base.n_parallel > 1 && !has_spec;
+        paged_admission_blocks = elastic_paged_context ? params_base.n_gpu_blocks_admission : 0;
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1156,6 +1165,9 @@ private:
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+        if (elastic_paged_context) {
+            n_ctx_slot = n_ctx;
+        }
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
@@ -1173,8 +1185,8 @@ private:
         }
 
         // setup slots
-        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
-                params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
+        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s', elastic_paged_context = %s\n",
+                params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false", elastic_paged_context ? "true" : "false");
 
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1211,6 +1223,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+            slot.clear_context_on_release = elastic_paged_context;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1451,7 +1464,45 @@ private:
         return nullptr;
     }
 
+    int64_t get_context_reservation(const server_task & task) const {
+        const int32_t n_predict = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        if (n_predict < 0) {
+            return n_ctx;
+        }
+
+        return (int64_t) task.n_tokens() + n_predict;
+    }
+
+    bool has_context_reservation(const server_task & task) const {
+        int64_t n_reserved = get_context_reservation(task);
+        int32_t n_active = 0;
+
+        for (const server_slot & slot : slots) {
+            if (slot.is_processing()) {
+                n_reserved += slot.n_ctx_reservation;
+                ++n_active;
+            }
+        }
+
+        if (n_reserved > n_ctx) {
+            return false;
+        }
+
+        if (n_active == 0 || paged_admission_blocks == 0) {
+            return true;
+        }
+
+        const uint64_t n_blocks = (n_reserved + params_base.block_size - 1) / params_base.block_size;
+        return n_blocks <= paged_admission_blocks;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
+        if (elastic_paged_context && !has_context_reservation(task)) {
+            SRV_DBG("%s", "deferring task: paged KV reservation exceeds an active admission limit\n");
+            return nullptr;
+        }
+
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1716,6 +1767,7 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+        slot.n_ctx_reservation = elastic_paged_context ? get_context_reservation(task) : 0;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2278,6 +2330,14 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (elastic_paged_context && get_context_reservation(task) > n_ctx) {
+                        send_error(task,
+                                   string_format("request (%d tokens plus output) exceeds the shared context size (%d tokens)",
+                                                 task.n_tokens(), n_ctx),
+                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -2916,6 +2976,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .dists    = */ &slot.spec_dists,
+                            /* .temperature = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                         };
 
                         drafting.push_back(&slot);
@@ -3795,7 +3858,13 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                auto accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                                slot.spec_dists.size() == slot.spec_draft.size()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3816,6 +3885,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -3843,6 +3913,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const auto ids = std::move(slot.spec_draft);

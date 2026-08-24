@@ -62,6 +62,7 @@ extern "C" {
     struct llama_model;
     struct llama_context;
     struct llama_sampler;
+    struct llama_paged_scheduler;
 
     typedef struct llama_memory_i * llama_memory_t;
 
@@ -264,6 +265,22 @@ extern "C" {
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
 
+    // CPU-side metadata produced by the paged scheduler and consumed by
+    // llama_kv_cache_paged_context during graph build. These arrays are owned
+    // by the scheduler and must remain valid until the next scheduler step
+    // clears them.
+    typedef struct llama_paged_batch_info {
+        int32_t   n_blocks_per_seq;
+        int32_t   n_seq;
+        int32_t   n_tokens;
+
+        int32_t * write_slots;    // [n_tokens]
+        int32_t * block_table;    // [n_seq * n_blocks_per_seq]
+        int32_t * context_lens;   // [n_seq]
+        int32_t * batch_offsets;  // [n_seq]
+        int32_t * batch_lens;     // [n_seq]
+    } llama_paged_batch_info;
+
     enum llama_model_kv_override_type {
         LLAMA_KV_OVERRIDE_TYPE_INT,
         LLAMA_KV_OVERRIDE_TYPE_FLOAT,
@@ -339,6 +356,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool paged_attn_cuda; // pin full-attention layers to the first device
     };
 
     struct llama_sampler_seq_config {
@@ -398,6 +416,25 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // Paged KV cache (experimental)
+        // Opt-in block-indexing KV cache with continuous-batching scheduling
+        bool     kv_paged;           // enable paged KV cache
+        bool     kv_paged_dynamic;   // grow and migrate KV pools between registered GPU backends
+        uint32_t block_size;         // tokens per physical KV block
+        uint32_t n_gpu_blocks;       // GPU block pool size
+        uint32_t n_gpu_blocks_initial; // initially allocated GPU blocks (0 = full pool)
+        uint32_t n_gpu_blocks_growth;  // dynamic pool growth step (0 = initial allocation)
+        uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
+        float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
+
+        // SnapKV-style selective KV retention over the paged cache
+        bool     snapkv_enabled;           // enable selective page eviction after prefill
+        uint32_t snapkv_observation_window; // tokens used to score page importance (0 = disabled)
+        uint32_t snapkv_recent_tokens;     // always-retained trailing window in tokens
+        uint32_t snapkv_pinned_tokens;     // always-retained leading window in tokens
+        float    snapkv_retention;         // fraction of old (non-pinned/non-recent) pages retained [0, 1]
+        uint32_t snapkv_budget_blocks;     // max physical blocks retained per sequence (0 = full GPU pool)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1622,6 +1659,53 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // Paged inference
+    //
+    struct llama_paged_seq_state {
+        int32_t request_id;
+        int32_t n_prompt;
+        int32_t n_decoded;
+        int32_t n_past;
+        int64_t t_arrival_us;
+        int64_t t_first_token_us;
+    };
+
+    typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,
+                                             const llama_token * tokens,
+                                             int32_t             n_tokens,
+                                             void *              user_data);
+    LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx);
+    LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched);
+
+    // Queueing and stepping.
+    LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
+                                                     const llama_token *            tokens,
+                                                     int32_t                        n_tokens,
+                                                     int32_t                        request_id);
+
+    LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
+                                                       struct llama_batch *           batch);
+
+    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
+                                                struct llama_batch *           batch,
+                                                const llama_token *            tokens,
+                                                const int8_t *                 stop_flags);
+
+    // Introspection.
+    LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
+                                                       int32_t                        request_id,
+                                                       struct llama_paged_seq_state * out_state);
+
+    // Returns the current batch's paged routing metadata. Valid until the next
+    // call to llama_paged_scheduler_prepare_batch on this scheduler. Do not free.
+    LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_info(
+        const struct llama_paged_scheduler * sched);
+
+    // Optional finish callback.
+    LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
+                                                       llama_paged_on_finish_cb       cb,
+                                                       void *                         user_data);
 #ifdef __cplusplus
 }
 #endif

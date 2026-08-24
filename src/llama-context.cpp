@@ -271,6 +271,20 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_paged   = params.kv_paged;
+    cparams.kv_paged_dynamic = params.kv_paged_dynamic;
+    cparams.block_size = params.block_size;
+    cparams.n_gpu_blocks = params.n_gpu_blocks;
+    cparams.n_gpu_blocks_initial = params.n_gpu_blocks_initial;
+    cparams.n_gpu_blocks_growth = params.n_gpu_blocks_growth;
+    cparams.n_cpu_blocks = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.snapkv_enabled = params.snapkv_enabled;
+    cparams.snapkv_observation_window = params.snapkv_observation_window;
+    cparams.snapkv_recent_tokens = params.snapkv_recent_tokens;
+    cparams.snapkv_pinned_tokens = params.snapkv_pinned_tokens;
+    cparams.snapkv_retention = params.snapkv_retention;
+    cparams.snapkv_budget_blocks = params.snapkv_budget_blocks;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -337,6 +351,29 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // if ctx_other is provided, add devices from ctx_other model so shared tensors can run on their backends
+        if (cparams.ctx_other != nullptr) {
+            const auto * model_other = llama_get_model(cparams.ctx_other);
+            if (model_other != nullptr) {
+                for (const auto & dev : model_other->devices) {
+                    bool found = false;
+                    for (const auto & b : backends) {
+                        if (ggml_backend_get_device(b.get()) == dev.dev) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                        if (backend == nullptr) {
+                            throw std::runtime_error(format("failed to initialize %s backend from ctx_other", ggml_backend_dev_name(dev.dev)));
+                        }
+                        backends.emplace_back(backend);
+                    }
+                }
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -392,7 +429,36 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        std::vector<ggml_backend_t> layer_backends;
+        std::vector<ggml_backend_t> kv_backends;
+        if (cparams.kv_paged) {
+            layer_backends.resize(model.hparams.n_layer(), backend_cpu);
+            for (auto & b : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    bool in_model = false;
+                    for (const auto & dev : model.devices) {
+                        if (dev.dev == ggml_backend_get_device(b.get())) {
+                            in_model = true;
+                            break;
+                        }
+                    }
+                    if (in_model) {
+                        kv_backends.push_back(b.get());
+                    }
+                }
+            }
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                const auto * layer_dev = model.dev_layer(il);
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == layer_dev) {
+                        layer_backends[il] = b.get();
+                        break;
+                    }
+                }
+            }
+        }
+
+        memory.reset(model.create_memory(params_mem, cparams, layer_backends, kv_backends, backend_cpu));
     }
 
     // init backends
@@ -756,6 +822,12 @@ uint32_t llama_context::n_ctx_seq() const {
     return cparams.n_ctx_seq;
 }
 
+void llama_context::set_n_ctx(uint32_t n_ctx) {
+    GGML_ASSERT(n_ctx > 0 && n_ctx <= cparams.n_ctx);
+    cparams.n_ctx = n_ctx;
+    cparams.n_ctx_seq = n_ctx;
+}
+
 uint32_t llama_context::n_batch() const {
     return cparams.n_batch;
 }
@@ -766,6 +838,10 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+uint32_t llama_context::block_size() const {
+    return cparams.block_size;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -2314,6 +2390,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        const uint32_t selector_tokens = std::min<uint32_t>(
+                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+        res += 32*selector_tokens;
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
@@ -3542,6 +3624,20 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_paged                    =*/ false,
+        /*.kv_paged_dynamic            =*/ false,
+        /*.block_size                  =*/ 16,
+        /*.n_gpu_blocks                =*/ 0,
+        /*.n_gpu_blocks_initial        =*/ 0,
+        /*.n_gpu_blocks_growth         =*/ 0,
+        /*.n_cpu_blocks                =*/ 0,
+        /*.kv_paged_watermark          =*/ 0.05f,
+        /*.snapkv_enabled              =*/ false,
+        /*.snapkv_observation_window   =*/ 0,
+        /*.snapkv_recent_tokens        =*/ 0,
+        /*.snapkv_pinned_tokens        =*/ 0,
+        /*.snapkv_retention            =*/ 1.0f,
+        /*.snapkv_budget_blocks        =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3586,6 +3682,29 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.kv_paged && params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: paged KV cache requires the same K (%s) and V (%s) cache type\n",
+                        __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (params.kv_paged && params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_Q4_0 && params.type_k != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: paged KV cache supports only F16, Q4_0, and Q8_0 (got %s)\n",
+                        __func__, ggml_type_name(params.type_k));
+        return nullptr;
+    }
+
+    if (params.kv_paged_dynamic &&
+        (params.n_gpu_blocks_initial == 0 || params.n_gpu_blocks_initial > params.n_gpu_blocks)) {
+        LLAMA_LOG_ERROR("%s: dynamic paged KV requires 0 < n_gpu_blocks_initial <= n_gpu_blocks\n", __func__);
+        return nullptr;
+    }
+
+    if (params.kv_paged_dynamic && params.n_gpu_blocks_growth > params.n_gpu_blocks) {
+        LLAMA_LOG_ERROR("%s: dynamic paged KV requires n_gpu_blocks_growth <= n_gpu_blocks\n", __func__);
         return nullptr;
     }
 

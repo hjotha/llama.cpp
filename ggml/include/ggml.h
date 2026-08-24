@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_PAGED_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -2850,6 +2852,25 @@ extern "C" {
     GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
+
+    GGML_API struct ggml_tensor * ggml_paged_attn(struct ggml_context * ctx,
+                                                  struct ggml_tensor  * q,
+                                                  struct ggml_tensor  * k_new,
+                                                  struct ggml_tensor  * v_new,
+                                                  struct ggml_tensor  * k_cache,
+                                                  struct ggml_tensor  * v_cache,
+                                                  struct ggml_tensor  * block_table,
+                                                  struct ggml_tensor  * write_slots,
+                                                  struct ggml_tensor  * context_lens,
+                                                  struct ggml_tensor  * batch_offsets,
+                                                  struct ggml_tensor  * batch_lens,
+                                                  float                 scale,
+                                                  int                   block_size,
+                                                  int                   max_blocks,
+                                                  int                   active_context,
+                                                  struct ggml_tensor  * snapkv_scores,
+                                                  struct ggml_tensor  * snapkv_capture_from,
+                                                  struct ggml_tensor  * snapkv_score_slots);
 
     //
     // quantization

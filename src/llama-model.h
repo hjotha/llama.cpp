@@ -363,6 +363,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
+    struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
+
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
     struct ggml_tensor * ssm_x   = nullptr;
@@ -649,6 +654,10 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
+    struct ggml_tensor * dflash_selector_prev   = nullptr;
+    struct ggml_tensor * dflash_selector_next   = nullptr;
+    struct ggml_tensor * dflash_selector_hidden = nullptr;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
@@ -718,7 +727,10 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                   const std::vector<ggml_backend_t> & layer_backends,
+                                   const std::vector<ggml_backend_t> & kv_backends,
+                                   ggml_backend_t backend_cpu) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

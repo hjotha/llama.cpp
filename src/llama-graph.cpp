@@ -8,12 +8,14 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-paged.h"
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
@@ -497,6 +499,77 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    return res;
+}
+
+void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch != nullptr);
+
+    if (paged_write_slots) {
+        ggml_backend_tensor_set(paged_write_slots, mctx->get_write_slots(), 0, ggml_nbytes(paged_write_slots));
+        last_n_tokens = paged_write_slots->ne[0];
+    }
+    if (paged_block_table) {
+        ggml_backend_tensor_set(paged_block_table, mctx->get_block_table(), 0, ggml_nbytes(paged_block_table));
+    }
+    if (paged_context_lens) {
+        ggml_backend_tensor_set(paged_context_lens, mctx->get_context_lens(), 0, ggml_nbytes(paged_context_lens));
+    }
+    if (paged_batch_offsets) {
+        ggml_backend_tensor_set(paged_batch_offsets, mctx->get_batch_offsets(), 0, ggml_nbytes(paged_batch_offsets));
+    }
+    if (paged_batch_lens) {
+        ggml_backend_tensor_set(paged_batch_lens, mctx->get_batch_lens(), 0, ggml_nbytes(paged_batch_lens));
+    }
+}
+
+bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_kv_cache_paged_context *>(params.mctx);
+    this->mctx = mctx;
+
+    // active_context is embedded in PAGED_ATTN op params, so only reuse decode graphs.
+    return params.ubatch.n_tokens <= 4 &&
+           storage_generation == mctx->get_storage_generation() &&
+           paged_write_slots->ne[0] == (int64_t) params.ubatch.n_tokens &&
+           paged_block_table->ne[0] == mctx->get_max_blocks() &&
+           paged_block_table->ne[1] == mctx->get_batch_size();
+}
+
+void llm_graph_input_mem_hybrid_paged::set_input(const llama_ubatch * ubatch) {
+    inp_attn->set_input(ubatch);
+
+    const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    if (inp_rs->s_copy) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+        int32_t * data = (int32_t *) inp_rs->s_copy->data;
+
+        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->get_recr()->s_copy(i);
+        }
+    }
+}
+
+bool llm_graph_input_mem_hybrid_paged::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_hybrid_paged_context *>(params.mctx);
+    this->mctx = mctx;
+
+    auto * paged = get_attn();
+    const auto * attn = mctx->get_attn();
+    paged->mctx = attn;
+
+    bool res = paged->storage_generation == attn->get_storage_generation();
+    res &= paged->paged_write_slots->ne[0] == (int64_t) params.ubatch.n_tokens;
+    res &= paged->paged_block_table->ne[0] == attn->get_max_blocks();
+    res &= paged->paged_block_table->ne[1] == attn->get_batch_size();
+
+    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    res &= inp_rs->head == mctx->get_recr()->get_head();
+    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
     return res;
 }
@@ -2538,6 +2611,41 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+ggml_tensor * llm_graph_context::build_attn_mha_paged(
+         ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
+         ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]
+         ggml_tensor * v_cur,           // [n_embd_head, n_head_kv, n_tokens]
+         ggml_tensor * k_cache,         // master K buffer
+         ggml_tensor * v_cache,         // master V buffer
+         ggml_tensor * block_table,     // [max_blocks, batch_size]
+         ggml_tensor * write_slots,     // [n_tokens]
+         ggml_tensor * context_lens,    // [batch_size]
+         ggml_tensor * batch_offsets,   // [batch_size]
+         ggml_tensor * batch_lens,      // [batch_size]
+               float   kq_scale,
+                 int   block_size,
+                 int   max_blocks,
+                 int   active_context,
+         ggml_tensor * snapkv_scores,   // [max_blocks, batch_size] page importance accumulator, nullable
+         ggml_tensor * snapkv_capture_from,
+         ggml_tensor * snapkv_score_slots) const {
+
+    // Paged attention kernel (write) assumes dense layout [n_tokens. n_heads_kv, head_dim].
+    // Architectures like (Falcon, GPT-2, etc.) produce KV as views into a fused QKV tensor
+    // We force contiguity before passing to kernel.
+    // This can be optimized in phase 2.
+    k_cur = ggml_cont(ctx0, k_cur);
+    v_cur = ggml_cont(ctx0, v_cur);
+    q     = ggml_cont(ctx0, q);
+
+    ggml_tensor * cur = ggml_paged_attn(ctx0,
+                                        q, k_cur, v_cur, k_cache, v_cache,
+                                        block_table, write_slots, context_lens, batch_offsets, batch_lens,
+                                        kq_scale, block_size, max_blocks, active_context,
+                                        snapkv_scores, snapkv_capture_from, snapkv_score_slots);
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2750,6 +2858,71 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn(
+        llm_graph_input_attn_kv_paged * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * /*kq_b*/,
+        ggml_tensor * /*sinks*/,
+        ggml_tensor * /*v_mla*/,
+            float     kq_scale,
+            int       il) const {
+    GGML_ASSERT(inp && "attn input is nullptr.");
+    auto * paged_mctx = inp->mctx;
+    GGML_ASSERT(paged_mctx && "llama_kv_cache_paged_context is nullptr.");
+
+    const int32_t max_blocks = paged_mctx->get_max_blocks();
+    const int32_t * context_lens = paged_mctx->get_context_lens();
+    int32_t active_context = max_blocks * cparams.block_size;
+    if (context_lens) {
+        active_context = 0;
+        for (int32_t i = 0; i < paged_mctx->get_batch_size(); ++i) {
+            active_context = std::max(active_context, context_lens[i]);
+        }
+    }
+    ggml_tensor * k_physical = paged_mctx->get_k(il); // interleaved KV
+    ggml_tensor * v_physical = paged_mctx->get_v(il); // interleaved KV
+
+    ggml_tensor * cur = build_attn_mha_paged(
+        q_cur, k_cur, v_cur, k_physical, v_physical,
+        inp->paged_block_table,
+        inp->paged_write_slots,
+        inp->paged_context_lens,
+        inp->paged_batch_offsets,
+        inp->paged_batch_lens,
+        kq_scale, cparams.block_size, max_blocks, active_context,
+        paged_mctx->get_snapkv_scores(), paged_mctx->get_snapkv_capture_from(), paged_mctx->get_snapkv_score_slots());
+    cb(cur, "kqv_out", il);
+
+    // Reshape to [n_embd_head * n_head, n_tokens] (just a view)
+    // note: for some archs (e.g. QWEN35) n_head * n_embd_head != n_embd
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], n_tokens);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+
+    if (wo_b) {
+        //cb(cur, "kqv_wo", il);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+static std::unique_ptr<llm_graph_input_attn_kv_paged> build_attn_inp_kv_paged_impl(
+           ggml_context * ctx0,
+    const llama_cparams & cparams,
+    const llama_hparams & hparams,
+    const llama_kv_cache_paged_context * mctx_paged);
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -2776,6 +2949,16 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+    if (auto * mctx_paged = dynamic_cast<const llama_kv_cache_paged_context *>(mctx)) {
+        auto inp = build_attn_inp_kv_paged_impl(ctx0, cparams, hparams, mctx_paged);
+        return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+    }
+
+    if (auto * mctx_hybrid = dynamic_cast<const llama_memory_hybrid_paged_context *>(mctx)) {
+        auto inp = build_attn_inp_kv_paged_impl(ctx0, cparams, hparams, mctx_hybrid->get_attn());
+        return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+    }
+
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
@@ -2797,6 +2980,10 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    if (auto * paged = dynamic_cast<llm_graph_input_attn_kv_paged *>(inp)) {
+        return build_attn(paged, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
 
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
@@ -2856,6 +3043,50 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     return cur;
+}
+
+static std::unique_ptr<llm_graph_input_attn_kv_paged> build_attn_inp_kv_paged_impl(
+           ggml_context * ctx0,
+     const llama_cparams & cparams,
+    const llama_hparams & hparams,
+    const llama_kv_cache_paged_context * mctx_cur) {
+
+    auto inp = std::make_unique<llm_graph_input_attn_kv_paged>(hparams, cparams, mctx_cur);
+    inp->storage_generation = mctx_cur->get_storage_generation();
+
+    const int32_t n_tokens   = mctx_cur->get_n_tokens();
+    const int32_t batch_size = mctx_cur->get_batch_size();
+    const int32_t max_blocks = mctx_cur->get_max_blocks();
+
+    // Create the GGML descriptors
+    inp->paged_write_slots   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp->paged_block_table   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, max_blocks, batch_size);
+    inp->paged_context_lens  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
+    inp->paged_batch_offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
+    inp->paged_batch_lens    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
+
+    ggml_set_input(inp->paged_write_slots);
+    ggml_set_input(inp->paged_block_table);
+    ggml_set_input(inp->paged_context_lens);
+    ggml_set_input(inp->paged_batch_offsets);
+    ggml_set_input(inp->paged_batch_lens);
+
+    return inp;
+}
+
+llm_graph_input_attn_kv_paged * llm_graph_context::build_attn_inp_kv_paged() const {
+    const auto * mctx_paged = static_cast<const llama_kv_cache_paged_context *>(mctx);
+
+    auto inp = build_attn_inp_kv_paged_impl(ctx0, cparams, hparams, mctx_paged);
+
+    return (llm_graph_input_attn_kv_paged *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_i * llm_graph_context::build_attn_inp_kv_auto() const {
+    if (cparams.kv_paged) {
+        return build_attn_inp_kv_paged();
+    }
+    return build_attn_inp_kv();
 }
 
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
@@ -3531,6 +3762,10 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 }
 
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+    if (cparams.kv_paged) {
+        return (llm_graph_input_mem_hybrid *) build_inp_mem_hybrid_paged();
+    }
+
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
@@ -3539,6 +3774,17 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_mem_hybrid_paged * llm_graph_context::build_inp_mem_hybrid_paged() const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_paged_context *>(mctx);
+
+    auto inp_rs   = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_attn = build_attn_inp_kv_paged_impl(ctx0, cparams, hparams, mctx_cur->get_attn());
+
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_paged>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+
+    return (llm_graph_input_mem_hybrid_paged *) res->add_input(std::move(inp));
 }
 
 llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const {

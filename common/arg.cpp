@@ -1716,7 +1716,169 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_unified = value;
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"-kvp", "--kv-paged"},
+        {"-no-kvp", "--no-kv-paged"},
+        "use paged KV buffer shared across all sequences (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_paged = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-dynamic"},
+        "grow paged KV on demand and migrate its attention layers between registered GPU backends",
+        [](common_params & params) {
+            params.kv_paged = true;
+            params.kv_paged_dynamic = true;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_DYNAMIC").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-prealloc-max"},
+        "after model load, fit a fixed paged-KV pool to free GPU memory and disable KV growth during requests",
+        [](common_params & params) {
+            params.kv_paged = true;
+            params.kv_paged_dynamic = true;
+            params.kv_paged_prealloc_max = true;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_PREALLOC_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-admission-blocks"}, "N",
+        "limit total admitted paged-KV blocks while multiple requests are active (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("kv-paged-admission-blocks must be non-negative");
+            }
+            params.n_gpu_blocks_admission = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_ADMISSION_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv"}, "OW",
+        "enable SnapKV selective page retention with observation window OW (tokens)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv observation window must be non-negative");
+            }
+            params.snapkv_observation_window = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-recent"}, "N",
+        "always-retained trailing window in tokens (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv-recent must be non-negative");
+            }
+            params.snapkv_recent_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_RECENT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-pinned"}, "N",
+        "always-retained leading window in tokens (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv-pinned must be non-negative");
+            }
+            params.snapkv_pinned_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_PINNED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-retention"}, "PCT",
+        "fraction [0,1] of old (non-pinned/non-recent) pages retained after prefill (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            float retention = std::stof(value);
+            if (retention < 0.0f || retention > 1.0f) {
+                throw std::invalid_argument("snapkv-retention must be in [0, 1]");
+            }
+            params.snapkv_retention = retention;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_RETENTION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--snapkv-budget-blocks"}, "N",
+        "max physical blocks retained per sequence after prefill (0 = full GPU pool)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("snapkv-budget-blocks must be non-negative");
+            }
+            params.snapkv_budget_blocks = value;
+        }
+    ).set_env("LLAMA_ARG_SNAPKV_BUDGET_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--paged-attn-cuda"},
+        "pin full-attention layers to the first offload device (use with --tensor-split for recurrent-only layers on the next device)",
+        [](common_params & params) {
+            params.paged_attn_cuda = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"-ncpub", "--n-cpu-blocks"}, "N",
+        "number of physical CPU blocks for paged KV cache (default: 1)",
+        [](common_params & params, int value) {
+            params.n_cpu_blocks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"-nchk", "--n-checkpoint"}, "N",
+        "print a TPS checkpoint every N decoded tokens for paged KV (default: 0 = disabled)",
+        [](common_params & params, int value) {
+            params.n_checkpoint = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"-no-eos", "--no-eos"},
+        "ignore EOS tokens and keep generating until n_predict (paged KV benchmark)",
+        [](common_params & params) {
+            params.no_eos = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"-ngpub", "--n-gpu-blocks"}, "N",
+        "number of physical GPU blocks for paged KV cache (default: 1)",
+        [](common_params & params, int value) {
+            params.n_gpu_blocks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--n-gpu-blocks-initial"}, "N",
+        "number of paged KV GPU blocks allocated at startup (default: 0 = full pool)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--n-gpu-blocks-initial must be non-negative");
+            }
+            params.n_gpu_blocks_initial = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--n-gpu-blocks-growth"}, "N",
+        "number of paged KV GPU blocks added per dynamic growth (default: 0 = initial pool)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--n-gpu-blocks-growth must be non-negative");
+            }
+            params.n_gpu_blocks_growth = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"-kvbls", "--kv-block-size"}, "N",
+        "fixed number of tokens for a given paged block (default: 16)",
+        [](common_params & params, int value) {
+            if (value <= 0 || (value & (value - 1)) != 0) {
+                throw std::invalid_argument("--kv-block-size must be a positive power of 2");
+            }
+            params.block_size = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-watermark"}, "N",
+        "fraction of blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0))",
+        [](common_params & params, const std::string & value) {
+            float potential_watermark = std::stof(value);
+            if (potential_watermark < 0.0f || potential_watermark >= 1.0f) {
+                throw std::invalid_argument("--kv-paged-watermark must be in range [0.0, 1.0)");
+            }
+            params.kv_paged_watermark = potential_watermark;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -2554,7 +2716,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.n_sequences = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PARALLEL}));
+    ).set_examples({LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-cb", "--cont-batching"},
         {"-nocb", "--no-cont-batching"},

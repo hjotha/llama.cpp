@@ -115,7 +115,16 @@ bool llama_supports_rpc(void) {
 }
 
 const char * llama_version(void) {
+#if defined(_WIN32) && defined(__HIP__)
+#define LLAMA_STRINGIFY_IMPL(x) #x
+#define LLAMA_STRINGIFY(x) LLAMA_STRINGIFY_IMPL(x)
+    // hipcc on Windows strips quotes from target_compile_definitions values.
+    return LLAMA_STRINGIFY(LLAMA_VERSION);
+#undef LLAMA_STRINGIFY
+#undef LLAMA_STRINGIFY_IMPL
+#else
     return LLAMA_VERSION;
+#endif
 }
 
 void llama_backend_init(void) {
@@ -614,4 +623,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

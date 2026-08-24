@@ -107,6 +107,7 @@ enum llama_example {
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
     LLAMA_EXAMPLE_TOKENIZE,
+    LLAMA_EXAMPLE_PAGED,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -561,6 +562,29 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool kv_paged          = false; // enable paged KV cache
+    bool paged_attn_cuda   = false; // pin full-attention layers to the first device
+    bool kv_paged_dynamic  = false; // grow and migrate paged KV pools between registered GPU backends
+    bool kv_paged_prealloc_max = false; // fit one fixed paged KV pool after model load
+
+    int32_t  block_size      = 16;
+
+    uint32_t n_gpu_blocks    = 1;
+    uint32_t n_gpu_blocks_initial = 0; // 0 = allocate the full pool at startup
+    uint32_t n_gpu_blocks_growth = 0; // 0 = grow by the initial allocation
+    uint32_t n_gpu_blocks_admission = 0; // 0 = use the logical context limit only
+    uint32_t n_cpu_blocks    = 1;
+    uint32_t n_checkpoint    = 0;   // print TPS checkpoint every N decoded tokens (0 = disabled)
+    bool     no_eos          = false; // ignore EOS tokens and keep generating until n_predict
+
+    uint32_t snapkv_observation_window = 0;  // SnapKV observation window in tokens (0 = disabled)
+    uint32_t snapkv_recent_tokens      = 0;  // always-retained trailing window in tokens
+    uint32_t snapkv_pinned_tokens      = 0;  // always-retained leading window in tokens
+    float    snapkv_retention          = 1.0f; // fraction of old pages retained after prefill [0, 1]
+    uint32_t snapkv_budget_blocks      = 0;  // max physical blocks retained per sequence (0 = full pool)
+
+    float cpu_to_gpu_blocks_ratio = 0.25;
+    float kv_paged_watermark      = 0.05;  // percentage
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

@@ -1363,9 +1363,12 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         return;
     }
 
-    const size_t margin = params.fit_params_target.empty()
+    const size_t requested_margin = params.fit_params_target.empty()
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
+    const size_t margin = params.kv_paged_prealloc_max
+        ? std::max(requested_margin, (size_t)(total_vram * 0.05f))
+        : requested_margin;
 
     if (free_vram <= margin) {
         LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
@@ -1391,14 +1394,33 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
             __func__, free_vram / 1024.0f / 1024.0f, ggml_type_name(params.cache_type_k), head_dim, n_layers,
             bytes_per_block, n_gpu_blocks, n_cpu_blocks);
 
-    if (params.kv_paged_dynamic) {
+    if (params.kv_paged_prealloc_max) {
+        const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;
+        const uint32_t logical_blocks = (requested_ctx + params.block_size - 1) / params.block_size;
+        const uint32_t fixed_blocks = std::min(n_gpu_blocks, logical_blocks);
+
+        if (fixed_blocks == 0) {
+            LOG_ERR("%s: no paged KV blocks fit in the selected GPU budget.\n", __func__);
+            return;
+        }
+
+        params.n_ctx = fixed_blocks * params.block_size;
+        params.n_gpu_blocks = fixed_blocks;
+        params.n_gpu_blocks_initial = fixed_blocks;
+        params.n_gpu_blocks_growth = fixed_blocks;
+        params.n_gpu_blocks_admission = fixed_blocks;
+        LOG_INF("%s: fixed paged KV pool: ctx=%u, blocks=%u, admission=%u, no request-time growth\n",
+                __func__, params.n_ctx, fixed_blocks, fixed_blocks);
+    } else if (params.kv_paged_dynamic) {
         params.n_gpu_blocks_initial = n_gpu_blocks;
         params.n_gpu_blocks = std::max({ params.n_gpu_blocks, n_gpu_blocks,
                 (uint32_t) std::ceil((double) params.n_ctx / params.block_size) });
     } else {
         params.n_gpu_blocks = n_gpu_blocks;
     }
-    params.n_cpu_blocks = n_cpu_blocks;
+    if (!params.kv_paged_prealloc_max) {
+        params.n_cpu_blocks = n_cpu_blocks;
+    }
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1451,7 +1473,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
-    if (params.fit_params && params.kv_paged) {
+    if ((params.fit_params || params.kv_paged_prealloc_max) && params.kv_paged) {
         LOG_INF("%s: fitting KV paged params to device memory\n", __func__);
         common_fit_paged_kv_blocks(params, pimpl->model.get());
         cparams = common_context_params_to_llama(params); // re-derive this params to reflect changes

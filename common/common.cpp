@@ -1397,11 +1397,17 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     const uint32_t n_heads_kv = model->hparams.n_head_kv_arr[0];
     const uint32_t n_layers   = common_paged_kv_attention_layers(model);
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // With MTP enabled, target and draft now have independent paged pools but
+    // the same logical block budget. Fit both layer sets against the same VRAM
+    // budget so dynamic growth cannot overcommit the device.
+    const uint32_t n_mtp_layers = spec_mtp ? model->hparams.n_layer_nextn : 0;
     const uint32_t head_dim   = model->hparams.n_embd_head_v_full;
     const uint32_t block_size = params.block_size;
 
     const size_t bytes_per_row   = ggml_row_size(params.cache_type_k, head_dim);
-    const size_t bytes_per_block = (size_t) 2 * bytes_per_row * n_heads_kv * block_size * n_layers;
+    const size_t bytes_per_block = (size_t) 2 * bytes_per_row * n_heads_kv * block_size * (n_layers + n_mtp_layers);
 
     // The base margin already covers one sequence. Hybrid models allocate an
     // R/S state per additional GPU sequence before the paged KV pool exists.
@@ -1419,6 +1425,13 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         }
     }
 
+    // MTP paged decode grows a CUDA workspace in addition to the target and
+    // draft KV pools. Keep enough headroom for that growth before advertising
+    // a larger elastic context; without it the pool can fail at ~17K tokens.
+    const size_t extra_speculative_vram = params.kv_paged_prealloc_max && spec_mtp
+        ? 224ull * 1024ull * 1024ull
+        : 0;
+
     if (n_layers == 0 || bytes_per_row == 0) {
         LOG_ERR("%s: model has no paged-attention layers or an invalid KV type (%s).\n",
                 __func__, ggml_type_name(params.cache_type_k));
@@ -1429,7 +1442,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
     const size_t margin = params.kv_paged_prealloc_max
-        ? requested_margin + extra_recurrent_vram
+        ? requested_margin + extra_recurrent_vram + extra_speculative_vram
         : requested_margin;
 
     if (free_vram <= margin) {
@@ -1452,9 +1465,10 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
     const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
 
-    LOG_INF("%s: free_vram=%0.1f MiB, device=%s, type=%s, head_dim=%u, attention_layers=%u, extra_recurrent_vram=%0.1f MiB, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u\n",
+    LOG_INF("%s: free_vram=%0.1f MiB, device=%s, type=%s, head_dim=%u, attention_layers=%u, mtp_layers=%u, extra_recurrent_vram=%0.1f MiB, extra_speculative_vram=%0.1f MiB, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u\n",
             __func__, free_vram / 1024.0f / 1024.0f, ggml_backend_dev_name(dev), ggml_type_name(params.cache_type_k), head_dim, n_layers,
-            extra_recurrent_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+            n_mtp_layers, extra_recurrent_vram / 1024.0f / 1024.0f, extra_speculative_vram / 1024.0f / 1024.0f,
+            bytes_per_block, n_gpu_blocks, n_cpu_blocks);
 
     if (params.kv_paged_prealloc_max) {
         const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;

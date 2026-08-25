@@ -1073,7 +1073,13 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
-        elastic_paged_context = params_base.kv_paged && params_base.kv_paged_dynamic && params_base.n_parallel > 1 && !has_spec;
+        const bool has_spec_mtp = std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        // MTP's draft context uses the same dynamic paged block geometry as the
+        // target.  The shared admission budget therefore covers both caches;
+        // other speculative backends remain on the conservative path.
+        elastic_paged_context = params_base.kv_paged && params_base.kv_paged_dynamic && params_base.n_parallel > 1 &&
+            (!has_spec || has_spec_mtp);
         paged_admission_blocks = elastic_paged_context ? params_base.n_gpu_blocks_admission : 0;
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -2332,10 +2338,11 @@ private:
                     const int id_task = task.id;
 
                     if (elastic_paged_context && get_context_reservation(task) > n_ctx) {
-                        send_error(task,
+                        send_error(task.id,
                                    string_format("request (%d tokens plus output) exceeds the shared context size (%d tokens)",
                                                  task.n_tokens(), n_ctx),
-                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                                   task.n_tokens(), n_ctx);
                         break;
                     }
 

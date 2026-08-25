@@ -2620,13 +2620,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        if (cparams.kv_paged && params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+                        // MTP uses only the appended nextn layers.  It can use the
+                        // paged cache too, but must pass its layer filter and size
+                        // the cache over all model layers so those appended layers
+                        // are addressable.  Keeping the old exclusion here leaves
+                        // the draft cache fixed per sequence and makes elastic
+                        // target scheduling unsafe.
+                        const bool use_paged = cparams.kv_paged &&
+                            (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP || filter != nullptr);
+
+                        if (use_paged) {
                             GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
                             GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
                             LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
                             const uint32_t head_dim   = hparams.n_embd_head_v();
                             const uint32_t n_head     = hparams.n_head_kv();
-                            const uint32_t n_layers   = hparams.n_layer();
+                            const uint32_t n_layers   = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+                                ? hparams.n_layer_all
+                                : hparams.n_layer();
                             const uint32_t block_size = cparams.block_size;
 
                             const uint32_t n_gpu_blocks = cparams.n_gpu_blocks;
@@ -2636,7 +2647,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             const uint32_t n_ubatch   = cparams.n_ubatch;
                             const uint32_t n_seq_max  = cparams.n_seq_max;
 
-                            auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
+                            auto * paged_cache = new llama_kv_cache_paged(
+                                head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max, std::move(filter));
                             GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
 
                             paged_cache->init(

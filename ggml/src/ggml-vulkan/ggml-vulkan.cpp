@@ -18143,6 +18143,13 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
         const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
 
+        // Skip unbounded heaps (SIZE_MAX) reported by some drivers (e.g. RADV
+        // on integrated GPUs); summing them overflows the size_t budget and
+        // makes fit/paged-KV calibrations try to allocate the whole system.
+        if (heap.size == SIZE_MAX || heap.size > (size_t) 1 << 60) {
+            continue;
+        }
+
         if (is_integrated_gpu || (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
             *total += heap.size;
 

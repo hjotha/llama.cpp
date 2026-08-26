@@ -1340,6 +1340,78 @@ static uint32_t common_paged_kv_attention_layers(const llama_model * model) {
     return n_attention_layers;
 }
 
+static void common_fit_normal_kv_context(common_params & params, const llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting normal KV context.");
+
+    ggml_backend_dev_t dev = nullptr;
+    for (ggml_backend_dev_t dev_it : params.devices) {
+        if (dev_it != nullptr) {
+            dev = dev_it;
+            break;
+        }
+    }
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    }
+    if (!dev) {
+        LOG_WRN("%s: no GPU device found, cannot fit normal KV context.\n", __func__);
+        return;
+    }
+
+    size_t free_vram = 0;
+    size_t total_vram = 0;
+    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+    const size_t sane_budget = (size_t) 1 << 50;
+    if (free_vram == 0 || free_vram > sane_budget || total_vram > sane_budget) {
+        LOG_WRN("%s: device %s reports an invalid memory budget (free=%zu, total=%zu).\n",
+                __func__, ggml_backend_dev_name(dev), free_vram, total_vram);
+        return;
+    }
+
+    size_t bytes_per_token = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        if (!model->hparams.has_kv(il)) {
+            continue;
+        }
+        bytes_per_token += ggml_row_size(params.cache_type_k, model->hparams.n_embd_k_gqa(il));
+        if (!model->hparams.is_mla()) {
+            bytes_per_token += ggml_row_size(params.cache_type_v, model->hparams.n_embd_v_gqa_max());
+        }
+    }
+    if (bytes_per_token == 0) {
+        LOG_WRN("%s: model has no normal KV rows, leaving ctx-size unchanged.\n", __func__);
+        return;
+    }
+
+    const size_t requested_margin = params.fit_params_target.empty()
+        ? (size_t)(total_vram * 0.05f)
+        : (size_t)params.fit_params_target[0];
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const size_t margin = requested_margin + (spec_mtp ? 64ull * 1024ull * 1024ull : 0);
+    if (free_vram <= margin) {
+        LOG_ERR("%s: free_vram=%.1f MiB <= margin=%.1f MiB; cannot fit normal KV context.\n",
+                __func__, free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f);
+        return;
+    }
+
+    const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
+    const uint64_t train_ctx = (uint64_t) model->hparams.n_ctx_train * n_seq;
+    const uint64_t available = free_vram - margin;
+    uint64_t ctx = std::min<uint64_t>(train_ctx, available / bytes_per_token);
+    const uint32_t align = 256 * n_seq;
+    ctx = (ctx / align) * align;
+    if (ctx < align) {
+        LOG_ERR("%s: no normal KV context fits the selected memory margin.\n", __func__);
+        return;
+    }
+
+    params.n_ctx = (uint32_t) ctx;
+    LOG_INF("%s: ctx0 normal KV candidate: ctx=%u, ctx_per_slot=%u, bytes_per_token=%zu, free_vram=%.1f MiB, margin=%.1f MiB, mtp=%s\n",
+            __func__, params.n_ctx, params.n_ctx / n_seq, bytes_per_token,
+            free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f, spec_mtp ? "yes" : "no");
+}
+
 static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
     GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
     // Calibrate against the device the user selected for offloading, not just
@@ -1398,9 +1470,9 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const uint32_t n_heads_kv = model->hparams.n_head_kv_arr[0];
     const uint32_t n_layers   = common_paged_kv_attention_layers(model);
     const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    // With MTP enabled, target and draft now have independent paged pools but
-    // the same logical block budget. Fit both layer sets against the same VRAM
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // With MTP enabled, target and draft use independent paged pools with the
+    // same logical block budget. Fit both layer sets against the same VRAM
     // budget so dynamic growth cannot overcommit the device.
     const uint32_t n_mtp_layers = spec_mtp ? model->hparams.n_layer_nextn : 0;
     const uint32_t head_dim   = model->hparams.n_embd_head_v_full;
@@ -1425,19 +1497,18 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         }
     }
 
-    // MTP paged decode grows a CUDA workspace in addition to the target and
-    // draft KV pools. Keep enough headroom for that growth before advertising
-    // a larger elastic context; without it the pool can fail at ~17K tokens.
-    const size_t extra_speculative_vram = params.kv_paged_prealloc_max && spec_mtp
-        ? 224ull * 1024ull * 1024ull
-        : 0;
-
     if (n_layers == 0 || bytes_per_row == 0) {
         LOG_ERR("%s: model has no paged-attention layers or an invalid KV type (%s).\n",
                 __func__, ggml_type_name(params.cache_type_k));
         return;
     }
 
+    // MTP paged decode grows a CUDA workspace in addition to the target and
+    // draft KV pools. Keep enough headroom for that growth before advertising
+    // a larger elastic context; without it the pool can fail at ~17K tokens.
+    const size_t extra_speculative_vram = params.kv_paged_prealloc_max && spec_mtp
+        ? 224ull * 1024ull * 1024ull
+        : 0;
     const size_t requested_margin = params.fit_params_target.empty()
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
@@ -1511,7 +1582,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.fit_params && !(params.n_ctx == 0 && !params.kv_paged)) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1554,6 +1625,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    if (!params.kv_paged && params.n_ctx == 0) {
+        common_fit_normal_kv_context(params, pimpl->model.get());
+        cparams = common_context_params_to_llama(params);
     }
 
     if ((params.fit_params || params.kv_paged_prealloc_max) && params.kv_paged) {

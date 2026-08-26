@@ -322,7 +322,16 @@ bool llama_kv_cache_paged::ensure_physical_capacity(uint32_t required_blocks, bo
         auto & storage = kv_gpu_layers[il];
         const bool can_spill = allow_dynamic_spill && storage.candidate_backend != nullptr &&
                                storage.candidate_backend != storage.backend;
+        const bool candidate_is_cpu = can_spill &&
+            ggml_backend_dev_type(ggml_backend_get_device(storage.candidate_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        // CPU spill is a last resort: first try to grow the current accelerator
+        // storage and move only as many layers as are needed to make room.  The
+        // old pre-spill heuristic is useful for balancing multiple accelerator
+        // backends, but applying it to CPU would move every layer at the first
+        // growth step and needlessly turn the whole attention pass into a CPU
+        // reference operation.
         const bool spill_first = (rebalance || target_blocks > original_budget_blocks) && can_spill &&
+                                 !candidate_is_cpu &&
                                  storage.backend == storage.original_backend &&
                                  layer_index >= max_original_layers;
         if (storage.capacity >= target_blocks && !spill_first) {

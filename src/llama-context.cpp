@@ -447,6 +447,12 @@ llama_context::llama_context(
                     }
                 }
             }
+            // Keep host KV spill opt-in: the normal paged-GPU path uses the
+            // default one-block bookkeeping pool but must not add the CPU as a
+            // candidate unless a real CPU spill capacity was requested.
+            if (cparams.kv_paged_dynamic && cparams.n_cpu_blocks > 1) {
+                kv_backends.push_back(backend_cpu);
+            }
             for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
                 const auto * layer_dev = model.dev_layer(il);
                 for (auto & b : backends) {

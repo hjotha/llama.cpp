@@ -3640,48 +3640,55 @@ private:
         });
 
         if (ret != 0) {
-            {
-                std::string err;
+            std::string err;
 
-                if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
-                    err = "Context size has been exceeded.";
-                }
-
-                if (ret == -1) {
-                    err = "Invalid input batch.";
-                }
-
-                if (ret < -1) {
-                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
-                    err = "Compute error.";
-                }
-
-                // TODO: handle ret == 2 (abort) when we start aborting
-
-                if (!err.empty()) {
-                    SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
-
-                    for (auto & slot : slots) {
-                        if (slot.is_processing()) {
-                            send_error(slot, err);
-                            slot.release();
-
-                            // note: it's complicated to keep track of how much of the current batch has been
-                            //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
-                        }
-                    }
-
-                    // stop, do not retry with smaller batch size
-                    throw std::runtime_error(err);
-                }
+            if (n_batch == 1 && ret == 1) {
+                // TODO: try to terminate only the largest active slot/sequence and continue with the rest
+                //       need to remove the tokens from the current batch too
+                err = "Context size has been exceeded.";
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
-                n_batch /= 2;
+            if (ret == -1) {
+                err = "Invalid input batch.";
+            }
+
+            if (ret < -1) {
+                // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
+                err = "Compute error.";
+            }
+
+            // TODO: handle ret == 2 (abort) when we start aborting
+
+            if (err.empty() && !try_clear_idle_slots()) {
+                const int32_t n_batch_next = n_batch / 2;
+                for (const auto & slot : slots) {
+                    if (!slot.spec_i_batch.empty() &&
+                            slot.spec_i_batch.front() >= off &&
+                            slot.spec_i_batch.front() < off + n_batch_next &&
+                            slot.spec_i_batch.back() >= off + n_batch_next) {
+                        err = "Context size has been exceeded.";
+                        break;
+                    }
+                }
+                n_batch = n_batch_next;
+            }
+
+            if (!err.empty()) {
+                SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, err);
+                        slot.release();
+
+                        // note: it's complicated to keep track of how much of the current batch has been
+                        //       processed before the error occurred, so we simply clear the entire context
+                        slot.prompt_clear();
+                    }
+                }
+
+                // stop, do not retry with smaller batch size
+                throw std::runtime_error(err);
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);

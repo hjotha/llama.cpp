@@ -1819,63 +1819,53 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             return res;
         }
 
-        // common_fit_paged_kv_blocks already fixed the pool budget. Pre-filling
-        // it with a synthetic sequence is only done when the user enabled
-        // --fit; with --fit off the pool grows dynamically on demand. The
-        // startup prefill is a heavy all-GPU workload that can wedge a shared
-        // iGPU and it is pointless when the user opted out of calibration.
-        if (!params.fit_params) {
-            COM_INF("%s: --fit off, paged KV pool grows dynamically (budget=%u blocks, ctx=%u)\n",
-                    __func__, params.n_gpu_blocks, params.n_ctx);
-        } else {
-            const uint32_t target_tokens = params.n_ctx > 0 ? params.n_ctx - 1 : 0;
-            const uint32_t chunk_size = (uint32_t) std::max(1, std::min(params.n_batch, params.n_ubatch));
-            llama_token token = llama_vocab_bos(vocab);
-            if (token == LLAMA_TOKEN_NULL) {
-                token = 0;
-            }
-            std::vector<llama_token> tokens(chunk_size, token);
-
-            try {
-                uint32_t processed = 0;
-                while (processed < target_tokens) {
-                    const uint32_t count = std::min(chunk_size, target_tokens - processed);
-                    const int rc = llama_decode(lctx, llama_batch_get_one(tokens.data(), count));
-                    if (rc != 0) {
-                        COM_INF("%s: calibration stopped at %u/%u tokens (decode=%d)\n",
-                                __func__, processed, target_tokens, rc);
-                        break;
-                    }
-                    processed += count;
-                }
-                llama_synchronize(lctx);
-            } catch (const std::exception & e) {
-                COM_ERR("%s: calibration failed (%s); keeping the dynamic pool\n", __func__, e.what());
-                return res;
-            } catch (...) {
-                COM_ERR("%s", "calibration failed; keeping the dynamic pool\n");
-                return res;
-            }
-
-            const uint32_t blocks = paged->freeze_physical_capacity();
-            if (blocks == 0) {
-                COM_ERR("%s", "paged KV max calibration found no usable GPU capacity\n");
-                return res;
-            }
-
-            const uint32_t calibrated_ctx = blocks * params.block_size;
-            lctx->set_n_ctx(calibrated_ctx);
-            params.n_ctx = calibrated_ctx;
-            params.n_gpu_blocks = blocks;
-            params.n_gpu_blocks_initial = blocks;
-            params.n_gpu_blocks_growth = blocks;
-            params.n_gpu_blocks_admission = blocks;
-            llama_memory_clear(llama_get_memory(lctx), true);
-            llama_synchronize(lctx);
-            llama_perf_context_reset(lctx);
-            COM_INF("%s: calibrated fixed paged KV pool: ctx=%u, blocks=%u, initial=%u, admission=%u\n",
-                    __func__, calibrated_ctx, blocks, blocks, blocks);
+        const uint32_t target_tokens = params.n_ctx > 0 ? params.n_ctx - 1 : 0;
+        const uint32_t chunk_size = (uint32_t) std::max(1, std::min(params.n_batch, params.n_ubatch));
+        llama_token token = llama_vocab_bos(vocab);
+        if (token == LLAMA_TOKEN_NULL) {
+            token = 0;
         }
+        std::vector<llama_token> tokens(chunk_size, token);
+
+        try {
+            uint32_t processed = 0;
+            while (processed < target_tokens) {
+                const uint32_t count = std::min(chunk_size, target_tokens - processed);
+                const int rc = llama_decode(lctx, llama_batch_get_one(tokens.data(), count));
+                if (rc != 0) {
+                    COM_INF("%s: calibration stopped at %u/%u tokens (decode=%d)\n",
+                            __func__, processed, target_tokens, rc);
+                    break;
+                }
+                processed += count;
+            }
+            llama_synchronize(lctx);
+        } catch (const std::exception & e) {
+            COM_ERR("%s: calibration failed (%s); keeping the dynamic pool\n", __func__, e.what());
+            return res;
+        } catch (...) {
+            COM_ERR("%s", "calibration failed; keeping the dynamic pool\n");
+            return res;
+        }
+
+        const uint32_t blocks = paged->freeze_physical_capacity();
+        if (blocks == 0) {
+            COM_ERR("%s", "paged KV max calibration found no usable GPU capacity\n");
+            return res;
+        }
+
+        const uint32_t calibrated_ctx = blocks * params.block_size;
+        lctx->set_n_ctx(calibrated_ctx);
+        params.n_ctx = calibrated_ctx;
+        params.n_gpu_blocks = blocks;
+        params.n_gpu_blocks_initial = blocks;
+        params.n_gpu_blocks_growth = blocks;
+        params.n_gpu_blocks_admission = blocks;
+        llama_memory_clear(llama_get_memory(lctx), true);
+        llama_synchronize(lctx);
+        llama_perf_context_reset(lctx);
+        COM_INF("%s: calibrated fixed paged KV pool: ctx=%u, blocks=%u, initial=%u, admission=%u\n",
+                __func__, calibrated_ctx, blocks, blocks, blocks);
     }
 
     if (params.warmup) {

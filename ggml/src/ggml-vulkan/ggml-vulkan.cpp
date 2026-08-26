@@ -18603,7 +18603,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!op->src[3]) {
                     return reject("missing K cache tensor");
                 }
-                if (op->src[3]->buffer) {
+                if (op->src[3]->buffer && !ggml_backend_buffer_is_meta(op->src[3]->buffer)) {
                     const auto buft = op->src[3]->buffer->buft;
                     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name ||
                         ((ggml_backend_vk_buffer_type_context *) buft->context)->device->idx != ctx->device) {

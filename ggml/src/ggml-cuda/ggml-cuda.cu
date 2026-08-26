@@ -5318,7 +5318,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (!op->src[3]) {
                 return false;
             }
-            return !op->src[3]->buffer || ggml_backend_buft_is_cuda(op->src[3]->buffer->buft);
+            return !op->src[3]->buffer || ggml_backend_buffer_is_meta(op->src[3]->buffer) ||
+                ggml_backend_buft_is_cuda(op->src[3]->buffer->buft);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

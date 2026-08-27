@@ -54,48 +54,64 @@ fail later under load. Slots draw from one shared pool: `--parallel` limits
 simultaneous sequences but does not divide the pool into fixed per-slot quotas.
 Pages released by a completed request can be reused by requests that remain.
 
-### RTX 4070 12 GB result
+### RTX 4070 12 GB results (2026-08-26)
 
-The current production profile was measured on a GeForce RTX 4070 12 GB with
-Qwen3.8-27B `UD-IQ3_XXS`, Q4_0 K/V cache, CUDA Flash Attention, and three server
-slots. CUDA reported 12,480,282,624 usable bytes. Startup calibration selected
-4,032 pages of 16 tokens, or 64,512 physical tokens, and took about 133 seconds
-before the health endpoint became ready.
+Current production profile, measured on a GeForce RTX 4070 12 GB with
+Qwen3.8-27B `UD-IQ3_XXS`, paged `q4_0` K/V cache, CUDA Flash Attention, one
+server slot and MTP speculative decoding:
 
 ```sh
 llama-server \
   --model Qwen3.8-27B-UD-IQ3_XXS.gguf \
-  --ctx-size 0 --parallel 3 \
+  --ctx-size 0 --parallel 1 \
   --batch-size 128 --ubatch-size 128 \
   --n-gpu-layers 999 --device CUDA0 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
-  --kv-paged-prealloc-max --fit off \
-  --n-cpu-blocks 1024 --kv-block-size 16
+  --kv-paged-prealloc-max --fit off --fit-target 643 --kv-block-size 16 \
+  --cache-ram 0 --ctx-checkpoints 0 --metrics \
+  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
+  --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
 ```
 
-Measured OpenAI-compatible completion results:
+Measured OpenAI-compatible completions at the maximum validated gate
+(`36,864` prompt + `4,096` output tokens, `ignore_eos`, temperature 0):
+
+| Profile | Prefill | Decode | Wall time |
+| --- | ---: | ---: | ---: |
+| P1 MTP nmax2, CUDA Graphs (production) | 544.4 tok/s | 38.0 tok/s | 175.6 s |
+| P1 MTP nmax2, CUDA Graphs off | 541.6 tok/s | 37.4 tok/s | 177.6 s |
+| P1 no MTP | 694.2 tok/s | 24.1 tok/s | 223.2 s |
+
+MTP wins the full request even though it adds a draft forward to prefill:
+decode rises from 24.1 to 38.0 tok/s and wall time drops about 21%. CUDA
+Graphs adds another ~1.15% wall reduction for ~22 MiB of VRAM. The confirmed
+operational context limit of this profile is 40,960 tokens: startup
+calibration announces 43,008, but the first page growth beyond 40,960 fails
+to reserve about 46 MiB of CUDA workspace. `nmax=3` OOMs repeatedly and
+DFlash2 stays below target-only on this hardware, so MTP `nmax=2` is the
+promoted speculative profile.
+
+High-capacity profile without MTP (shared paged pool, `--parallel 3`, logical
+context 77,824; startup calibration with `--kv-paged-prealloc-max` selects
+4,032 pages of 16 tokens = 64,512 physical tokens in about 133 s):
 
 | Workload | Prefill | Decode | Wall time |
 | --- | ---: | ---: | ---: |
-| 30,052 prompt + 256 output, first request | 1,103.9 tok/s | 27.0 tok/s | 36.7 s |
-| distinct 30,052 prompt + 256 output, next request | 1,100.2 tok/s | 27.0 tok/s | 36.8 s |
-| 64,511 prompt + 1 output | 1,100.5 tok/s | - | 58.6 s |
-| 60,416 prompt + 4,096 output | 1,098.4 tok/s | 21.3 tok/s | 247.1 s |
+| 30,052 + 256, first request | 1,103.9 tok/s | 27.0 tok/s | 36.7 s |
+| distinct 30,052 + 256, next request | 1,100.2 tok/s | 27.0 tok/s | 36.8 s |
+| 64,511 + 1 | 1,100.5 tok/s | - | 58.6 s |
+| 60,416 + 4,096 | 1,098.4 tok/s | 21.3 tok/s | 247.1 s |
+| 62,052 + 4,096 (76K logical) | 535.3 tok/s | 22.3 tok/s | complete |
 
-Three concurrent requests of 20,052 prompt + 256 output tokens also completed
-successfully. Together they reserved 3,810/4,032 pages (94.5% of the pool) and
-finished in 88.8 seconds. Per-request prefill was 638.9, 1,031.0, and 640.3
-tok/s because GPU compute was shared while the requests overlapped.
+`--parallel 4` aborts the long gate at 57,344 tokens with a `cuMemCreate`
+OOM; admission control defers overflow requests but does not replace the
+FlashAttention workspace budget. Paged KV does not beat plain KV at equal
+context - it wins by shared capacity, dynamic growth and eviction, not raw
+decode speed (about 1% at short context, 6-7% slower decode at 40-48K).
 
-The two distinct sequential prompts are the fragmentation check: prefill
-changed by only 0.34%, so the fixed pool did not degrade after the first
-request. By comparison, the earlier dynamic-growth profile delivered roughly
-522-543 prompt tok/s at long context because page allocation and migration
-occurred in the request's critical path.
-
-SnapKV is available but was disabled for these production measurements. The
-64,512-token limit is therefore exact full KV capacity, not a larger logical
-context obtained through eviction. Results are hardware-, model-, build-, and
+SnapKV is available but not promoted for production: above the physical pool
+it accepts long prompts but evicts pages and loses needle facts (80K logical
+/ 48K physical missed 3/3 facts). Results are hardware-, model-, build-, and
 cache-type-specific; the automatic calibration is intended to determine the
 corresponding safe value on another system.
 

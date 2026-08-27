@@ -33,6 +33,16 @@ The main additions are:
 - CUDA Flash Decode / DFlash2 support for paged attention;
 - optional SnapKV page scoring, selective retention, per-sequence score state,
   eviction timing, and a repeatable quality benchmark;
+- page-eviction guards in the paged attention kernels (`physical_block < 0` is
+  skipped/masked instead of dereferenced), so evicted pages never corrupt KV
+  reads during prefill or decode;
+- a per-sequence `n_prompt`/`n_decoded` allocator invariant so cached tokens
+  and decoded tokens keep `n_prompt + n_decoded == previous_max + 1` while
+  pages are being released and reused;
+- SnapKV state kept per sequence and correctly sized against the *logical*
+  per-slot context even under `--kv-paged-dynamic` with multiple parallel
+  slots (the fix uses `cparams.n_ctx` instead of `n_ctx_seq`, which previously
+  under-sized the score window and crashed with more than one slot);
 - `--kv-paged-prealloc-max`, which measures the usable GPU budget, runs one
   synthetic long prefill before the health endpoint becomes ready, and freezes
   the largest validated page pool for the lifetime of the server.

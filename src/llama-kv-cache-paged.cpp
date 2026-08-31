@@ -1041,7 +1041,7 @@ uint32_t llama_kv_cache_paged::snapkv_evict_to_target(llama_sequence_group & gro
         const int32_t physical = group.block_table[cand.bid];
         if (physical >= 0) {
             if (block_manager.is_gpu((uint32_t) physical)) {
-                release_gpu_blocks(llama_block_ids{ (uint32_t) physical });
+                release_gpu_blocks(llama_block_ids{ static_cast<int32_t>(physical) });
             } else {
                 block_manager.release_cpu_blocks({ (uint32_t) physical });
             }
@@ -1105,7 +1105,7 @@ uint32_t llama_kv_cache_paged::snapkv_progressive_evict(llama_sequence_group & g
         const int32_t physical = group.block_table[cand.bid];
         if (physical >= 0) {
             if (block_manager.is_gpu((uint32_t) physical)) {
-                release_gpu_blocks(llama_block_ids{ (uint32_t) physical });
+                release_gpu_blocks(llama_block_ids{ static_cast<int32_t>(physical) });
             } else {
                 block_manager.release_cpu_blocks({ (uint32_t) physical });
             }
@@ -1153,7 +1153,7 @@ bool llama_kv_cache_paged::snapkv_migrate_cpu_to_gpu(llama_sequence_group & grou
             break;
         }
         const int32_t old_id = group.block_table[bid];
-        do_block_copy({ (uint32_t) old_id }, { (uint32_t) new_ids[0] }, /*to_gpu=*/true);
+        do_block_copy({ static_cast<int32_t>(old_id) }, { static_cast<int32_t>(new_ids[0]) }, /*to_gpu=*/true);
         block_manager.release_cpu_blocks({ (uint32_t) old_id });
         group.block_table[bid] = new_ids[0];
         ++migrated;

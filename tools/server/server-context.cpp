@@ -1781,6 +1781,23 @@ private:
             if (slot.n_predict_max > 0) {
                 request_tokens += slot.n_predict_max;
             }
+
+            // The paged pool budget is n_ctx: prompt + predicted output must
+            // fit or the KV growth would OOM mid-prefill and abort the whole
+            // process (ggml_abort on CUDA alloc failure). Fail cleanly with a
+            // context error so the client can compact instead of crash-looping.
+            if (request_tokens > n_ctx) {
+                slot.n_kv_reservation = 0;
+                send_error(
+                    task.id,
+                    string_format("request (%lld tokens) exceeds the available context size (%d tokens), compact the context and retry",
+                        (long long) request_tokens, n_ctx),
+                    ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                    (int32_t) task.n_tokens(),
+                    n_ctx);
+                return false;
+            }
+
             slot.n_kv_reservation = std::min<int64_t>(request_tokens, n_ctx);
 
             int64_t total_tokens = slot.n_kv_reservation;

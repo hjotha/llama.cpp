@@ -79,9 +79,12 @@ llama-server \
 
 `--ctx-size 40960` matches the confirmed operational limit: a request of
 36,866 prompt + 4,094 output tokens (40,960 total) is the maximum that
-completes. The nominal 43,008 calibration is not reachable on this hardware;
-beyond 40,960 the first KV page growth fails with a `cudaMalloc` OOM of about
-46 MiB and the request errors with `Failed to reserve paged KV cache`.
+completes. Requests whose prompt + max_tokens exceed 40,960 are rejected
+upfront with a clean HTTP 400 `exceed_context_size_error` ("compact the
+context and retry") instead of growing the KV pool past the physical budget,
+which previously OOM'd with a `cudaMalloc` failure mid-prefill and aborted
+the whole process (core dump + systemd restart). The nominal 43,008
+calibration is not reachable on this hardware.
 
 `--ctx-checkpoints 1` is required for prompt caching on hybrid models.
 Qwen3.8-27B-UD has 16 attention layers and 48 recurrent layers, so the hybrid

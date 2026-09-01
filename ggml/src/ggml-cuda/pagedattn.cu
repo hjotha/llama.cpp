@@ -4,7 +4,6 @@
 #include "dequantize.cuh"
 #include "fattn.cuh"
 
-static constexpr int PAGED_ATTN_PARALLEL_MAX_TOKENS = 4;
 static constexpr int PAGED_ATTN_FA_STRIDE = 256;
 
 // flash-decoding: context tokens handled per shared memory tile
@@ -224,6 +223,7 @@ static __global__ void paged_attention_gather_f16_kernel(
         const size_t stride_head,
         const size_t stride_block,
         const int n_heads_kv,
+        const int contiguous_base,
         const int block_size,
         const int context_len,
         const int padded_context,
@@ -239,7 +239,8 @@ static __global__ void paged_attention_gather_f16_kernel(
     if (token < context_len) {
         const int bid            = token / block_size;
         const int token_in_block = token % block_size;
-        const int physical_block = block_table[bid];
+        const int physical_block = contiguous_base >= 0
+            ? contiguous_base + bid : block_table[bid];
         if (physical_block >= 0) {
             const size_t k_offset = (size_t) physical_block * stride_block +
                                     (size_t) head_idx * stride_head +
@@ -262,6 +263,7 @@ static __global__ void paged_attention_mask_f16_kernel(
         const int n_tokens,
         const int padded_context,
         const int block_size,
+        const int contiguous_base,
         const int * __restrict__ block_table,
         half * __restrict__ mask) {
     const int token = blockIdx.x * blockDim.x + threadIdx.x;
@@ -274,7 +276,7 @@ static __global__ void paged_attention_mask_f16_kernel(
     half value = __float2half(0.0f);
     if (token > query_pos) {
         value = __float2half(-INFINITY);
-    } else if (block_table != nullptr) {
+    } else if (contiguous_base < 0 && block_table != nullptr) {
         const int bid = token / block_size;
         if (block_table[bid] < 0) {
             value = __float2half(-INFINITY);  // evicted page: masked out
@@ -344,6 +346,7 @@ static bool ggml_cuda_paged_attn_prefill(
     const int n_heads_kv     = k_new->ne[1];
     const int n_seq          = batch_lens->ne[0];
     const int active_context = ((const int32_t *) ((const float *) dst->op_params + 1))[2];
+    const int contiguous_base = ((const int32_t *) ((const float *) dst->op_params + 1))[13] - 1;
     if (n_seq != 1 || n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || active_context <= 0) {
         return false;
     }
@@ -362,11 +365,11 @@ static bool ggml_cuda_paged_attn_prefill(
         dim3(padded_context, n_heads_kv), dim3(head_dim), 0, ctx.stream()>>>(
             kv_cache->data, (const int *) block_table->data,
             stride_token, stride_head, stride_block, n_heads_kv,
-            block_size, active_context, padded_context, k_f16.ptr, v_f16.ptr);
+            contiguous_base, block_size, active_context, padded_context, k_f16.ptr, v_f16.ptr);
     paged_attention_mask_f16_kernel<<<
         dim3((padded_context + 255) / 256, n_tokens), dim3(256), 0, ctx.stream()>>>(
             active_context, n_tokens, padded_context, block_size,
-            (const int *) block_table->data, mask.ptr);
+            contiguous_base, (const int *) block_table->data, mask.ptr);
 
     ggml_tensor q_fa = *q;
     q_fa.ne[1] = n_tokens;
@@ -442,6 +445,7 @@ static __global__ void paged_attention_flash_decode_kernel(
         const int gqa_ratio,
         const int block_size,
         const int max_blocks,
+        const int contiguous_base,
         const int n_splits,
         const float scale,
         float * __restrict__ partial_acc,
@@ -504,7 +508,8 @@ static __global__ void paged_attention_flash_decode_kernel(
             const int bid   = token / block_size;
             if (bid != cached_bid) {
                 cached_bid = bid;
-                cached_pb  = block_table[seq_idx * max_blocks + bid];
+                cached_pb  = contiguous_base >= 0
+                    ? contiguous_base + bid : block_table[seq_idx * max_blocks + bid];
             }
             float qk[GQA] = {};
             if (cached_pb >= 0) {
@@ -589,7 +594,8 @@ static __global__ void paged_attention_flash_decode_kernel(
             const int bid   = token / block_size;
             if (bid != cached_bid) {
                 cached_bid = bid;
-                cached_pb  = block_table[seq_idx * max_blocks + bid];
+                cached_pb  = contiguous_base >= 0
+                    ? contiguous_base + bid : block_table[seq_idx * max_blocks + bid];
             }
             if (cached_pb < 0) {
                 continue;  // evicted page: weight is ~0
@@ -1125,6 +1131,7 @@ static void paged_attn_flash_decode_launch(
         const int head_dim,
         const int block_size,
         const int max_blocks,
+        const int contiguous_base,
         const float scale) {
     const int gqa_ratio = n_heads / n_heads_kv;
     const int n_groups  = n_heads / GQA;
@@ -1147,7 +1154,7 @@ static void paged_attn_flash_decode_launch(
             (const float *) q->data, kv_cache->data, (const int *) block_table->data,
             (const int *) context_lens->data, (const int *) batch_offsets->data,
             (const int *) batch_lens->data, stride_token, stride_head, stride_block,
-            n_heads_kv, gqa_ratio, block_size, max_blocks, n_splits, scale,
+            n_heads_kv, gqa_ratio, block_size, max_blocks, contiguous_base, n_splits, scale,
             partial_acc.ptr, partial_meta.ptr);
 
     const size_t combine_smem = (size_t) (n_splits + n_warps) * sizeof(float);
@@ -1177,13 +1184,14 @@ static void paged_attn_flash_decode(
         const int head_dim,
         const int block_size,
         const int max_blocks,
+        const int contiguous_base,
         const float scale) {
 #define PAGED_ATTN_FD_CASE(GQA)                                                                  \
     case GQA:                                                                                    \
         paged_attn_flash_decode_launch<block_t, quantized, GQA>(                                 \
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,         \
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,       \
-            head_dim, block_size, max_blocks, scale);                                            \
+            head_dim, block_size, max_blocks, contiguous_base, scale);                           \
         break
 
     switch (paged_attn_flash_decode_gqa(n_heads / n_heads_kv)) {
@@ -1380,11 +1388,13 @@ static void ggml_cuda_op_paged_attn_quantized(ggml_backend_cuda_context & ctx, g
         return;
     }
 
+    const int contiguous_base = n_seq == 1
+        ? ((const int32_t *) (op_params_f + 1))[13] - 1 : -1;
     if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || snapkv_streaming) {
         paged_attn_flash_decode<block_t, true>(
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,
-            head_dim, block_size, max_blocks, scale);
+            head_dim, block_size, max_blocks, contiguous_base, scale);
     } else {
         const size_t reduce_smem = (size_t) ((head_dim + 31) / 32) * sizeof(float);
         paged_attention_quant_decode_kernel<block_t, QK><<<
@@ -1470,11 +1480,13 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         return;
     }
 
+    const int contiguous_base = n_seq == 1
+        ? ((const int32_t *) (op_params_f + 1))[13] - 1 : -1;
     if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || snapkv_streaming) {
         paged_attn_flash_decode<half, false>(
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,
-            head_dim, block_size, max_blocks, scale);
+            head_dim, block_size, max_blocks, contiguous_base, scale);
     } else {
         const size_t reduce_smem = (size_t) ((head_dim + 31) / 32) * sizeof(float);
         paged_attention_decode_kernel<<<grid_dims, block_dims, reduce_smem, ctx.stream()>>>(

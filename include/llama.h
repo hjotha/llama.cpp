@@ -762,6 +762,12 @@ extern "C" {
     // Memory
     //
 
+    // Reserve physical memory for a bounded request. This is a no-op for memory
+    // implementations that do not require explicit growth.
+    LLAMA_API bool llama_memory_reserve(
+            llama_memory_t mem,
+                   uint32_t n_tokens);
+
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
     LLAMA_API void llama_memory_clear(

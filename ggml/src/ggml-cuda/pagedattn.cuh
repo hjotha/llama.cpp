@@ -1,5 +1,7 @@
 #include "common.cuh"
 
+static constexpr int PAGED_ATTN_PARALLEL_MAX_TOKENS = 4;
+
 __global__ void paged_attention_write_kernel(const float * k_new,        // [batch_size, n_heads_kv, head_dim]
                                              const float * v_new,        // [batch_size, n_heads_kv, head_dim]
                                              half *        kv_cache,     // The paged cache

@@ -4030,6 +4030,14 @@ int32_t llama_set_adapter_cvec(
 // memory
 //
 
+bool llama_memory_reserve(llama_memory_t mem, uint32_t n_tokens) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->reserve(n_tokens);
+}
+
 void llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
         return;

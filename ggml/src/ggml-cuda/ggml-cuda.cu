@@ -2561,6 +2561,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // Paged prefill updates active_context in op_params for every ubatch.
+        // CUDA graph replay would otherwise keep the value captured by the first
+        // ubatch. Decode reads its live context length from the input tensor and
+        // remains CUDA-graph compatible.
+        if (node->op == GGML_OP_PAGED_ATTN &&
+                node->src[0]->ne[2] > PAGED_ATTN_PARALLEL_MAX_TOKENS) {
+            use_cuda_graph = false;
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

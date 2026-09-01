@@ -8128,6 +8128,8 @@ struct ggml_tensor * ggml_paged_attn(
     op_params_i[12] = snapkv_scores != NULL && q->ne[1] > 0
         ? (int32_t) (snapkv_scores->ne[0] / q->ne[1])
         : max_blocks;
+    // base+1 for a contiguous single-sequence block table; set_input refreshes it.
+    op_params_i[13] = 0;
 
     return result;
 }

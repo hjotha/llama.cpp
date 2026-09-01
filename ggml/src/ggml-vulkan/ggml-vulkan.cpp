@@ -6527,17 +6527,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
         std::vector<const char *> device_extensions;
         vk::PhysicalDeviceFeatures device_features = device->physical_device.getFeatures();
 
-        VkPhysicalDeviceFeatures2 device_features2;
+        VkPhysicalDeviceFeatures2 device_features2 {};
         device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         device_features2.pNext = nullptr;
         device_features2.features = (VkPhysicalDeviceFeatures)device_features;
 
-        VkPhysicalDeviceVulkan11Features vk11_features;
+        VkPhysicalDeviceVulkan11Features vk11_features {};
         vk11_features.pNext = nullptr;
         vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
         device_features2.pNext = &vk11_features;
 
-        VkPhysicalDeviceVulkan12Features vk12_features;
+        VkPhysicalDeviceVulkan12Features vk12_features {};
         vk12_features.pNext = nullptr;
         vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
         vk11_features.pNext = &vk12_features;
@@ -6742,8 +6742,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
-        device->buffer_device_address = vk12_features.bufferDeviceAddress;
-        device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
+        const bool vulkan12_or_newer = VK_VERSION_MAJOR(device->properties.apiVersion) > 1 ||
+                                       (VK_VERSION_MAJOR(device->properties.apiVersion) == 1 &&
+                                        VK_VERSION_MINOR(device->properties.apiVersion) >= 2);
+        device->buffer_device_address = vulkan12_or_newer && vk12_features.bufferDeviceAddress;
+        device->vulkan_memory_model = vulkan12_or_newer && vk12_features.vulkanMemoryModel;
 
         if (device->subgroup_size_control) {
             device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
@@ -11223,7 +11226,8 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // The temporary score/partial layout is shared across sequences. Keep the
     // split path single-sequence until the shaders include seq in that layout.
     const bool parallel_decode = n_seq == 1 &&
-                                 active_context >= parallel_min_context &&
+                                 (n_tokens > parallel_max_tokens ||
+                                  active_context >= parallel_min_context) &&
                                  gqa_ratio <= 8 &&
                                  scratch_size <= ctx->device->properties.limits.maxStorageBufferRange;
 
@@ -16317,6 +16321,16 @@ static int ggml_vk_get_device_count() {
     return vk_instance.device_indices.size();
 }
 
+static bool ggml_vk_device_supports_timeline_semaphore(size_t idx) {
+    ggml_vk_instance_init();
+
+    const auto physical_devices = vk_instance.instance.enumeratePhysicalDevices();
+    const auto api_version = physical_devices[vk_instance.device_indices[idx]].getProperties().apiVersion;
+
+    return VK_VERSION_MAJOR(api_version) > 1 ||
+           (VK_VERSION_MAJOR(api_version) == 1 && VK_VERSION_MINOR(api_version) >= 2);
+}
+
 static void ggml_vk_get_device_description(int device, char * description, size_t description_size) {
     ggml_vk_instance_init();
 
@@ -18393,7 +18407,7 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ true,
+        /* .events                = */ ggml_vk_device_supports_timeline_semaphore(ctx->device),
         /* .mmap_support          = */ !ctx->is_integrated_gpu,
     };
 }
@@ -19279,8 +19293,18 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
                 ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
                 ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
                 ctx->op_offload_min_batch_size = min_batch_size;
+
+                auto device_iface = ggml_backend_vk_device_i;
+                if (!ggml_vk_device_supports_timeline_semaphore(i)) {
+                    // Device events use timeline semaphore commands, which are not
+                    // available on Vulkan 1.1 devices such as Mali-G76 on Android.
+                    device_iface.event_new = nullptr;
+                    device_iface.event_free = nullptr;
+                    device_iface.event_synchronize = nullptr;
+                }
+
                 devices.push_back(new ggml_backend_device {
-                    /* .iface   = */ ggml_backend_vk_device_i,
+                    /* .iface   = */ device_iface,
                     /* .reg     = */ reg,
                     /* .context = */ ctx,
                 });

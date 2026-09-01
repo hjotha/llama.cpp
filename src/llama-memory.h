@@ -104,6 +104,10 @@ struct llama_memory_i {
     // ops
     //
 
+    // Reserve physical capacity for a bounded request. Memory types that do not
+    // need an explicit reservation keep the default no-op.
+    virtual bool reserve(uint32_t n_tokens) { (void) n_tokens; return true; }
+
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
 

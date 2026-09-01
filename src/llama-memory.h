@@ -113,6 +113,9 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // Optional hint for paged SnapKV users that feed a prompt in batches.
+    virtual void set_snapkv_prefill_end(llama_seq_id /*seq_id*/, llama_pos /*prefill_end*/) {}
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

@@ -2868,9 +2868,11 @@ extern "C" {
                                                   int                   block_size,
                                                   int                   max_blocks,
                                                   int                   active_context,
+                                                  bool                  snapkv_streaming,
                                                   struct ggml_tensor  * snapkv_scores,
                                                   struct ggml_tensor  * snapkv_capture_from,
-                                                  struct ggml_tensor  * snapkv_score_slots);
+                                                  struct ggml_tensor  * snapkv_score_slots,
+                                                  struct ggml_tensor  * snapkv_token_scores);
 
     //
     // quantization

@@ -2626,7 +2626,9 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
                  int   block_size,
                  int   max_blocks,
                  int   active_context,
+         bool   snapkv_streaming,
          ggml_tensor * snapkv_scores,   // [max_blocks, batch_size] page importance accumulator, nullable
+         ggml_tensor * snapkv_token_scores,
          ggml_tensor * snapkv_capture_from,
          ggml_tensor * snapkv_score_slots) const {
 
@@ -2641,8 +2643,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
     ggml_tensor * cur = ggml_paged_attn(ctx0,
                                         q, k_cur, v_cur, k_cache, v_cache,
                                         block_table, write_slots, context_lens, batch_offsets, batch_lens,
-                                        kq_scale, block_size, max_blocks, active_context,
-                                        snapkv_scores, snapkv_capture_from, snapkv_score_slots);
+                                        kq_scale, block_size, max_blocks, active_context, snapkv_streaming,
+                                        snapkv_scores, snapkv_capture_from, snapkv_score_slots, snapkv_token_scores);
     return cur;
 }
 
@@ -2894,8 +2896,9 @@ ggml_tensor * llm_graph_context::build_attn(
         inp->paged_context_lens,
         inp->paged_batch_offsets,
         inp->paged_batch_lens,
-        kq_scale, cparams.block_size, max_blocks, active_context,
-        paged_mctx->get_snapkv_scores(), paged_mctx->get_snapkv_capture_from(), paged_mctx->get_snapkv_score_slots());
+        kq_scale, cparams.block_size, max_blocks, active_context, paged_mctx->get_snapkv_streaming(),
+        paged_mctx->get_snapkv_scores(), paged_mctx->get_snapkv_token_scores(),
+        paged_mctx->get_snapkv_capture_from(), paged_mctx->get_snapkv_score_slots());
     cb(cur, "kqv_out", il);
 
     // Reshape to [n_embd_head * n_head, n_tokens] (just a view)

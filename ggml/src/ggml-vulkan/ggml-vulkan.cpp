@@ -11226,7 +11226,8 @@ static void ggml_vk_paged_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // The temporary score/partial layout is shared across sequences. Keep the
     // split path single-sequence until the shaders include seq in that layout.
     const bool parallel_decode = n_seq == 1 &&
-                                 active_context >= parallel_min_context &&
+                                 (n_tokens > parallel_max_tokens ||
+                                  active_context >= parallel_min_context) &&
                                  gqa_ratio <= 8 &&
                                  scratch_size <= ctx->device->properties.limits.maxStorageBufferRange;
 

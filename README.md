@@ -58,50 +58,53 @@ Pages released by a completed request can be reused by requests that remain.
 
 Current production profile, measured on a GeForce RTX 4070 12 GB with
 Qwen3.8-27B `UD-IQ3_XXS`, paged `q4_0` K/V cache, CUDA Flash Attention, one
-server slot, MTP speculative decoding and dynamic paged KV:
+server slot, MTP speculative decoding and dynamic paged KV. All pool
+parameters are explicit, so startup skips the calibration pass and the server
+is ready in about 12 s:
 
 ```sh
 llama-server \
   --model Qwen3.8-27B-UD-IQ3_XXS.gguf \
-  --ctx-size 43008 --parallel 1 \
+  --ctx-size 40960 --parallel 1 \
   --batch-size 128 --ubatch-size 128 \
   --device CUDA0 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
-  --kv-paged --kv-paged-dynamic --n-gpu-blocks 2688 \
+  --kv-paged --kv-paged-dynamic --n-gpu-blocks 2560 \
   --n-gpu-blocks-initial 64 --n-gpu-blocks-growth 64 \
-  --kv-paged-admission-blocks 2688 --fit off --kv-block-size 16 \
+  --kv-paged-admission-blocks 2560 --fit off --kv-block-size 16 \
   --cache-ram 0 --ctx-checkpoints 1 --metrics \
   --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
   --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
 ```
+
+`--ctx-size 40960` matches the confirmed operational limit: a request of
+36,866 prompt + 4,094 output tokens (40,960 total) is the maximum that
+completes. The nominal 43,008 calibration is not reachable on this hardware;
+beyond 40,960 the first KV page growth fails with a `cudaMalloc` OOM of about
+46 MiB and the request errors with `Failed to reserve paged KV cache`.
 
 `--ctx-checkpoints 1` is required for prompt caching on hybrid models.
 Qwen3.8-27B-UD has 16 attention layers and 48 recurrent layers, so the hybrid
 paged memory reports the rolling recurrent tail as the sequence minimum and
 the server would otherwise force a full prompt re-process on every request
 (zero cached tokens). Context checkpoints restore the attention and draft
-state, turning a repeated prompt into a near-free prefill: an identical
-1,651-token prompt drops from 9.8 s to 0.3 s, and a 35,251-token prompt with
-4,096 output drops from 195.6 s to 103.3 s (35,247 cached tokens).
+state: an identical 1,651-token prompt drops from 9.8 s to 0.3 s, and the
+maximum 36,867-token prompt reuses 36,863 cached tokens.
 
-Measured OpenAI-compatible completions (35,251 prompt + 4,096 output tokens,
-`ignore_eos`, temperature 0):
+Measured OpenAI-compatible completions at the maximum gate (`ignore_eos`,
+temperature 0):
 
 | Profile | Prefill | Decode | Wall time |
 | --- | ---: | ---: | ---: |
-| P1 MTP nmax2, cold (uncached) | 541.8 tok/s | 31.4 tok/s | 195.6 s |
-| P1 MTP nmax2, warm (35,247 cached) | - | 39.7 tok/s | 103.3 s |
+| P1 MTP nmax2, cold 36,867 + 4,091 | 631.1 tok/s | 32.6 tok/s | 183.9 s |
+| P1 MTP nmax2, warm (36,863 cached) | - | ~32.6 tok/s | 160.2 s |
+| P1 MTP nmax2, 2026-08-26 prealloc-max gate | 544.4 tok/s | 38.0 tok/s | 175.6 s |
 
-The 2026-08-26 prealloc-max profile (`--kv-paged-prealloc-max --ctx-size 0
---fit off --fit-target 643`) measured 544.4 tok/s prefill, 38.0 tok/s decode
-and 175.6 s wall on the same gate, and remains valid for that mode.
-
-The operational context limit is 40,960 tokens (36,864 prompt + 4,096
-output). Beyond it the first KV page growth fails with a `cudaMalloc` OOM of
-about 46 MiB and the request errors with `Failed to reserve paged KV cache`;
-the nominal 43,008 calibration is not reachable on this hardware. `nmax=3`
-OOMs repeatedly and DFlash2 stays below target-only, so MTP `nmax=2` remains
-the promoted speculative profile.
+The 2026-08-26 row is the `--kv-paged-prealloc-max --ctx-size 0 --fit off
+--fit-target 643` profile on the same gate (36,864 + 4,096), kept for
+reference. Peak VRAM during the maximum request is 11,899 / 12,282 MiB
+(GPU-only, no spill). `nmax=3` OOMs repeatedly and DFlash2 stays below
+target-only, so MTP `nmax=2` remains the promoted speculative profile.
 
 CPU spill (`--n-cpu-blocks N` with N > 1) removes the reserve failure but
 migrates whole attention layers to CPU, where the paged attention reference

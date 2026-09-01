@@ -54,42 +54,58 @@ fail later under load. Slots draw from one shared pool: `--parallel` limits
 simultaneous sequences but does not divide the pool into fixed per-slot quotas.
 Pages released by a completed request can be reused by requests that remain.
 
-### RTX 4070 12 GB results (2026-08-26)
+### RTX 4070 12 GB results (2026-09-01)
 
 Current production profile, measured on a GeForce RTX 4070 12 GB with
 Qwen3.8-27B `UD-IQ3_XXS`, paged `q4_0` K/V cache, CUDA Flash Attention, one
-server slot and MTP speculative decoding:
+server slot, MTP speculative decoding and dynamic paged KV:
 
 ```sh
 llama-server \
   --model Qwen3.8-27B-UD-IQ3_XXS.gguf \
-  --ctx-size 0 --parallel 1 \
+  --ctx-size 43008 --parallel 1 \
   --batch-size 128 --ubatch-size 128 \
-  --n-gpu-layers 999 --device CUDA0 --flash-attn on \
+  --device CUDA0 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
-  --kv-paged-prealloc-max --fit off --fit-target 643 --kv-block-size 16 \
-  --cache-ram 0 --ctx-checkpoints 0 --metrics \
+  --kv-paged --kv-paged-dynamic --n-gpu-blocks 2688 \
+  --n-gpu-blocks-initial 64 --n-gpu-blocks-growth 64 \
+  --kv-paged-admission-blocks 2688 --fit off --kv-block-size 16 \
+  --cache-ram 0 --ctx-checkpoints 1 --metrics \
   --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
   --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
 ```
 
-Measured OpenAI-compatible completions at the maximum validated gate
-(`36,864` prompt + `4,096` output tokens, `ignore_eos`, temperature 0):
+`--ctx-checkpoints 1` is required for prompt caching on hybrid models.
+Qwen3.8-27B-UD has 16 attention layers and 48 recurrent layers, so the hybrid
+paged memory reports the rolling recurrent tail as the sequence minimum and
+the server would otherwise force a full prompt re-process on every request
+(zero cached tokens). Context checkpoints restore the attention and draft
+state, turning a repeated prompt into a near-free prefill: an identical
+1,651-token prompt drops from 9.8 s to 0.3 s, and a 35,251-token prompt with
+4,096 output drops from 195.6 s to 103.3 s (35,247 cached tokens).
+
+Measured OpenAI-compatible completions (35,251 prompt + 4,096 output tokens,
+`ignore_eos`, temperature 0):
 
 | Profile | Prefill | Decode | Wall time |
 | --- | ---: | ---: | ---: |
-| P1 MTP nmax2, CUDA Graphs (production) | 544.4 tok/s | 38.0 tok/s | 175.6 s |
-| P1 MTP nmax2, CUDA Graphs off | 541.6 tok/s | 37.4 tok/s | 177.6 s |
-| P1 no MTP | 694.2 tok/s | 24.1 tok/s | 223.2 s |
+| P1 MTP nmax2, cold (uncached) | 541.8 tok/s | 31.4 tok/s | 195.6 s |
+| P1 MTP nmax2, warm (35,247 cached) | - | 39.7 tok/s | 103.3 s |
 
-MTP wins the full request even though it adds a draft forward to prefill:
-decode rises from 24.1 to 38.0 tok/s and wall time drops about 21%. CUDA
-Graphs adds another ~1.15% wall reduction for ~22 MiB of VRAM. The confirmed
-operational context limit of this profile is 40,960 tokens: startup
-calibration announces 43,008, but the first page growth beyond 40,960 fails
-to reserve about 46 MiB of CUDA workspace. `nmax=3` OOMs repeatedly and
-DFlash2 stays below target-only on this hardware, so MTP `nmax=2` is the
-promoted speculative profile.
+The 2026-08-26 prealloc-max profile (`--kv-paged-prealloc-max --ctx-size 0
+--fit off --fit-target 643`) measured 544.4 tok/s prefill, 38.0 tok/s decode
+and 175.6 s wall on the same gate, and remains valid for that mode.
+
+The operational context limit is 40,960 tokens (36,864 prompt + 4,096
+output). Beyond it the first KV page growth fails with a `cudaMalloc` OOM of
+about 46 MiB and the request errors with `Failed to reserve paged KV cache`;
+the nominal 43,008 calibration is not reachable on this hardware. `nmax=3`
+OOMs repeatedly and DFlash2 stays below target-only, so MTP `nmax=2` remains
+the promoted speculative profile.
+
+CPU spill (`--n-cpu-blocks N` with N > 1) removes the reserve failure but
+migrates whole attention layers to CPU, where the paged attention reference
+kernel drops decode to about 3.6 tok/s. It stays disabled in production.
 
 High-capacity profile without MTP (shared paged pool, `--parallel 3`, logical
 context 77,824; startup calibration with `--kv-paged-prealloc-max` selects

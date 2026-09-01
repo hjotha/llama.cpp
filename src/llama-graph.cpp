@@ -522,15 +522,56 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch * ubatch) {
     if (paged_batch_lens) {
         ggml_backend_tensor_set(paged_batch_lens, mctx->get_batch_lens(), 0, ggml_nbytes(paged_batch_lens));
     }
+
+    const int32_t * context_lens = mctx->get_context_lens();
+    int32_t active_context = mctx->get_max_blocks() * cparams.block_size;
+    if (context_lens) {
+        active_context = 0;
+        for (int32_t i = 0; i < mctx->get_batch_size(); ++i) {
+            active_context = std::max(active_context, context_lens[i]);
+        }
+    }
+
+    // Encode base+1 for the common single-sequence contiguous table. Zero keeps
+    // the fully general paged lookup path.
+    int32_t contiguous_base = -1;
+    const int32_t * block_table = mctx->get_block_table();
+    if (mctx->get_batch_size() == 1 && context_lens && context_lens[0] > 0 && block_table) {
+        const int32_t n_blocks = (context_lens[0] + cparams.block_size - 1) / cparams.block_size;
+        contiguous_base = block_table[0];
+        for (int32_t i = 0; contiguous_base >= 0 && i < n_blocks; ++i) {
+            if (block_table[i] != contiguous_base + i) {
+                contiguous_base = -1;
+            }
+        }
+    }
+
+    const auto tensor_addr = [](const ggml_tensor * tensor) {
+        return tensor != nullptr && tensor->data != nullptr ? (uintptr_t) tensor->data : 0;
+    };
+    const uintptr_t snapkv_addr         = tensor_addr(mctx->get_snapkv_scores());
+    const uintptr_t snapkv_capture_addr = tensor_addr(mctx->get_snapkv_capture_from());
+    const uintptr_t snapkv_slots_addr   = tensor_addr(mctx->get_snapkv_score_slots());
+
+    for (ggml_tensor * node : paged_attn_nodes) {
+        GGML_ASSERT(node->op == GGML_OP_PAGED_ATTN);
+        int32_t * op_params_i = (int32_t *) ((float *) node->op_params + 1);
+        op_params_i[2] = active_context;
+        op_params_i[3] = contiguous_base + 1;
+        op_params_i[4] = (int32_t) (snapkv_addr & 0xffffffffu);
+        op_params_i[5] = (int32_t) (snapkv_addr >> 32);
+        op_params_i[6] = (int32_t) (snapkv_capture_addr & 0xffffffffu);
+        op_params_i[7] = (int32_t) (snapkv_capture_addr >> 32);
+        op_params_i[8] = (int32_t) (snapkv_slots_addr & 0xffffffffu);
+        op_params_i[9] = (int32_t) (snapkv_slots_addr >> 32);
+    }
 }
 
 bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_paged_context *>(params.mctx);
     this->mctx = mctx;
 
-    // active_context is embedded in PAGED_ATTN op params, so only reuse decode graphs.
-    return params.ubatch.n_tokens <= 4 &&
-           storage_generation == mctx->get_storage_generation() &&
+    return storage_generation == mctx->get_storage_generation() &&
            paged_write_slots->ne[0] == (int64_t) params.ubatch.n_tokens &&
            paged_block_table->ne[0] == mctx->get_max_blocks() &&
            paged_block_table->ne[1] == mctx->get_batch_size();
@@ -2896,6 +2937,7 @@ ggml_tensor * llm_graph_context::build_attn(
         inp->paged_batch_lens,
         kq_scale, cparams.block_size, max_blocks, active_context,
         paged_mctx->get_snapkv_scores(), paged_mctx->get_snapkv_capture_from(), paged_mctx->get_snapkv_score_slots());
+    inp->paged_attn_nodes.push_back(cur);
     cb(cur, "kqv_out", il);
 
     // Reshape to [n_embd_head * n_head, n_tokens] (just a view)

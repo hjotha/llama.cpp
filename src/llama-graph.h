@@ -416,6 +416,8 @@ public:
     ggml_tensor * paged_batch_offsets = nullptr;
     ggml_tensor * paged_batch_lens    = nullptr;
 
+    std::vector<ggml_tensor *> paged_attn_nodes;
+
     int32_t last_n_tokens;
     uint64_t storage_generation = 0;
 

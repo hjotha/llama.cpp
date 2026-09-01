@@ -42,6 +42,7 @@ class llama_kv_cache_paged : public llama_memory_i {
         init(layer_backends, {}, backend_cpu, type, n_gpu_blocks, n_cpu_blocks, watermark, n_gpu_blocks, n_gpu_blocks, false);
     }
 
+    bool reserve(uint32_t n_tokens) override;
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
     bool swap_in(llama_sequence_group & group);

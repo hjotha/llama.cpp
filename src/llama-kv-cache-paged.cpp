@@ -867,6 +867,12 @@ uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
     return num_gpu_blocks;
 }
 
+bool llama_kv_cache_paged::reserve(uint32_t n_tokens) {
+    const uint32_t requested_blocks = std::min<uint64_t>(
+        num_gpu_blocks, ((uint64_t) n_tokens + block_size - 1) / block_size);
+    return ensure_physical_capacity(std::max(requested_blocks, required_gpu_capacity()));
+}
+
 uint32_t llama_kv_cache_paged::freeze_physical_capacity() {
     if (attn_layer_ids.empty()) {
         return 0;

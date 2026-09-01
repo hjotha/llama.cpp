@@ -133,6 +133,10 @@ bool llama_memory_hybrid_paged::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid_paged::reserve(uint32_t n_tokens) {
+    return mem_attn->reserve(n_tokens);
+}
+
 void llama_memory_hybrid_paged::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

@@ -229,6 +229,7 @@ struct server_slot {
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
     int32_t n_ctx_reservation = 0;
+    int32_t n_kv_reservation = 0;
     bool clear_context_on_release = false;
 
     size_t last_nl_pos = 0;
@@ -355,6 +356,7 @@ struct server_slot {
 
         n_predict_max = -1;
         n_ctx_reservation = 0;
+        n_kv_reservation = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -1773,6 +1775,30 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        if (params_base.kv_paged && params_base.kv_paged_dynamic) {
+            int64_t request_tokens = task.n_tokens();
+            if (slot.n_predict_max > 0) {
+                request_tokens += slot.n_predict_max;
+            }
+            slot.n_kv_reservation = std::min<int64_t>(request_tokens, n_ctx);
+
+            int64_t total_tokens = slot.n_kv_reservation;
+            for (const server_slot & active_slot : slots) {
+                if (&active_slot != &slot && active_slot.is_processing()) {
+                    total_tokens += active_slot.n_kv_reservation;
+                }
+            }
+            total_tokens = std::min<int64_t>(total_tokens, n_ctx);
+
+            SLT_INF(slot, "reserving paged KV for %lld tokens\n", (long long) total_tokens);
+            if (!llama_memory_reserve(llama_get_memory(ctx_tgt), (uint32_t) total_tokens)) {
+                send_error(task, "Failed to reserve paged KV cache.", ERROR_TYPE_SERVER);
+                slot.n_kv_reservation = 0;
+                return false;
+            }
+        }
+
         slot.n_ctx_reservation = elastic_paged_context ? get_context_reservation(task) : 0;
 
         slot.task = std::make_unique<const server_task>(std::move(task));

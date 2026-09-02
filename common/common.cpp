@@ -1315,26 +1315,41 @@ static bool common_paged_kv_is_hybrid_arch(llm_arch arch) {
     }
 }
 
+// Return whether a layer contributes a regular per-token attention KV cache.
+// Hybrid models keep recurrent state for their linear-attention layers instead
+// of a normal K/V row cache.  The paged and non-paged sizing paths must use the
+// same layer selection or the estimated context sizes diverge substantially.
+static bool common_kv_uses_attention_layer(const llama_model * model, uint32_t il) {
+    const auto & hparams = model->hparams;
+
+    // Appended nextn/MTP layers use a regular attention KV cache.
+    if (il >= hparams.n_layer()) {
+        return true;
+    }
+
+    if (!common_paged_kv_is_hybrid_arch(model->arch)) {
+        return true;
+    }
+
+    bool is_attention = hparams.is_recr_impl[il] == 0;
+
+    if (model->arch == LLM_ARCH_FALCON_H1) {
+        is_attention = true;
+    } else if ((model->arch == LLM_ARCH_NEMOTRON_H || model->arch == LLM_ARCH_NEMOTRON_H_MOE) &&
+               hparams.n_ff_arr[il] != 0) {
+        is_attention = false;
+    }
+
+    return is_attention;
+}
+
 static uint32_t common_paged_kv_attention_layers(const llama_model * model) {
     const auto & hparams = model->hparams;
     const uint32_t n_layers = hparams.n_layer_all - hparams.n_layer_nextn;
 
-    if (!common_paged_kv_is_hybrid_arch(model->arch)) {
-        return n_layers;
-    }
-
     uint32_t n_attention_layers = 0;
     for (uint32_t il = 0; il < n_layers; ++il) {
-        bool is_attention = hparams.is_recr_impl[il] == 0;
-
-        if (model->arch == LLM_ARCH_FALCON_H1) {
-            is_attention = true;
-        } else if ((model->arch == LLM_ARCH_NEMOTRON_H || model->arch == LLM_ARCH_NEMOTRON_H_MOE) &&
-                   hparams.n_ff_arr[il] != 0) {
-            is_attention = false;
-        }
-
-        n_attention_layers += is_attention;
+        n_attention_layers += common_kv_uses_attention_layer(model, il);
     }
 
     return n_attention_layers;
@@ -1368,16 +1383,38 @@ static void common_fit_normal_kv_context(common_params & params, const llama_mod
         return;
     }
 
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
     size_t bytes_per_token = 0;
-    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-        if (!model->hparams.has_kv(il)) {
-            continue;
+    uint32_t attention_layers = 0;
+    uint32_t mtp_layers = 0;
+    auto add_kv_layer = [&](uint32_t il, bool is_mtp) {
+        if (!model->hparams.has_kv(il) || (!is_mtp && !common_kv_uses_attention_layer(model, il))) {
+            return;
         }
+
         bytes_per_token += ggml_row_size(params.cache_type_k, model->hparams.n_embd_k_gqa(il));
         if (!model->hparams.is_mla()) {
             bytes_per_token += ggml_row_size(params.cache_type_v, model->hparams.n_embd_v_gqa_max());
         }
+
+        (is_mtp ? mtp_layers : attention_layers)++;
+    };
+
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        add_kv_layer(il, false);
     }
+
+    // An MTP draft context is created from the appended nextn layers and
+    // shares the target context length, so its regular KV rows also consume
+    // memory for every token in the request.
+    if (spec_mtp) {
+        for (uint32_t il = model->hparams.n_layer(); il < model->hparams.n_layer_all; ++il) {
+            add_kv_layer(il, true);
+        }
+    }
+
     if (bytes_per_token == 0) {
         LOG_WRN("%s: model has no normal KV rows, leaving ctx-size unchanged.\n", __func__);
         return;
@@ -1386,8 +1423,6 @@ static void common_fit_normal_kv_context(common_params & params, const llama_mod
     const size_t requested_margin = params.fit_params_target.empty()
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
-    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     const size_t margin = requested_margin + (spec_mtp ? 64ull * 1024ull * 1024ull : 0);
     if (free_vram <= margin) {
         LOG_ERR("%s: free_vram=%.1f MiB <= margin=%.1f MiB; cannot fit normal KV context.\n",
@@ -1407,8 +1442,9 @@ static void common_fit_normal_kv_context(common_params & params, const llama_mod
     }
 
     params.n_ctx = (uint32_t) ctx;
-    LOG_INF("%s: ctx0 normal KV candidate: ctx=%u, ctx_per_slot=%u, bytes_per_token=%zu, free_vram=%.1f MiB, margin=%.1f MiB, mtp=%s\n",
+    LOG_INF("%s: ctx0 normal KV candidate: ctx=%u, ctx_per_slot=%u, bytes_per_token=%zu, attention_layers=%u, mtp_layers=%u, free_vram=%.1f MiB, margin=%.1f MiB, mtp=%s\n",
             __func__, params.n_ctx, params.n_ctx / n_seq, bytes_per_token,
+            attention_layers, mtp_layers,
             free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f, spec_mtp ? "yes" : "no");
 }
 

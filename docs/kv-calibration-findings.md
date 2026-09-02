@@ -146,6 +146,32 @@ highest value validated. This is an operational absolute for the tested
 model, GPU state, MTP settings, q4_0 KV, and batch/ubatch 64—not a hardware
 invariant; changing any of those can move the boundary.
 
+## Paged MTP memory versus throughput boundary
+
+The paged search used dynamic growth with a 16-token block and enough
+`--n-gpu-blocks`/`--kv-paged-admission-blocks` for the requested context. This
+is distinct from the calibrated fixed pool of 41,984 tokens; omitting those
+capacity values causes an artificial `Context size has been exceeded` error.
+
+| `ctx-size` | Prompt | Result |
+|---:|---:|---|
+| 41,984 | 37,888 | HTTP 200, 4,094 generated |
+| 44,032 | 39,936 | HTTP 200, 4,094 generated |
+| 54,272 | 50,176 | HTTP 200, 4,094 generated |
+| 59,392 | 55,296 | HTTP 200, 4,094 generated |
+| 60,416 | 56,320 | CUDA OOM during prefill |
+| 63,488 | 59,392 | CUDA OOM during prefill |
+| 67,584 | 63,488 | CUDA OOM during prefill |
+
+The maximum paged context that passed the full request test was therefore
+59,392 tokens, but it is not a usable replacement target: its measured
+throughput fell to 475.18 prompt tok/s and 30.45 decode tok/s, versus
+496.71 prompt tok/s and 36.97 decode tok/s at 44,032. Since the reference
+paged-attention implementation shows a clear throughput collapse as the
+context grows, `44,032` is the current practical ceiling; `41,984` remains the
+safer calibrated value. The memory ceiling and the performance ceiling must
+not be reported as the same number.
+
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid

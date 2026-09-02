@@ -172,6 +172,15 @@ context grows, `44,032` is the current practical ceiling; `41,984` remains the
 safer calibrated value. The memory ceiling and the performance ceiling must
 not be reported as the same number.
 
+With the explicit collapse rule of decode throughput below `10 tok/s`, the
+last stable paged-MTP point was refined to `60,160` tokens. Its request used a
+56,064-token prompt and completed with `30.11` decode tok/s. The next paged
+allocation step, `60,176` tokens, required one additional 16-token block and
+repeatedly failed to allocate approximately 63 MiB on CUDA before decode
+could start. Thus `60,160` is the last validated non-collapsed value under
+this exact configuration; the failure is an OOM boundary rather than a
+measured sub-10 tok/s decode.
+
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid

@@ -123,6 +123,29 @@ the server's boundary/protocol behavior, so the candidate is operationally
 valid but does not yield a literal 4,096 generated tokens at the exact
 context edge.
 
+## Absolute MTP-traditional request boundary
+
+To separate the startup limit from the usable request limit, the same server
+configuration was tested with `prompt = ctx-size - 4,096` and
+`max_tokens=4096`. The search narrowed the transition to one token:
+
+| `ctx-size` | Prompt | Result |
+|---:|---:|---|
+| 53,120 | 49,024 | HTTP 200, 4,096 generated |
+| 54,208 | 50,112 | HTTP 200, 4,096 generated |
+| 54,240 | 50,144 | HTTP 200, 4,096 generated |
+| 54,256 | 50,160 | HTTP 200, 4,096 generated |
+| 54,264 | 50,168 | HTTP 200, 4,096 generated |
+| 54,272 | 50,176 | HTTP 200, 4,094 generated; boundary truncation |
+| 54,273 | 50,177 | CUDA OOM during request |
+
+`54,272` is therefore the highest context that accepted this maximum-size
+request in two independent runs; `54,273` was the first failing integer. If
+the requirement is literally all 4,096 generated tokens, `54,264` is the
+highest value validated. This is an operational absolute for the tested
+model, GPU state, MTP settings, q4_0 KV, and batch/ubatch 64—not a hardware
+invariant; changing any of those can move the boundary.
+
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid

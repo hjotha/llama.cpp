@@ -181,6 +181,30 @@ could start. Thus `60,160` is the last validated non-collapsed value under
 this exact configuration; the failure is an OOM boundary rather than a
 measured sub-10 tok/s decode.
 
+## Traditional versus paged MTP performance
+
+At the same `ctx-size=54,272`, with the same 50,176-token prompt and
+`max_tokens=4096`, the measured comparison was:
+
+| Metric | Traditional KV | Paged KV | Paged delta |
+|---|---:|---:|---:|
+| Prefill | 549.13 tok/s | 485.01 tok/s | 11.7% slower |
+| Decode | 46.66 tok/s | 32.26 tok/s | 30.9% slower |
+| Total time | 179.10 s | 230.32 s | +51.2 s |
+
+At each path's maximum validated context, traditional KV reached 54,272
+tokens at 549.13 prompt tok/s and 46.66 decode tok/s, while paged KV reached
+60,160 tokens at 471.00 prompt tok/s and 30.11 decode tok/s. Paged KV gained
+5,888 context tokens, but lost approximately 78 prompt tok/s and 16.5 decode
+tok/s. These values are for the current build, where the log reports that
+paged attention is using the CPU reference implementation for correctness
+validation; it is explicitly not optimized. The measured speed penalty is
+therefore not an inherent limit of paged KV and may change with an optimized
+backend.
+
+No completed paged request reached the defined collapse threshold of decode
+below 10 tok/s; the higher-context failures occurred first as CUDA OOM.
+
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid

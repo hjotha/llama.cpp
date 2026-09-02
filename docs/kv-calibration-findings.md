@@ -113,6 +113,16 @@ server again marked the exact boundary as `truncated=1`, so client-side output
 reserve should leave a small additional margin when strict completion of all
 4,096 tokens is required.
 
+The MTP-traditional candidate was then tested at the exact `50,944`-token
+context boundary with a `46,848`-token prompt (`50,944 - 4,096`) and
+`max_tokens=4096`. The request returned HTTP 200 without OOM, with
+`prompt_tokens=46848`, `completion_tokens=4094`, `total_tokens=50942`, and
+`finish_reason=length`. The server metrics recorded 566.24 prompt tokens/s,
+48.03 decode tokens/s, and 167.948 s total time. The two-token difference is
+the server's boundary/protocol behavior, so the candidate is operationally
+valid but does not yield a literal 4,096 generated tokens at the exact
+context edge.
+
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid
@@ -128,11 +138,13 @@ reserve should leave a small additional margin when strict completion of all
   `--kv-paged-prealloc-max` freezes the calibrated physical pool and sets the
   final admission capacity to the measured pool size.
 
-## Pending threshold validation
+## Threshold validation status
 
 The first conservative functional threshold for the GSQ-RCO MTP-paged model
-is around 44k tokens, based on the previous model's successful 43,008-token
-MTP-paged calibration. This is a hypothesis, not yet a promoted production
-value. Validate it with a real request using `context - 4096` prompt tokens
-and `max_tokens=4096`, and record prefill TPS, decode TPS, total time, and
-whether the request completes without truncation or OOM.
+was around 44k tokens, based on the previous model's successful 43,008-token
+MTP-paged calibration. Requests at 44,032 and 41,984 tokens completed without
+OOM, although the server stopped at 4,094 generated tokens at the exact
+boundary. The MTP-traditional candidate at 50,944 shows the same two-token
+boundary behavior. A small client-side reserve below the advertised context
+limit is therefore still advisable when exactly 4,096 generated tokens are
+required.

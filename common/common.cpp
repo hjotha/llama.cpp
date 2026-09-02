@@ -1343,6 +1343,116 @@ static bool common_kv_uses_attention_layer(const llama_model * model, uint32_t i
     return is_attention;
 }
 
+static ggml_backend_dev_t common_fit_selected_device(const common_params & params) {
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            return dev;
+        }
+    }
+
+    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+}
+
+static size_t common_context_memory_on_device(const llama_context * ctx, ggml_backend_dev_t dev) {
+    size_t total = 0;
+
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        if (!ggml_backend_buft_is_host(buft) && ggml_backend_buft_get_device(buft) == dev) {
+            total += mb.context + mb.compute;
+        }
+    }
+
+    return total;
+}
+
+static uint32_t common_fit_probe_context(const common_params & params, uint64_t train_ctx, uint32_t align) {
+    // --ctx-size 0 stores UINT32_MAX/-1 in fit_params_min_ctx to disable the
+    // generic fitter's context reduction.  That sentinel is not a useful
+    // probe size; use the normal 4096-token floor instead.
+    const uint64_t requested = params.fit_params_min_ctx > 0
+        ? (uint64_t) params.fit_params_min_ctx
+        : 4096ull;
+    return (uint32_t) std::min<uint64_t>(train_ctx, std::max<uint64_t>(align, requested));
+}
+
+// Probe a small, real context using the same batch/ubatch and (when enabled)
+// the same MTP draft context.  This captures fixed compute/context overhead
+// that a KV-only bytes-per-token estimate cannot see.
+static size_t common_probe_context_overhead(
+        common_params & params, llama_model * model, uint32_t probe_ctx,
+        uint32_t probe_gpu_blocks, uint32_t probe_cpu_blocks, bool paged,
+        size_t probe_kv_bytes) {
+    ggml_backend_dev_t dev = common_fit_selected_device(params);
+    if (dev == nullptr) {
+        return SIZE_MAX;
+    }
+
+    common_params probe_params = params;
+    probe_params.n_ctx = probe_ctx;
+    probe_params.fit_params = false;
+    probe_params.kv_paged = paged;
+    probe_params.kv_paged_dynamic = paged;
+    probe_params.kv_paged_prealloc_max = false;
+    probe_params.n_gpu_blocks = std::max<uint32_t>(1, probe_gpu_blocks);
+    probe_params.n_gpu_blocks_initial = probe_params.n_gpu_blocks;
+    probe_params.n_gpu_blocks_growth = probe_params.n_gpu_blocks;
+    probe_params.n_cpu_blocks = std::max<uint32_t>(1, probe_cpu_blocks);
+
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    try {
+        auto cparams_tgt = common_context_params_to_llama(probe_params);
+        cparams_tgt.n_ctx = probe_ctx;
+        ctx_tgt = llama_init_from_model(model, cparams_tgt);
+        if (ctx_tgt == nullptr) {
+            LOG_WRN("%s: target context probe failed at ctx=%u\n", __func__, probe_ctx);
+            return SIZE_MAX;
+        }
+
+        size_t measured = common_context_memory_on_device(ctx_tgt, dev);
+        if (spec_mtp) {
+            auto probe_params_dft = common_base_params_to_speculative(probe_params);
+            auto cparams_dft = common_context_params_to_llama(probe_params_dft);
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_dft.ctx_other = ctx_tgt;
+            cparams_dft.n_ctx = probe_ctx;
+            cparams_dft.n_rs_seq = 0;
+
+            ctx_dft = llama_init_from_model(model, cparams_dft);
+            if (ctx_dft == nullptr) {
+                LOG_WRN("%s: MTP context probe failed at ctx=%u\n", __func__, probe_ctx);
+                llama_free(ctx_tgt);
+                return SIZE_MAX;
+            }
+            measured += common_context_memory_on_device(ctx_dft, dev);
+        }
+
+        if (ctx_dft != nullptr) {
+            llama_free(ctx_dft);
+        }
+        llama_free(ctx_tgt);
+
+        const size_t overhead = measured > probe_kv_bytes ? measured - probe_kv_bytes : 0;
+        LOG_INF("%s: probe ctx=%u, batch=%u, ubatch=%u, measured=%.1f MiB, kv=%.1f MiB, overhead=%.1f MiB, mtp=%s\n",
+                __func__, probe_ctx, params.n_batch, params.n_ubatch,
+                measured / 1024.0 / 1024.0, probe_kv_bytes / 1024.0 / 1024.0,
+                overhead / 1024.0 / 1024.0, spec_mtp ? "yes" : "no");
+        return overhead;
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: context probe failed at ctx=%u: %s\n", __func__, probe_ctx, e.what());
+        if (ctx_dft != nullptr) {
+            llama_free(ctx_dft);
+        }
+        if (ctx_tgt != nullptr) {
+            llama_free(ctx_tgt);
+        }
+        return SIZE_MAX;
+    }
+}
+
 static uint32_t common_paged_kv_attention_layers(const llama_model * model) {
     const auto & hparams = model->hparams;
     const uint32_t n_layers = hparams.n_layer_all - hparams.n_layer_nextn;
@@ -1355,7 +1465,7 @@ static uint32_t common_paged_kv_attention_layers(const llama_model * model) {
     return n_attention_layers;
 }
 
-static void common_fit_normal_kv_context(common_params & params, const llama_model * model) {
+static void common_fit_normal_kv_context(common_params & params, llama_model * model) {
     GGML_ASSERT(model && "model must be loaded before fitting normal KV context.");
 
     ggml_backend_dev_t dev = nullptr;
@@ -1432,9 +1542,22 @@ static void common_fit_normal_kv_context(common_params & params, const llama_mod
 
     const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
     const uint64_t train_ctx = (uint64_t) model->hparams.n_ctx_train * n_seq;
-    const uint64_t available = free_vram - margin;
-    uint64_t ctx = std::min<uint64_t>(train_ctx, available / bytes_per_token);
     const uint32_t align = 256 * n_seq;
+    const uint32_t probe_ctx_per_seq = common_fit_probe_context(params, model->hparams.n_ctx_train, 256);
+    const uint32_t probe_ctx = probe_ctx_per_seq * n_seq;
+    const size_t probe_kv_bytes = bytes_per_token * probe_ctx;
+    const size_t probed_overhead = common_probe_context_overhead(
+        params, model, probe_ctx, 0, 1, false, probe_kv_bytes);
+    size_t compute_overhead = 0;
+    size_t available = free_vram - margin;
+    if (probed_overhead != SIZE_MAX) {
+        compute_overhead = probed_overhead;
+        available = available > compute_overhead ? available - compute_overhead : 0;
+    } else {
+        LOG_WRN("%s: compute-aware normal KV probe unavailable; using KV-only estimate\n", __func__);
+    }
+
+    uint64_t ctx = std::min<uint64_t>(train_ctx, available / bytes_per_token);
     ctx = (ctx / align) * align;
     if (ctx < align) {
         LOG_ERR("%s: no normal KV context fits the selected memory margin.\n", __func__);
@@ -1442,13 +1565,15 @@ static void common_fit_normal_kv_context(common_params & params, const llama_mod
     }
 
     params.n_ctx = (uint32_t) ctx;
-    LOG_INF("%s: ctx0 normal KV candidate: ctx=%u, ctx_per_slot=%u, bytes_per_token=%zu, attention_layers=%u, mtp_layers=%u, free_vram=%.1f MiB, margin=%.1f MiB, mtp=%s\n",
+    LOG_INF("%s: ctx0 normal KV candidate: ctx=%u, ctx_per_slot=%u, bytes_per_token=%zu, attention_layers=%u, mtp_layers=%u, free_vram=%.1f MiB, margin=%.1f MiB, compute_overhead=%.1f MiB, batch=%u, ubatch=%u, mtp=%s\n",
             __func__, params.n_ctx, params.n_ctx / n_seq, bytes_per_token,
             attention_layers, mtp_layers,
-            free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f, spec_mtp ? "yes" : "no");
+            free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f,
+            compute_overhead / 1024.0f / 1024.0f, params.n_batch, params.n_ubatch,
+            spec_mtp ? "yes" : "no");
 }
 
-static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
+static void common_fit_paged_kv_blocks(common_params& params, llama_model * model) {
     GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
     // Calibrate against the device the user selected for offloading, not just
     // the first registered GPU (which may be a different, unrelated device).
@@ -1560,7 +1685,29 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         return; // leave params.n_gpu_blocks at its existing value
     }
 
-    const size_t available = (free_vram > margin) ? free_vram - margin : 0;
+    size_t available = (free_vram > margin) ? free_vram - margin : 0;
+
+    size_t compute_overhead = 0;
+    if (params.fit_params && params.n_ctx == 0) {
+        const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
+        const uint32_t align = params.block_size * 64;
+        const uint32_t probe_ctx_per_seq = common_fit_probe_context(params, model->hparams.n_ctx_train, align);
+        const uint32_t probe_ctx = probe_ctx_per_seq * n_seq;
+        const uint32_t probe_blocks = std::max<uint32_t>(1,
+            (probe_ctx + params.block_size - 1) / params.block_size);
+        const uint32_t probe_cpu_blocks = params.kv_paged_prealloc_max
+            ? 1
+            : std::max<uint32_t>(1, (uint32_t) std::ceil(probe_blocks * params.cpu_to_gpu_blocks_ratio));
+        const size_t probe_kv_bytes = (size_t) bytes_per_block * probe_blocks;
+        const size_t probed_overhead = common_probe_context_overhead(
+            params, model, probe_ctx, probe_blocks, probe_cpu_blocks, true, probe_kv_bytes);
+        if (probed_overhead != SIZE_MAX) {
+            compute_overhead = probed_overhead;
+            available = available > compute_overhead ? available - compute_overhead : 0;
+        } else {
+            LOG_WRN("%s: compute-aware paged KV probe unavailable; using KV-only estimate\n", __func__);
+        }
+    }
 
     if (bytes_per_block == 0 || available < bytes_per_block) {
         LOG_ERR("%s: available VRAM (%.1f MiB) is less than one block (%.1f MiB). "
@@ -1572,10 +1719,11 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
     const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
 
-    LOG_INF("%s: free_vram=%0.1f MiB, device=%s, type=%s, head_dim=%u, attention_layers=%u, mtp_layers=%u, extra_recurrent_vram=%0.1f MiB, extra_speculative_vram=%0.1f MiB, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u\n",
+    LOG_INF("%s: free_vram=%0.1f MiB, device=%s, type=%s, head_dim=%u, attention_layers=%u, mtp_layers=%u, extra_recurrent_vram=%0.1f MiB, extra_speculative_vram=%0.1f MiB, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u, compute_overhead=%0.1f MiB, batch=%u, ubatch=%u\n",
             __func__, free_vram / 1024.0f / 1024.0f, ggml_backend_dev_name(dev), ggml_type_name(params.cache_type_k), head_dim, n_layers,
             n_mtp_layers, extra_recurrent_vram / 1024.0f / 1024.0f, extra_speculative_vram / 1024.0f / 1024.0f,
-            bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+            bytes_per_block, n_gpu_blocks, n_cpu_blocks, compute_overhead / 1024.0f / 1024.0f,
+            params.n_batch, params.n_ubatch);
 
     if (params.kv_paged_prealloc_max) {
         const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;
@@ -1605,6 +1753,9 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         params.n_gpu_blocks_initial = n_gpu_blocks;
         params.n_gpu_blocks = std::max({ params.n_gpu_blocks, n_gpu_blocks,
                 (uint32_t) std::ceil((double) params.n_ctx / params.block_size) });
+        if (params.n_ctx == 0) {
+            params.n_ctx = n_gpu_blocks * params.block_size;
+        }
     } else {
         params.n_gpu_blocks = n_gpu_blocks;
     }

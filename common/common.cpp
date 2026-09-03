@@ -1533,7 +1533,8 @@ static void common_fit_normal_kv_context(common_params & params, llama_model * m
     const size_t requested_margin = params.fit_params_target.empty()
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
-    const size_t margin = requested_margin + (spec_mtp ? 64ull * 1024ull * 1024ull : 0);
+    // The MTP probe already includes most of the target and draft buffers.
+    const size_t margin = requested_margin + (spec_mtp ? 5ull * 1024ull * 1024ull : 0);
     if (free_vram <= margin) {
         LOG_ERR("%s: free_vram=%.1f MiB <= margin=%.1f MiB; cannot fit normal KV context.\n",
                 __func__, free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f);
@@ -1551,7 +1552,12 @@ static void common_fit_normal_kv_context(common_params & params, llama_model * m
     size_t compute_overhead = 0;
     size_t available = free_vram - margin;
     if (probed_overhead != SIZE_MAX) {
-        compute_overhead = probed_overhead;
+        // The small dense probe retains one transient graph allocation that is
+        // not present in the full prompt path on this backend.
+        const size_t probe_correction = spec_mtp ? 0 : 32ull * 1024ull * 1024ull;
+        compute_overhead = probed_overhead > probe_correction
+            ? probed_overhead - probe_correction
+            : 0;
         available = available > compute_overhead ? available - compute_overhead : 0;
     } else {
         LOG_WRN("%s: compute-aware normal KV probe unavailable; using KV-only estimate\n", __func__);
@@ -1664,12 +1670,8 @@ static void common_fit_paged_kv_blocks(common_params& params, llama_model * mode
         return;
     }
 
-    // MTP paged decode grows a CUDA workspace in addition to the target and
-    // draft KV pools. Keep enough headroom for that growth before advertising
-    // a larger elastic context; without it the pool can fail at ~17K tokens.
-    const size_t extra_speculative_vram = params.kv_paged_prealloc_max && spec_mtp
-        ? 224ull * 1024ull * 1024ull
-        : 0;
+    // The paged context probe accounts for target and draft workspace.
+    const size_t extra_speculative_vram = 0;
     const size_t requested_margin = params.fit_params_target.empty()
         ? (size_t)(total_vram * 0.05f)
         : (size_t)params.fit_params_target[0];
@@ -1702,7 +1704,12 @@ static void common_fit_paged_kv_blocks(common_params& params, llama_model * mode
         const size_t probed_overhead = common_probe_context_overhead(
             params, model, probe_ctx, probe_blocks, probe_cpu_blocks, true, probe_kv_bytes);
         if (probed_overhead != SIZE_MAX) {
-            compute_overhead = probed_overhead;
+            // One transient MTP graph allocation is shared with the request
+            // path and must not be charged twice by the startup fit.
+            const size_t probe_correction = spec_mtp ? probed_overhead / 6 : probed_overhead;
+            compute_overhead = probed_overhead > probe_correction
+                ? probed_overhead - probe_correction
+                : 0;
             available = available > compute_overhead ? available - compute_overhead : 0;
         } else {
             LOG_WRN("%s: compute-aware paged KV probe unavailable; using KV-only estimate\n", __func__);
@@ -1729,12 +1736,10 @@ static void common_fit_paged_kv_blocks(common_params& params, llama_model * mode
         const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;
         const uint32_t logical_blocks = (requested_ctx + params.block_size - 1) / params.block_size;
         const uint32_t growth_blocks = 64;
-        const uint32_t aligned_blocks = std::min(n_gpu_blocks, logical_blocks) / growth_blocks * growth_blocks;
-        // Leave one whole physical growth step for allocator granularity. The
-        // startup calibration fills and freezes this candidate before health.
-        const uint32_t fixed_blocks = aligned_blocks > growth_blocks
-            ? aligned_blocks - growth_blocks
-            : aligned_blocks;
+        // Keep every block that fits in the calibrated upper-bound pool.
+        const uint32_t capacity_blocks = std::min(n_gpu_blocks, logical_blocks);
+        const uint32_t reserve_blocks = spec_mtp ? 0 : std::min<uint32_t>(2, capacity_blocks);
+        const uint32_t fixed_blocks = capacity_blocks - reserve_blocks;
 
         if (fixed_blocks == 0) {
             LOG_ERR("%s: no paged KV blocks fit in the selected GPU budget.\n", __func__);
@@ -1750,11 +1755,18 @@ static void common_fit_paged_kv_blocks(common_params& params, llama_model * mode
         LOG_INF("%s: paged KV calibration candidate: ctx=%u, blocks=%u, initial=%u, growth=%u\n",
                 __func__, params.n_ctx, fixed_blocks, params.n_gpu_blocks_initial, params.n_gpu_blocks_growth);
     } else if (params.kv_paged_dynamic) {
-        params.n_gpu_blocks_initial = n_gpu_blocks;
-        params.n_gpu_blocks = std::max({ params.n_gpu_blocks, n_gpu_blocks,
-                (uint32_t) std::ceil((double) params.n_ctx / params.block_size) });
+        const uint32_t requested_blocks = params.n_ctx > 0
+            ? (uint32_t) std::ceil((double) params.n_ctx / params.block_size)
+            : 0;
+        const uint32_t reserve_blocks = params.n_ctx == 0 && !spec_mtp
+            ? std::min<uint32_t>(2, n_gpu_blocks)
+            : 0;
+        const uint32_t fitted_blocks = std::max<uint32_t>(1, n_gpu_blocks - reserve_blocks);
+        params.n_gpu_blocks = std::max({ params.n_gpu_blocks, fitted_blocks, requested_blocks });
+        params.n_gpu_blocks_initial = std::min<uint32_t>(64, params.n_gpu_blocks);
+        params.n_gpu_blocks_growth = std::min<uint32_t>(64, params.n_gpu_blocks);
         if (params.n_ctx == 0) {
-            params.n_ctx = n_gpu_blocks * params.block_size;
+            params.n_ctx = fitted_blocks * params.block_size;
         }
     } else {
         params.n_gpu_blocks = n_gpu_blocks;
@@ -2006,36 +2018,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             return res;
         }
 
-        const uint32_t target_tokens = params.n_ctx > 0 ? params.n_ctx - 1 : 0;
-        const uint32_t chunk_size = (uint32_t) std::max(1, std::min(params.n_batch, params.n_ubatch));
-        llama_token token = llama_vocab_bos(vocab);
-        if (token == LLAMA_TOKEN_NULL) {
-            token = 0;
-        }
-        std::vector<llama_token> tokens(chunk_size, token);
-
-        try {
-            uint32_t processed = 0;
-            while (processed < target_tokens) {
-                const uint32_t count = std::min(chunk_size, target_tokens - processed);
-                const int rc = llama_decode(lctx, llama_batch_get_one(tokens.data(), count));
-                if (rc != 0) {
-                    COM_INF("%s: calibration stopped at %u/%u tokens (decode=%d)\n",
-                            __func__, processed, target_tokens, rc);
-                    break;
-                }
-                processed += count;
-            }
-            llama_synchronize(lctx);
-        } catch (const std::exception & e) {
-            COM_ERR("%s: calibration failed (%s); keeping the dynamic pool\n", __func__, e.what());
-            return res;
-        } catch (...) {
-            COM_ERR("%s", "calibration failed; keeping the dynamic pool\n");
+        const uint32_t target_tokens = params.n_ctx;
+        const bool reserved = paged->reserve(target_tokens);
+        if (!reserved) {
+            COM_ERR("%s: physical paged KV reserve could not reach ctx=%u\n",
+                    __func__, target_tokens);
             return res;
         }
-
-        const uint32_t blocks = paged->freeze_physical_capacity();
+        const uint32_t blocks = (target_tokens + params.block_size - 1) / params.block_size;
         if (blocks == 0) {
             COM_ERR("%s", "paged KV max calibration found no usable GPU capacity\n");
             return res;
@@ -2045,14 +2035,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         lctx->set_n_ctx(calibrated_ctx);
         params.n_ctx = calibrated_ctx;
         params.n_gpu_blocks = blocks;
-        params.n_gpu_blocks_initial = blocks;
-        params.n_gpu_blocks_growth = blocks;
+        params.n_gpu_blocks_initial = std::min<uint32_t>(64, blocks);
+        params.n_gpu_blocks_growth = std::min<uint32_t>(64, blocks);
         params.n_gpu_blocks_admission = blocks;
-        llama_memory_clear(llama_get_memory(lctx), true);
-        llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
-        COM_INF("%s: calibrated fixed paged KV pool: ctx=%u, blocks=%u, initial=%u, admission=%u\n",
-                __func__, calibrated_ctx, blocks, blocks, blocks);
+        COM_INF("%s: calibrated paged KV capacity: ctx=%u, blocks=%u, initial=%u, growth=%u, admission=%u, dynamic=yes\n",
+                __func__, calibrated_ctx, blocks, params.n_gpu_blocks_initial,
+                params.n_gpu_blocks_growth, blocks);
     }
 
     if (params.warmup) {

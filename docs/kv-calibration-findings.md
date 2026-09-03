@@ -63,22 +63,34 @@ subtracted separately (`643 MiB` here); MTP adds its explicit workspace
 reserve. These are safer startup candidates than the prior KV-only values,
 but a maximum request should still be used as the final gate.
 
-## Final compute-aware matrix: GSQ-RCO MTP model, batch/ubatch 64, fit-target 643
+## Final automatic calibration matrix: ISTA GGUFs, batch/ubatch 64, fit-target 643
 
-The probe now treats the `--ctx-size 0` fit sentinel as a 4096-token probe
-floor. All four cases reached `model loaded` and `listening` on the live
-`8091` test port:
+The automatic path now accounts for the actual GGUF loaded in each process.
+The model size, free VRAM, KV geometry, and probe result are not reused
+between the MTP and non-MTP files. The probe treats the `--ctx-size 0` fit
+sentinel as a 4096-token floor.
 
-| KV path | MTP | Probe context | Probe overhead | Candidate context |
-|---|---:|---:|---:|---:|
-| traditional | no | 4,096 | 176.4 MiB | 95,488 |
-| traditional | yes | 4,096 | 502.4 MiB | 50,944 |
-| paged | no | 4,096 | 164.9 MiB | 94,208 |
-| paged | yes | 4,096 | 480.9 MiB | 41,984 |
+| GGUF | KV path | MTP | Free VRAM | Probe overhead | Effective overhead | Candidate context |
+|---|---|---:|---:|---:|---:|---:|
+| `...-mtp.gguf` | traditional | yes | 2,165.6 MiB | 502.4 MiB | 502.4 MiB | 54,272 |
+| `...-mtp.gguf` | paged | yes | 2,165.6 MiB | 480.9 MiB | 400.7 MiB | 60,064 |
+| `...XXS.gguf` | traditional | no | 2,499.6 MiB | 176.4 MiB | 144.4 MiB | 97,280 |
+| `...XXS.gguf` | paged | no | 2,499.6 MiB | not used | 0 MiB | 105,584 |
 
-This is the current recommended matrix for this GGUF and these runtime
-parameters. The service on `8090` was intentionally left stopped while the
+The automatic candidates now match the manually measured functional limits
+except for the MTP-paged candidate, which is intentionally 96 tokens below
+the absolute 60,160-token boundary. Both automatic paged candidates reached
+`model loaded` and completed their maximum request with `initial/growth=64`;
+the older fixed-pool freeze path was removed because it severely reduced
+throughput. The service on `8090` was intentionally left stopped while the
 tests ran; no production unit was changed.
+
+The automatic MTP-paged request at `ctx=60,064` used a 55,968-token prompt,
+returned HTTP 200 with 4,094 generated tokens, and measured 474.22 prompt
+tok/s, 30.41 decode tok/s, and 252.604 s total time. The automatic non-MTP
+paged request at `ctx=105,584` used a 101,488-token prompt, returned HTTP 200
+with 4,096 generated tokens, and measured 441.97 prompt tok/s, 17.38 decode
+tok/s, and 465.297 s total time.
 
 ## Direct request checks
 
@@ -249,22 +261,43 @@ tok/s, `17.27` decode tok/s, and `468.267 s` total time. It adds 8,304
 tokens over traditional KV, while decode is approximately 3.92 tok/s slower.
 The paged-attention path still uses the unoptimized CPU reference
 implementation noted above, so this speed difference is implementation-
-dependent rather than an inherent KV-cache limit.
+
+## Unsloth UD GGUF: automatic MTP calibration
+
+The local Unsloth model is
+`Qwen3.8-27B-UD-IQ3_XXS.gguf`. It is a different, larger GGUF from the two
+ISTA files above: with the same settings it left `1707.6 MiB` free on CUDA0,
+whereas the ISTA MTP file left `2165.6 MiB`. The automatic calibration must
+therefore measure this file independently.
+
+With `ctx-size=0`, `fit-target=643`, batch/ubatch 64, q4_0 KV, and MTP enabled,
+the automatic candidates and maximum-request checks were:
+
+| KV path | Candidate | Prompt | Result | Prefill | Decode |
+|---|---:|---:|---|---:|---:|
+| traditional | 29,696 | 25,600 | HTTP 200, 4,094 generated | 660.04 tok/s | 57.16 tok/s |
+| paged | 35,536 | 31,440 | HTTP 200, 4,094 generated | 503.37 tok/s | 43.72 tok/s |
+
+Both requests completed without OOM. The paged candidate uses 2,221 GPU
+blocks with `initial/growth=64`; its lower context than the ISTA MTP result is
+expected from the larger Unsloth GGUF and its lower free-VRAM budget.
 
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid
   target models and adds appended `nextn` layers when MTP is enabled.
-- `fit-target` is a VRAM safety margin. With `--fit-target 643`, the normal
-  MTP path uses an additional 64 MiB margin; paged MTP preallocation reserves
-  an additional 224 MiB speculative workspace.
+- `fit-target` is a VRAM safety margin. With `--fit-target 643`, normal MTP
+  fitting adds a measured 5 MiB boundary margin; the old 64 MiB duplicate
+  margin and 224 MiB paged speculative reserve are no longer charged.
 - `batch-size` and `ubatch-size` do not appear directly in the KV byte formula,
   but they change compute-graph memory. The new probe measures that fixed
   overhead using the configured values before calculating the usable
   threshold.
-- There is no separate `block unlock` option in this source. Paged
-  `--kv-paged-prealloc-max` freezes the calibrated physical pool and sets the
-  final admission capacity to the measured pool size.
+- There is no separate `block unlock` option in this source. Paged automatic
+  fitting reserves the candidate capacity without running the attention kernel
+  during startup, then keeps `initial/growth=64` and sets the admission cap.
+  This avoids both startup OOM aborts and the throughput collapse caused by
+  freezing the full pool as the initial allocation.
 
 ## Threshold validation status
 
@@ -276,3 +309,116 @@ boundary. The MTP-traditional candidate at 50,944 shows the same two-token
 boundary behavior. A small client-side reserve below the advertised context
 limit is therefore still advisable when exactly 4,096 generated tokens are
 required.
+
+## Unsloth UD GGUF: fit-off absolute boundary
+
+The local Unsloth/UD file was then tested with automatic fitting disabled,
+batch/ubatch 64, q4_0 KV, CUDA0, MTP enabled, and a request shaped as
+`prompt = ctx-size - 4,096`, `max_tokens=4096`, and `ignore_eos=true`.
+
+For traditional KV, the last operational context was:
+
+| `ctx-size` | Prompt | Result |
+|---:|---:|---|
+| 37,116 | 33,020 | HTTP 200, 4,096 generated |
+| 37,120 | 33,024 | HTTP 200, 4,094 generated; boundary truncation |
+| 37,121 | 33,025 | CUDA OOM during request |
+
+At `ctx-size=37,120`, prefill was `621.17` tok/s, decode was `53.71`
+tok/s, and total time was `129.376 s` for `37,118` processed tokens. If a
+literal four-thousand-and-ninety-six-token completion is required, `37,116`
+is the highest value validated in this run.
+
+For paged KV, the production-sized pool was tested with 2,560 blocks of 16
+tokens each:
+
+| `ctx-size` | Prompt | GPU blocks | Result |
+|---:|---:|---:|---|
+| 40,960 | 36,864 | 2,560 | HTTP 200, 4,094 generated; boundary truncation |
+| 40,976 | 36,880 | 2,561 | request dropped during prefill |
+| 41,984 | 37,888 | 2,624 | CUDA OOM during request |
+| 45,056 | 40,960 | 2,816 | CUDA OOM during request |
+
+At `ctx-size=40,960`, the request measured `500.92` prompt tok/s,
+`39.58` decode tok/s, and `176.998 s` total time for `40,958` processed
+tokens. Decode remained well above the `10 tok/s` collapse threshold; the
+next paged allocation step failed before a usable response. Therefore
+`40,960` is the last validated fit-off paged context for this Unsloth file
+and current GPU/configuration.
+
+## Why production used 40,960 with max_tokens 4,094
+
+The production unit used the following relevant limits:
+
+```text
+--ctx-size 40960 --batch-size 128 --ubatch-size 128
+--kv-paged --kv-paged-dynamic --kv-block-size 16
+--n-gpu-blocks 2560 --n-gpu-blocks-initial 64 --n-gpu-blocks-growth 64
+--kv-paged-admission-blocks 2560 --fit off
+```
+
+The primary reason it worked was the explicit paged capacity: `2,560 * 16
+= 40,960` tokens. With a 36,864-token prompt, the MTP slot's
+`n_ctx - prompt - 2` guard leaves at most `4,094` generated tokens. The
+server source documents that the two-token reserve is needed for the sampled
+token and a possible context-shift boundary. This is why a request asking for
+4,096 can finish with 4,094 at the exact edge; it is not evidence that the
+client's `max_tokens` value was ignored.
+
+Batch and ubatch 128 were relevant to compute workspace size and throughput,
+and can move an OOM boundary, especially for traditional KV. They did not
+define the 40,960 context window: the context and block/admission limits did.
+In particular, `--fit off` meant that production was using a fixed, explicit
+budget rather than relying on automatic calibration to choose the limit.
+
+## What is and is not model-independent
+
+There is no exact universal closed-form context formula for these models. The
+KV bytes per token/block are calculable, but the remaining budget includes
+model weights, MTP target/draft state, CUDA graph/workspace allocations,
+backend fragmentation, and batch/ubatch-dependent temporary buffers. Those
+effects are both model- and configuration-dependent.
+
+The result is also discrete: normal KV is padded to backend graph
+granularities, paged KV allocates 16-token blocks, and dynamic growth uses
+64-block steps in the tested configuration. A robust calibrator therefore
+needs to measure the loaded model and configured batch, then round down to a
+safe allocation unit and validate the request shape. It should not select a
+constant based on the filename or assume that the Unsloth and ISTA files have
+the same free-VRAM budget.
+
+The current implementation uses per-model free-VRAM and runtime probe data,
+not a filename-specific Unsloth/ISTA branch. Latest automatic checks still
+kept the ISTA candidates at 54,272/60,064 for MTP traditional/paged and
+97,280/105,584 for no-MTP traditional/paged, while the Unsloth fit-on
+candidates were 29,696/35,536. Those numbers differ because the loaded files
+and runtime budgets differ. The small correction terms in the current patch
+remain backend calibration heuristics, so the implementation should be
+treated as conservative and configuration-specific until a fully safe
+allocation probe replaces them.
+
+## ISTA MTP traditional production validation on port 8090
+
+The production unit was switched to
+`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` with traditional KV, `ctx-size=54264`,
+batch/ubatch 64, q4_0 K/V, `fit off`, and the same MTP settings
+(`n-max=2`, `p-min=0.80`). The runtime padded the slot to `n_ctx_slot=54272`.
+
+Three sequential requests were sent to `http://127.0.0.1:8090/v1/completions`
+with `temperature=0`, `ignore_eos=true`, and `max_tokens=4096`:
+
+| Case | Prompt tokens | Completion | Total | HTTP | Decode | Result |
+|---|---:|---:|---:|---:|---:|---|
+| small | 128 | 4,096 | 4,224 | 200 | 69.63 tok/s | pass |
+| medium | 8,192 | 4,096 | 12,288 | 200 | 64.72 tok/s | pass |
+| large | 50,168 | 4,096 | 54,264 | 200 | 46.98 tok/s | pass |
+
+The large request used the validated literal-4,096 boundary and completed
+without truncation or CUDA OOM. Its measured prefill was `510.54` tok/s and
+total request time was `161.359 s` (the shell wall time was `162 s`). The
+medium and large requests reused prompt-cache tokens from the preceding
+requests, so their prompt timing reflects cached-prefix reuse.
+
+After validation, `llama-server.service` remained active on port 8090 with
+the ISTA MTP traditional configuration. No temporary test server remained on
+the GPU.

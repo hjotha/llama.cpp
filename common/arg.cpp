@@ -1735,7 +1735,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_PAGED_DYNAMIC").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--kv-paged-prealloc-max"},
-        "after model load, fit a fixed paged-KV pool to free GPU memory and disable KV growth during requests",
+        "after model load, fit the maximum paged-KV capacity to free GPU memory and cap dynamic growth",
         [](common_params & params) {
             params.kv_paged = true;
             params.kv_paged_dynamic = true;

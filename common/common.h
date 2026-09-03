@@ -565,7 +565,7 @@ struct common_params {
     bool kv_paged          = false; // enable paged KV cache
     bool paged_attn_cuda   = false; // pin full-attention layers to the first device
     bool kv_paged_dynamic  = false; // grow and migrate paged KV pools between registered GPU backends
-    bool kv_paged_prealloc_max = false; // fit one fixed paged KV pool after model load
+    bool kv_paged_prealloc_max = false; // fit the maximum paged KV capacity after model load
 
     int32_t  block_size      = 16;
 

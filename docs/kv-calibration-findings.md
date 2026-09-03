@@ -205,6 +205,52 @@ backend.
 No completed paged request reached the defined collapse threshold of decode
 below 10 tok/s; the higher-context failures occurred first as CUDA OOM.
 
+## ISTA GGUF without MTP: absolute request limits
+
+The non-MTP ISTA file is
+`Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf`. The same maximum-request test was used in
+both KV modes: `prompt = ctx-size - 4,096`, `max_tokens=4096`, batch/ubatch
+64, q4_0 KV, CUDA0, and no `--spec-*` flags.
+
+For traditional KV, the search ended at:
+
+| `ctx-size` | Prompt | Result |
+|---:|---:|---|
+| 95,488 | 91,392 | HTTP 200, 4,096 generated |
+| 96,736 | 92,640 | HTTP 200, 4,096 generated |
+| 97,048 | 92,952 | HTTP 200, 4,096 generated |
+| 97,204 | 93,108 | HTTP 200, 4,096 generated |
+| 97,243 | 93,147 | HTTP 200, 4,096 generated |
+| 97,272 | 93,176 | HTTP 200, 4,096 generated |
+| 97,277 | 93,181 | HTTP 200, 4,096 generated |
+| 97,280 | 93,184 | HTTP 200, 4,096 generated |
+| 97,281 | 93,185 | CUDA OOM during request |
+
+`97,280` is the highest traditional-KV context validated, with `456.42`
+prompt tok/s, `21.19` decode tok/s, and `397.444 s` total time.
+
+For paged KV, dynamic growth was enabled and the physical/admission pool was
+set to the number of 16-token blocks needed by each candidate:
+
+| `ctx-size` | Prompt | GPU blocks | Result |
+|---:|---:|---:|---|
+| 94,208 | 90,112 | 5,888 | HTTP 200, 4,096 generated |
+| 99,328 | 95,232 | 6,208 | HTTP 200, 4,096 generated |
+| 101,888 | 97,792 | 6,368 | HTTP 200, 4,096 generated |
+| 104,448 | 100,352 | 6,528 | HTTP 200, 4,096 generated |
+| 105,472 | 101,376 | 6,592 | HTTP 200, 4,096 generated |
+| 105,536 | 101,440 | 6,596 | HTTP 200, 4,096 generated |
+| 105,568 | 101,472 | 6,598 | HTTP 200, 4,096 generated |
+| 105,584 | 101,488 | 6,599 | HTTP 200, 4,096 generated |
+| 105,600 | 101,504 | 6,600 | CUDA OOM during prefill |
+
+`105,584` is the highest paged-KV context validated, with `439.02` prompt
+tok/s, `17.27` decode tok/s, and `468.267 s` total time. It adds 8,304
+tokens over traditional KV, while decode is approximately 3.92 tok/s slower.
+The paged-attention path still uses the unoptimized CPU reference
+implementation noted above, so this speed difference is implementation-
+dependent rather than an inherent KV-cache limit.
+
 ## Calibration implementation observations
 
 - The normal KV estimator now counts only regular attention layers for hybrid

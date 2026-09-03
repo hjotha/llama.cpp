@@ -422,3 +422,29 @@ requests, so their prompt timing reflects cached-prefix reuse.
 After validation, `llama-server.service` remained active on port 8090 with
 the ISTA MTP traditional configuration. No temporary test server remained on
 the GPU.
+
+## Stock upstream comparison
+
+The upstream stock binary was fetched from `ggml-org/llama.cpp` at commit
+`67a17c17c` and built with CUDA for `sm_89`. The fork binary was the existing
+CUDA build used by the production unit, with the same model and runtime
+parameters. The production unit was stopped only while the stock process used
+the GPU on port 8091; it was started again after the comparison.
+
+Both binaries used the ISTA MTP traditional configuration with `ctx-size`
+54264, batch/ubatch 64, q4_0 K/V, `parallel=1`, Flash Attention, and
+`n-max=2`, `p-min=0.80`. The same three sequential prompts and
+`max_tokens=4096`, `temperature=0`, `ignore_eos=true` were used:
+
+| Case | Fork prefill | Stock prefill | Fork decode | Stock decode | Stock decode delta | Result |
+|---|---:|---:|---:|---:|---:|---|
+| small, 128 prompt | 217.94 | 323.45 | 69.63 | 69.67 | +0.053% | both pass |
+| medium, 8,192 prompt | 706.39 | 710.70 | 64.72 | 64.79 | +0.104% | both pass |
+| large, 50,168 prompt | 510.54 | 510.11 | 46.98 | 47.23 | +0.532% | both pass |
+
+All six requests returned HTTP 200 and exactly 4,096 completion tokens. The
+stock total times were 0.375%, 0.145%, and 0.247% lower for small, medium,
+and large respectively. The small-prompt prefill difference is dominated by
+fixed-request timing; at the large boundary the prefill difference was only
+`-0.085%`. The stock and fork had identical MTP draft counts and acceptance
+for these runs, so there was no material TPS regression from the fork changes.

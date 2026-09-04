@@ -233,3 +233,11 @@ root process produced the transitions `idle -> prefill -> decode -> idle`, and
 restored the original 200 W limit before the service was started again. Router
 deployments with multiple independent processes targeting the same physical GPU
 remain unsupported because the power limit is device-global.
+
+During the first production observation, the `54272` context configuration
+caused repeated CUDA OOM/ABRT crashes when OpenCode sessions approached the
+available VRAM. The stack was in `MUL_MAT` and was independent of NVML. The
+production unit was therefore reduced to `--ctx-size 40960`, which matches the
+intended 40K workload and leaves additional VRAM headroom. The same remote
+OpenCode session then completed at `38368` prompt tokens with `587.20` prompt
+tokens per second and `39.87` decode tokens per second, with no new restart.

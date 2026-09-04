@@ -54,88 +54,70 @@ fail later under load. Slots draw from one shared pool: `--parallel` limits
 simultaneous sequences but does not divide the pool into fixed per-slot quotas.
 Pages released by a completed request can be reused by requests that remain.
 
-### RTX 4070 12 GB results (2026-09-01)
+### Recent integration status (2026-09-04)
 
-Current production profile, measured on a GeForce RTX 4070 12 GB with
-Qwen3.8-27B `UD-IQ3_XXS`, paged `q4_0` K/V cache, CUDA Flash Attention, one
-server slot, MTP speculative decoding and dynamic paged KV. All pool
-parameters are explicit, so startup skips the calibration pass and the server
-is ready in about 12 s:
+The current fork `master` contains the upstream merge through
+`86b351fd6`, followed by the experimental SnapKV paged-retention merges. The
+recent work adds streaming SnapKV capture, per-head page scores, selective
+eviction, CPU-to-GPU page migration, and the repeatable
+`tools/snapkv-40k-mtp-bench.py` harness.
+
+The normal KV and traditional MTP paths remain the upstream implementation.
+The added code is selected only for paged KV configurations. SnapKV remains
+experimental: it is a long-context capacity and quality experiment, not the
+default production profile.
+
+### RTX 4070 12 GB calibration and production profile (2026-09-04)
+
+The complete, model-specific calibration record is in
+[docs/kv-calibration-findings.md](docs/kv-calibration-findings.md). Results
+below use CUDA0, `q4_0` K/V, `parallel=1`, CUDA Flash Attention, and the
+tested RTX 4070 12 GB unless stated otherwise.
+
+The promoted profile is traditional KV with the ISTA MTP GGUF. It avoids the
+paged-attention throughput penalty while retaining a validated 54K request
+budget:
 
 ```sh
 llama-server \
-  --model Qwen3.8-27B-UD-IQ3_XXS.gguf \
-  --ctx-size 40960 --parallel 1 \
-  --batch-size 128 --ubatch-size 128 \
+  --model Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf \
+  --ctx-size 54272 --parallel 1 \
+  --batch-size 64 --ubatch-size 64 \
   --device CUDA0 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
-  --kv-paged --kv-paged-dynamic --n-gpu-blocks 2560 \
-  --n-gpu-blocks-initial 64 --n-gpu-blocks-growth 64 \
-  --kv-paged-admission-blocks 2560 --fit off --kv-block-size 16 \
-  --cache-ram 0 --ctx-checkpoints 1 --metrics \
+  --fit off --cache-ram 0 --ctx-checkpoints 1 --metrics \
   --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
   --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
 ```
 
-`--ctx-size 40960` matches the confirmed operational limit: a request of
-36,866 prompt + 4,094 output tokens (40,960 total) is the maximum that
-completes. Requests whose prompt + max_tokens exceed 40,960 are rejected
-upfront with a clean HTTP 400 `exceed_context_size_error` ("compact the
-context and retry") instead of growing the KV pool past the physical budget,
-which previously OOM'd with a `cudaMalloc` failure mid-prefill and aborted
-the whole process (core dump + systemd restart). The nominal 43,008
-calibration is not reachable on this hardware.
+| Configuration | Validated boundary | Observed throughput | Operational result |
+| --- | --- | --- | --- |
+| ISTA traditional MTP | 50,168 prompt + 4,096 output | 510.54 prompt tok/s, 46.98 decode tok/s | promoted production profile |
+| ISTA paged MTP | 60,160 total tokens | 471.00 prompt tok/s, 30.11 decode tok/s | more capacity, not a speed replacement |
+| ISTA traditional no-MTP | 97,280 total tokens | 456.42 prompt tok/s, 21.19 decode tok/s | highest tested traditional capacity |
+| ISTA paged no-MTP | 105,584 total tokens | 439.02 prompt tok/s, 17.27 decode tok/s | highest tested paged capacity |
 
-`--ctx-checkpoints 1` is required for prompt caching on hybrid models.
-Qwen3.8-27B-UD has 16 attention layers and 48 recurrent layers, so the hybrid
-paged memory reports the rolling recurrent tail as the sequence minimum and
-the server would otherwise force a full prompt re-process on every request
-(zero cached tokens). Context checkpoints restore the attention and draft
-state: an identical 1,651-token prompt drops from 9.8 s to 0.3 s, and the
-maximum 36,867-token prompt reuses 36,863 cached tokens.
+For a literal 4,096-token MTP completion, `54,264` is the highest validated
+traditional-KV context. At `54,272`, the server completes 4,094 tokens at the
+exact boundary; `54,273` OOMs during the request. This two-token reserve is a
+server boundary behavior, not a client-side cache hit or throughput issue.
 
-Measured OpenAI-compatible completions at the maximum gate (`ignore_eos`,
-temperature 0):
+Paged KV expands the memory ceiling, but should not be selected for raw
+throughput at equal context. At `ctx-size=54,272`, paged MTP measured 485.01
+prompt tok/s and 32.26 decode tok/s versus 549.13 and 46.66 for traditional
+KV: 11.7% lower prefill and 30.9% lower decode. The current paged attention
+path is still experimental and is expected to improve with backend work.
 
-| Profile | Prefill | Decode | Wall time |
-| --- | ---: | ---: | ---: |
-| P1 MTP nmax2, cold 36,867 + 4,091 | 631.1 tok/s | 32.6 tok/s | 183.9 s |
-| P1 MTP nmax2, warm (36,863 cached) | - | ~32.6 tok/s | 160.2 s |
-| P1 MTP nmax2, 2026-08-26 prealloc-max gate | 544.4 tok/s | 38.0 tok/s | 175.6 s |
+The calibration is intentionally model- and configuration-specific. The
+larger Unsloth UD GGUF has different free VRAM and different usable limits;
+do not reuse the ISTA thresholds for it. Run the automatic probe and then a
+maximum-shaped request on the target model, batch/ubatch, cache type, and GPU.
 
-The 2026-08-26 row is the `--kv-paged-prealloc-max --ctx-size 0 --fit off
---fit-target 643` profile on the same gate (36,864 + 4,096), kept for
-reference. Peak VRAM during the maximum request is 11,899 / 12,282 MiB
-(GPU-only, no spill). `nmax=3` OOMs repeatedly and DFlash2 stays below
-target-only, so MTP `nmax=2` remains the promoted speculative profile.
-
-CPU spill (`--n-cpu-blocks N` with N > 1) removes the reserve failure but
-migrates whole attention layers to CPU, where the paged attention reference
-kernel drops decode to about 3.6 tok/s. It stays disabled in production.
-
-High-capacity profile without MTP (shared paged pool, `--parallel 3`, logical
-context 77,824; startup calibration with `--kv-paged-prealloc-max` selects
-4,032 pages of 16 tokens = 64,512 physical tokens in about 133 s):
-
-| Workload | Prefill | Decode | Wall time |
-| --- | ---: | ---: | ---: |
-| 30,052 + 256, first request | 1,103.9 tok/s | 27.0 tok/s | 36.7 s |
-| distinct 30,052 + 256, next request | 1,100.2 tok/s | 27.0 tok/s | 36.8 s |
-| 64,511 + 1 | 1,100.5 tok/s | - | 58.6 s |
-| 60,416 + 4,096 | 1,098.4 tok/s | 21.3 tok/s | 247.1 s |
-| 62,052 + 4,096 (76K logical) | 535.3 tok/s | 22.3 tok/s | complete |
-
-`--parallel 4` aborts the long gate at 57,344 tokens with a `cuMemCreate`
-OOM; admission control defers overflow requests but does not replace the
-FlashAttention workspace budget. Paged KV does not beat plain KV at equal
-context - it wins by shared capacity, dynamic growth and eviction, not raw
-decode speed (about 1% at short context, 6-7% slower decode at 40-48K).
-
-SnapKV is available but not promoted for production: above the physical pool
-it accepts long prompts but evicts pages and loses needle facts (80K logical
-/ 48K physical missed 3/3 facts). Results are hardware-, model-, build-, and
-cache-type-specific; the automatic calibration is intended to determine the
-corresponding safe value on another system.
+Traditional MTP was also checked against a CUDA `sm_89` stock-upstream build.
+At 128, 8,192, and 50,168 prompt tokens, the stock decode delta was 0.053%,
+0.104%, and 0.532%, respectively, with identical draft counts and acceptance.
+This is not a material regression; MTP acceptance and GPU clock variation are
+larger sources of sub-1% run-to-run differences.
 
 ## Quick start
 

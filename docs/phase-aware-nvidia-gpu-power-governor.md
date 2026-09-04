@@ -183,8 +183,8 @@ and their `LLAMA_ARG_*` names.
 
 ## Documentation and validation deliverables
 
-The generated server help in `tools/server/README.md` will be refreshed from
-the argument definitions with `llama-gen-docs`. The server README will include
+The generated server help in `tools/server/README.md` was refreshed from the
+argument definitions with `llama-gen-docs`. The server README includes
 the usage example:
 
 ```bash
@@ -222,6 +222,11 @@ Permissions`; the governor logged the error and disabled further writes, as
 designed. The fake backend test covers successful writes and restoration.
 
 The pytest server suite was not run because `pytest` is not installed in this
-environment. The production `llama-server` service was not reloaded or
-modified. Router deployments with multiple independent processes targeting the
-same physical GPU remain unsupported because the power limit is device-global.
+environment. After explicit deployment, the user unit
+`~/.config/systemd/user/llama-server.service` points to the committed
+`build/bin/llama-server` and enables the `200/165/0` profiles. A real production
+request returned successfully and the service stayed healthy. The host denied
+the decode write with `NVML code 4: Insufficient Permissions`, so the governor
+disabled itself and the device remained at 200 W. Router deployments with
+multiple independent processes targeting the same physical GPU remain
+unsupported because the power limit is device-global.

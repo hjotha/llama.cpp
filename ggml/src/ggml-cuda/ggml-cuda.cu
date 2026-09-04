@@ -2600,6 +2600,47 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+static int ggml_cuda_graph_min_stable_calls() {
+    static const int min_stable_calls = [] {
+        const char * value = getenv("GGML_CUDA_GRAPH_MIN_STABLE_CALLS");
+        return value == nullptr ? 4 : std::max(1, atoi(value));
+    }();
+
+    return min_stable_calls;
+}
+
+static bool ggml_cuda_graph_debug_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_graph_debug_log(ggml_backend_cuda_context * cuda_ctx,
+                                      const void *                graph_key,
+                                      const ggml_cuda_graph *     graph,
+                                      const char *                event) {
+    if (!ggml_cuda_graph_debug_enabled()) {
+        return;
+    }
+
+    size_t            free_bytes  = 0;
+    size_t            total_bytes = 0;
+    const cudaError_t status      = cudaMemGetInfo(&free_bytes, &total_bytes);
+
+    if (status == cudaSuccess) {
+        fprintf(stderr,
+                "CUDA graph %s: key=%p entries=%zu captures=%zu updates=%zu stable=%d free=%.2f MiB total=%.2f MiB\n",
+                event, graph_key, cuda_ctx->cuda_graphs.size(), graph->capture_count, graph->update_count,
+                graph->warmup_stable_calls, free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+    } else {
+        fprintf(stderr, "CUDA graph %s: key=%p entries=%zu captures=%zu updates=%zu stable=%d memory_status=%s\n",
+                event, graph_key, cuda_ctx->cuda_graphs.size(), graph->capture_count, graph->update_count,
+                graph->warmup_stable_calls, cudaGetErrorString(status));
+        (void) cudaGetLastError();
+    }
+
+    fflush(stderr);
+}
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
@@ -2645,7 +2686,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-#if CUDART_VERSION >= 12000
+    graph->update_count++;
+    ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "update-begin");
+
+#    if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
 #else
@@ -2662,11 +2706,14 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "update-reinstantiate");
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+        ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "update-complete");
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -4380,6 +4427,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->capture_count++;
+            ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "capture-complete");
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4395,8 +4444,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        }
-        if (cuda_graph_update_required) { // Update graph executable
+            ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "instantiate");
+        } else if (cuda_graph_update_required) {  // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
@@ -4446,19 +4495,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                // Avoid capturing short-lived prefill shapes. Traditional KV commonly changes
+                // n_kv every few ubatches; requiring several matching calls keeps CUDA graphs
+                // for stable decode without repeatedly recapturing them during prefill.
+                if (properties_changed) {
+                    graph->warmup_stable_calls = 0;
+                } else {
+                    graph->warmup_stable_calls++;
+                }
+
+                if (graph->warmup_stable_calls >= ggml_cuda_graph_min_stable_calls()) {
                     graph->warmup_complete = true;
+                    graph->warmup_stable_calls = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+                // else: properties changed or the graph is not stable yet - execute directly
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->warmup_stable_calls = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;

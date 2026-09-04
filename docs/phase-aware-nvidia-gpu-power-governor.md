@@ -235,9 +235,17 @@ deployments with multiple independent processes targeting the same physical GPU
 remain unsupported because the power limit is device-global.
 
 During the first production observation, the `54272` context configuration
-caused repeated CUDA OOM/ABRT crashes when OpenCode sessions approached the
+showed repeated CUDA OOM/ABRT crashes when OpenCode sessions approached the
 available VRAM. The stack was in `MUL_MAT` and was independent of NVML. The
-production unit was therefore reduced to `--ctx-size 40960`, which matches the
-intended 40K workload and leaves additional VRAM headroom. The same remote
-OpenCode session then completed at `38368` prompt tokens with `587.20` prompt
-tokens per second and `39.87` decode tokens per second, with no new restart.
+context was temporarily reduced to `40960`, but a deterministic sequence later
+reproduced the same failure in the intact upstream `llama2` binary with both
+`--cache-ram 0` and `4096`. Disabling CUDA graphs eliminated it.
+
+Instrumentation showed that short-lived prefill shapes were repeatedly becoming
+eligible for CUDA graph capture while only a few MiB of VRAM remained. The CUDA
+backend now waits for four structurally stable calls before capture, avoids a
+redundant instantiate/update cycle, and synchronizes before incompatible graph
+replacement. The full failing sequence passed with CUDA graphs re-enabled,
+`--ctx-size 54272`, `--cache-ram 4096`, and no server restart. See
+[OOM reproduction trace](oom-reproduction-trace.md) for the exact requests and
+A/B evidence.

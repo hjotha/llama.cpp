@@ -85,7 +85,7 @@ llama-server \
   --batch-size 64 --ubatch-size 64 \
   --device CUDA0 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
-  --fit off --cache-ram 0 --ctx-checkpoints 1 --metrics \
+  --fit off --cache-ram 4096 --ctx-checkpoints 1 --metrics \
   --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
   --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
 ```
@@ -118,6 +118,13 @@ At 128, 8,192, and 50,168 prompt tokens, the stock decode delta was 0.053%,
 0.104%, and 0.532%, respectively, with identical draft counts and acceptance.
 This is not a material regression; MTP acceptance and GPU clock variation are
 larger sources of sub-1% run-to-run differences.
+
+Sustained requests with varying prompt shapes exposed an upstream CUDA graph
+recapture OOM at this tight VRAM boundary. The local fix requires four stable
+graph calls before capture, preserving decode graphs while avoiding transient
+prefill captures. The exact reproduction, upstream A/B, instrumentation, and
+ten-request validation are recorded in
+[docs/oom-reproduction-trace.md](docs/oom-reproduction-trace.md).
 
 ## Quick start
 

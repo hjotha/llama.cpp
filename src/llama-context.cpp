@@ -2616,6 +2616,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
     };
 }
 
+void llama_context::set_snapkv_prefill_end(llama_seq_id seq_id, llama_pos prefill_end) {
+    if (memory) {
+        memory->set_snapkv_prefill_end(seq_id, prefill_end);
+    }
+}
+
 //
 // state save/load
 //
@@ -4260,6 +4266,15 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+void llama_set_snapkv_prefill_end(
+        llama_context * ctx,
+        llama_seq_id   seq_id,
+        llama_pos      prefill_end) {
+    if (ctx) {
+        ctx->set_snapkv_prefill_end(seq_id, prefill_end);
+    }
 }
 
 //

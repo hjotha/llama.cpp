@@ -8084,9 +8084,11 @@ struct ggml_tensor * ggml_paged_attn(
     int                   block_size,
     int                   max_blocks,
     int                   active_context,
+    bool                  snapkv_streaming,
     struct ggml_tensor  * snapkv_scores,
     struct ggml_tensor  * snapkv_capture_from,
-    struct ggml_tensor  * snapkv_score_slots) {
+    struct ggml_tensor  * snapkv_score_slots,
+    struct ggml_tensor  * snapkv_token_scores) {
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), q->ne);
     result->op = GGML_OP_PAGED_ATTN;
@@ -8108,7 +8110,7 @@ struct ggml_tensor * ggml_paged_attn(
     op_params_i[0] = block_size;
     op_params_i[1] = max_blocks;
     op_params_i[2] = active_context;
-    op_params_i[3] = 0;
+    op_params_i[3] = snapkv_streaming ? 1 : 0;
     // GGML_MAX_SRC is 10, so the optional SnapKV accumulator is passed as a
     // pointer in op_params instead of an 11th source tensor.
     uintptr_t snapkv_addr = snapkv_scores != NULL ? (uintptr_t) snapkv_scores->data : 0;
@@ -8120,6 +8122,12 @@ struct ggml_tensor * ggml_paged_attn(
     uintptr_t snapkv_slots_addr = snapkv_score_slots != NULL ? (uintptr_t) snapkv_score_slots->data : 0;
     op_params_i[8] = (int32_t) (snapkv_slots_addr & 0xffffffffu);
     op_params_i[9] = (int32_t) (snapkv_slots_addr >> 32);
+    uintptr_t snapkv_token_addr = snapkv_token_scores != NULL ? (uintptr_t) snapkv_token_scores->data : 0;
+    op_params_i[10] = (int32_t) (snapkv_token_addr & 0xffffffffu);
+    op_params_i[11] = (int32_t) (snapkv_token_addr >> 32);
+    op_params_i[12] = snapkv_scores != NULL && q->ne[1] > 0
+        ? (int32_t) (snapkv_scores->ne[0] / q->ne[1])
+        : max_blocks;
 
     return result;
 }

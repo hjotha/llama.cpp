@@ -2634,6 +2634,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
                             LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
                             const uint32_t head_dim   = hparams.n_embd_head_v();
+                            const uint32_t n_head_q   = hparams.n_head();
                             const uint32_t n_head     = hparams.n_head_kv();
                             const uint32_t n_layers   = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
                                 ? hparams.n_layer_all
@@ -2648,7 +2649,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             const uint32_t n_seq_max  = cparams.n_seq_max;
 
                             auto * paged_cache = new llama_kv_cache_paged(
-                                head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max, std::move(filter));
+                                head_dim, n_head_q, n_head, block_size, n_layers, n_ubatch, n_seq_max, std::move(filter));
                             GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
 
                             paged_cache->init(

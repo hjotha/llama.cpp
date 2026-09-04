@@ -1019,6 +1019,13 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Tell paged SnapKV the final position of a prompt that will be decoded in batches.
+    // This is an optional no-op for contexts without paged SnapKV.
+    LLAMA_API void llama_set_snapkv_prefill_end(
+            struct llama_context * ctx,
+                       llama_seq_id seq_id,
+                          llama_pos prefill_end);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

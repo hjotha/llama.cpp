@@ -274,6 +274,24 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    {
+        common_params power_params;
+        argv = {
+            "binary_name",
+            "--gpu-power-prefill", "200",
+            "--gpu-power-decode", "165",
+            "--gpu-power-device", "1",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), power_params, LLAMA_EXAMPLE_SERVER));
+        assert(power_params.gpu_power_prefill == 200);
+        assert(power_params.gpu_power_decode == 165);
+        assert(power_params.gpu_power_device == 1);
+
+        common_params incomplete_power_params;
+        argv = {"binary_name", "--gpu-power-prefill", "200"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), incomplete_power_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -361,6 +379,19 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "overwritten.gguf");
     assert(params.cpuparams.n_threads == 1010);
+
+    setenv("LLAMA_ARG_GPU_POWER_PREFILL", "200", true);
+    setenv("LLAMA_ARG_GPU_POWER_DECODE", "165", true);
+    setenv("LLAMA_ARG_GPU_POWER_DEVICE", "1", true);
+    common_params power_env_params;
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), power_env_params, LLAMA_EXAMPLE_SERVER));
+    assert(power_env_params.gpu_power_prefill == 200);
+    assert(power_env_params.gpu_power_decode == 165);
+    assert(power_env_params.gpu_power_device == 1);
+    unsetenv("LLAMA_ARG_GPU_POWER_PREFILL");
+    unsetenv("LLAMA_ARG_GPU_POWER_DECODE");
+    unsetenv("LLAMA_ARG_GPU_POWER_DEVICE");
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");

@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-gpu-power.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -105,6 +106,19 @@ enum slot_state {
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
 };
+
+static server_gpu_power_slot_state server_gpu_power_slot_state_from_slot_state(slot_state state) {
+    switch (state) {
+        case SLOT_STATE_IDLE:              return server_gpu_power_slot_state::idle;
+        case SLOT_STATE_WAIT_OTHER:        return server_gpu_power_slot_state::wait_other;
+        case SLOT_STATE_STARTED:           return server_gpu_power_slot_state::started;
+        case SLOT_STATE_PROCESSING_PROMPT: return server_gpu_power_slot_state::processing_prompt;
+        case SLOT_STATE_DONE_PROMPT:       return server_gpu_power_slot_state::done_prompt;
+        case SLOT_STATE_GENERATING:        return server_gpu_power_slot_state::generating;
+    }
+
+    return server_gpu_power_slot_state::idle;
+}
 
 struct server_slot; // forward declaration
 
@@ -864,6 +878,7 @@ public:
     }
 
     ~server_context_impl() {
+        gpu_power.shutdown();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -884,6 +899,8 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    server_gpu_power gpu_power;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -963,6 +980,7 @@ private:
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
+            gpu_power.on_sleeping(true);
             if (callback_state) {
                 callback_state(SERVER_STATE_SLEEPING, {});
                 // note: for sleeping == false, event is emitted by load_model()
@@ -973,6 +991,13 @@ private:
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
                 GGML_ABORT("failed to reload model after sleeping");
+            }
+            if (!gpu_power.init({
+                    params_base.gpu_power_prefill,
+                    params_base.gpu_power_decode,
+                    params_base.gpu_power_device,
+                })) {
+                GGML_ABORT("failed to reinitialize GPU power governor after sleeping");
             }
         }
         sleeping = new_state;
@@ -1436,6 +1461,14 @@ private:
         GGML_ASSERT(model_tgt != nullptr);
 
         GGML_ASSERT(!sleeping);
+
+        if (!gpu_power.init({
+                params_base.gpu_power_prefill,
+                params_base.gpu_power_decode,
+                params_base.gpu_power_device,
+            })) {
+            return false;
+        }
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
@@ -2896,7 +2929,21 @@ private:
     };
 #endif
 
+    void update_gpu_power_phase() {
+        if (!gpu_power.enabled()) {
+            return;
+        }
+
+        server_gpu_power_phase_arbitrator arbitrator;
+        for (const auto & slot : slots) {
+            arbitrator.observe(server_gpu_power_slot_state_from_slot_state(slot.state));
+        }
+        gpu_power.update(arbitrator.phase());
+    }
+
     void update_slots() {
+        update_gpu_power_phase();
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4296,6 +4343,7 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    impl->gpu_power.shutdown();
 }
 
 void server_context::terminate() {

@@ -888,6 +888,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER) {
+        const bool has_prefill_power = params.gpu_power_prefill != -1;
+        const bool has_decode_power  = params.gpu_power_decode != -1;
+        if (has_prefill_power != has_decode_power) {
+            throw std::invalid_argument(
+                "--gpu-power-prefill and --gpu-power-decode must be provided together");
+        }
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -3758,6 +3767,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_prompt = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PROMPT"));
+    add_opt(common_arg(
+        {"--gpu-power-prefill"}, "W",
+        "NVIDIA GPU power limit in watts during prompt processing (requires --gpu-power-decode)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--gpu-power-prefill must be positive");
+            }
+            params.gpu_power_prefill = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_PREFILL"));
+    add_opt(common_arg(
+        {"--gpu-power-decode"}, "W",
+        "NVIDIA GPU power limit in watts during token generation (requires --gpu-power-prefill)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--gpu-power-decode must be positive");
+            }
+            params.gpu_power_decode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_DECODE"));
+    add_opt(common_arg(
+        {"--gpu-power-device"}, "N",
+        "NVML device index used by the NVIDIA GPU power governor (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--gpu-power-device must be non-negative");
+            }
+            params.gpu_power_device = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_DEVICE"));
     add_opt(common_arg(
         {"--cache-reuse"}, "N",
         string_format(

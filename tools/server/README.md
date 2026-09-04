@@ -168,6 +168,22 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
+| `-kvp, --kv-paged, -no-kvp, --no-kv-paged` | use paged KV buffer shared across all sequences (default: disabled)<br/>(env: LLAMA_ARG_KV_PAGED) |
+| `--kv-paged-dynamic` | grow paged KV on demand and migrate its attention layers between registered GPU backends<br/>(env: LLAMA_ARG_KV_PAGED_DYNAMIC) |
+| `--kv-paged-prealloc-max` | after model load, fit the maximum paged-KV capacity to free GPU memory and cap dynamic growth<br/>(env: LLAMA_ARG_KV_PAGED_PREALLOC_MAX) |
+| `--kv-paged-admission-blocks N` | limit total admitted paged-KV blocks while multiple requests are active (0 = disabled)<br/>(env: LLAMA_ARG_KV_PAGED_ADMISSION_BLOCKS) |
+| `--snapkv OW` | enable SnapKV selective page retention with observation window OW (tokens)<br/>(env: LLAMA_ARG_SNAPKV) |
+| `--snapkv-recent N` | always-retained trailing window in tokens (default: 0)<br/>(env: LLAMA_ARG_SNAPKV_RECENT) |
+| `--snapkv-pinned N` | always-retained leading window in tokens (default: 0)<br/>(env: LLAMA_ARG_SNAPKV_PINNED) |
+| `--snapkv-retention PCT` | fraction [0,1] of old (non-pinned/non-recent) pages retained after prefill (default: 1.0)<br/>(env: LLAMA_ARG_SNAPKV_RETENTION) |
+| `--snapkv-budget-blocks N` | max physical blocks retained per sequence after prefill (0 = full GPU pool)<br/>(env: LLAMA_ARG_SNAPKV_BUDGET_BLOCKS) |
+| `--paged-attn-cuda` | pin full-attention layers to the first offload device (use with --tensor-split for recurrent-only layers on the next device) |
+| `-ncpub, --n-cpu-blocks N` | number of physical CPU blocks for paged KV cache (default: 1) |
+| `-ngpub, --n-gpu-blocks N` | number of physical GPU blocks for paged KV cache (default: 1) |
+| `--n-gpu-blocks-initial N` | number of paged KV GPU blocks allocated at startup (default: 0 = full pool) |
+| `--n-gpu-blocks-growth N` | number of paged KV GPU blocks added per dynamic growth (default: 0 = initial pool) |
+| `-kvbls, --kv-block-size N` | fixed number of tokens for a given paged block (default: 16) |
+| `--kv-paged-watermark N` | fraction of blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0)) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
@@ -220,6 +236,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--sse-ping-interval N` | server SSE ping interval in seconds (-1 = disabled, default: 30)<br/>(env: LLAMA_ARG_SSE_PING_INTERVAL) |
 | `--threads-http N` | number of threads used to process HTTP requests (default: -1)<br/>(env: LLAMA_ARG_THREADS_HTTP) |
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |
+| `--gpu-power-prefill W` | NVIDIA GPU power limit in watts during prompt processing (requires --gpu-power-decode)<br/>(env: LLAMA_ARG_GPU_POWER_PREFILL) |
+| `--gpu-power-decode W` | NVIDIA GPU power limit in watts during token generation (requires --gpu-power-prefill)<br/>(env: LLAMA_ARG_GPU_POWER_DECODE) |
+| `--gpu-power-device N` | NVML device index used by the NVIDIA GPU power governor (default: 0)<br/>(env: LLAMA_ARG_GPU_POWER_DEVICE) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
@@ -236,7 +255,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--reasoning-effort LEVEL` | reasoning effort level given to the chat template: 'default' to keep the template default,<br/>or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)<br/>(env: LLAMA_ARG_REASONING_EFFORT) |
 | `--reasoning-budget N` | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
 | `--reasoning-budget-message MESSAGE` | message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
-| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: template default)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
+| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: enabled)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--chat-template JINJA_TEMPLATE` | set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE) |
 | `--chat-template-file JINJA_TEMPLATE_FILE` | set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE) |
 | `--skip-chat-parsing, --no-skip-chat-parsing` | force a pure content parser, even if a Jinja template is specified; model will output everything in the content section, including any reasoning and/or tool calls (default: disabled)<br/>(env: LLAMA_ARG_SKIP_CHAT_PARSING) |
@@ -312,6 +331,38 @@ For string options like `--load-mode`, the environment variable is handled as sh
 - `LLAMA_ARG_LOAD_MODE=mlock` locks the model in RAM
 - `LLAMA_ARG_LOAD_MODE=mmap+mlock` enables memory-mapping and locks in RAM
 - `LLAMA_ARG_LOAD_MODE=dio` uses DirectIO if available
+
+### NVIDIA GPU power governor
+
+The server has an opt-in phase-aware power governor for NVIDIA GPUs. It uses
+NVML directly and selects a global power profile from the internal slot state:
+prompt processing uses `--gpu-power-prefill`, token generation uses
+`--gpu-power-decode`, and idle leaves the power limit unchanged so the driver
+can manage idle power naturally. Continuous batching gives `PREFILL` priority
+over `DECODE` when multiple slots are active.
+
+The feature is NVIDIA/NVML-only and requires permission from the system and
+driver to change the power limit. It does not use `nvidia-smi`, a daemon, or a
+polling process. It is disabled when the profile arguments are omitted and
+does not change the default server behavior.
+
+Example:
+
+```bash
+llama-server \
+  -m model.gguf \
+  --gpu-power-prefill 200 \
+  --gpu-power-decode 165 \
+  --gpu-power-device 0
+```
+
+The original power limit is restored when the server enters sleep or shuts
+down. The equivalent environment variables are
+`LLAMA_ARG_GPU_POWER_PREFILL`, `LLAMA_ARG_GPU_POWER_DECODE`, and
+`LLAMA_ARG_GPU_POWER_DEVICE`.
+
+Only one governor owner should target a physical GPU; multiple independent
+router or server processes must not control the same device concurrently.
 
 For boolean options like `--kv-offload`:
 - `LLAMA_ARG_KV_OFFLOAD=true` means enabled, other accepted values are: `1`, `on`, `enabled`

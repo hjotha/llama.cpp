@@ -5519,6 +5519,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+            return true;
         case GGML_OP_PAGED_ATTN:
             // Paged KV is persistent storage. Copying it to CUDA for every decode step is
             // both incorrect for hot migration and far more expensive than moving the op.

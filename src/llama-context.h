@@ -144,6 +144,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    void set_snapkv_prefill_end(llama_seq_id seq_id, llama_pos prefill_end);
 
     //
     // state save/load

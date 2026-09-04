@@ -38,6 +38,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_paged(
         hparams.n_embd_head_v(),
+        hparams.n_head(),
         hparams.n_head_kv(),
         block_size,
         hparams.n_layer(),
@@ -169,6 +170,10 @@ void llama_memory_hybrid_paged::seq_add(llama_seq_id seq_id, llama_pos p0, llama
 void llama_memory_hybrid_paged::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
+}
+
+void llama_memory_hybrid_paged::set_snapkv_prefill_end(llama_seq_id seq_id, llama_pos prefill_end) {
+    mem_attn->set_snapkv_prefill_end(seq_id, prefill_end);
 }
 
 llama_pos llama_memory_hybrid_paged::seq_pos_min(llama_seq_id seq_id) const {

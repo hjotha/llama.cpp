@@ -20100,8 +20100,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_paged_attn(ggml_ctx,
                                            src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4],
                                            src_clone[5], src_clone[6], src_clone[7], src_clone[8], src_clone[9],
-                                           params[0], params_i[0], params_i[1], params_i[2],
-                                           nullptr, params_i[3]);
+                                           params[0], params_i[0], params_i[1], params_i[2], params_i[3],
+                                           nullptr, nullptr, nullptr, nullptr);
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

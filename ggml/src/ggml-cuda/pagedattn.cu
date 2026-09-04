@@ -304,6 +304,27 @@ static const int * paged_attn_snapkv_score_slots(const float * op_params_f) {
     return addr != 0 ? (const int *) addr : nullptr;
 }
 
+static float * paged_attn_snapkv_token_scores(const float * op_params_f) {
+    const int32_t * ip = (const int32_t *) (op_params_f + 1);
+    uintptr_t addr = (uintptr_t)(uint32_t) ip[10] | ((uintptr_t)(uint32_t) ip[11] << 32);
+    return addr != 0 ? (float *) addr : nullptr;
+}
+
+static bool paged_attn_snapkv_streaming(const float * op_params_f) {
+    const int32_t * ip = (const int32_t *) (op_params_f + 1);
+    return ip[3] != 0;
+}
+
+static int paged_attn_snapkv_score_blocks(const float * op_params_f, int fallback) {
+    const int32_t * ip = (const int32_t *) (op_params_f + 1);
+    return ip[12] > 0 ? ip[12] : fallback;
+}
+
+static bool paged_attn_snapkv_sync_debug() {
+    static const bool enabled = std::getenv("LLAMA_SNAPKV_SYNC_DEBUG") != nullptr;
+    return enabled;
+}
+
 template<typename block_t, bool quantized>
 static bool ggml_cuda_paged_attn_prefill(
         ggml_backend_cuda_context & ctx,
@@ -325,7 +346,7 @@ static bool ggml_cuda_paged_attn_prefill(
     const int n_heads_kv     = k_new->ne[1];
     const int n_seq          = batch_lens->ne[0];
     const int active_context = ((const int32_t *) ((const float *) dst->op_params + 1))[2];
-    const int contiguous_base = ((const int32_t *) ((const float *) dst->op_params + 1))[3] - 1;
+    const int contiguous_base = ((const int32_t *) ((const float *) dst->op_params + 1))[13] - 1;
     if (n_seq != 1 || n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || active_context <= 0) {
         return false;
     }
@@ -654,7 +675,19 @@ static __global__ void paged_attention_flash_combine_kernel(
 // observation window, softmax-normalize per query/head, and accumulate the
 // resulting attention mass per logical page (skipping evicted pages).
 
-static constexpr int PAGED_ATTN_OBS_CHUNK = 32;
+static constexpr size_t PAGED_ATTN_OBS_SCRATCH_BUDGET = 128ull * 1024 * 1024;
+static constexpr int PAGED_ATTN_OBS_CHUNK_MIN = 8;
+
+static int paged_attn_snapkv_observation_chunk(size_t max_context, int n_heads, int n_seq) {
+    const int candidates[] = { 32, 16, PAGED_ATTN_OBS_CHUNK_MIN };
+    for (const int chunk : candidates) {
+        const size_t scratch = max_context * (size_t) n_heads * (size_t) n_seq * (size_t) chunk * sizeof(float);
+        if (scratch <= PAGED_ATTN_OBS_SCRATCH_BUDGET) {
+            return chunk;
+        }
+    }
+    return PAGED_ATTN_OBS_CHUNK_MIN;
+}
 
 template<typename block_t, bool quantized>
 static __global__ void paged_attention_obs_scores_kernel(
@@ -811,18 +844,13 @@ static __global__ void paged_attention_obs_scores_gqa_kernel(
 }
 
 static __global__ void paged_attention_obs_softmax_accum_kernel(
-        const float * __restrict__ scores,
-        const int * __restrict__ block_table,
+        float * __restrict__ scores,
         const int * __restrict__ context_lens,
-        const int * __restrict__ batch_offsets,
         const int * __restrict__ batch_lens,
         const size_t max_context,
-        const int block_size,
-        const int max_blocks,
         const int obs_offset,
         const int * __restrict__ capture_from,
-        const int * __restrict__ score_slots,
-        float * __restrict__ accum) {
+        const int * __restrict__ score_slots) {
     extern __shared__ float smem[];
 
     const int head_idx   = blockIdx.x;
@@ -831,19 +859,17 @@ static __global__ void paged_attention_obs_softmax_accum_kernel(
     const int tid        = threadIdx.x;
     const int head_dim   = blockDim.x;
     const int n_heads    = gridDim.x;
-    const int seq_start  = batch_offsets[seq_idx];
     const int num_tokens = batch_lens[seq_idx];
     const int token_idx  = obs_offset + obs_idx;
     if (obs_idx >= num_tokens || token_idx >= num_tokens || capture_from[seq_idx] < 0 || score_slots[seq_idx] < 0) {
         return;
     }
 
-    const int token_batch_idx = seq_start + token_idx;
     const int q_pos = context_lens[seq_idx] - num_tokens + token_idx;
     if (q_pos < capture_from[seq_idx]) {
         return;
     }
-    const float * score_row = scores + (((size_t) seq_idx * gridDim.z + obs_idx) * n_heads + head_idx) * max_context;
+    float * score_row = scores + (((size_t) seq_idx * gridDim.z + obs_idx) * n_heads + head_idx) * max_context;
 
     float local_max = -FLT_MAX;
     for (int token = tid; token <= q_pos; token += head_dim) {
@@ -860,14 +886,102 @@ static __global__ void paged_attention_obs_softmax_accum_kernel(
 
     for (int token = tid; token <= q_pos; token += head_dim) {
         const float w = __expf(score_row[token] - qk_max) * inv_sum;
-        const int bid = token / block_size;
-        if (bid < max_blocks) {
-            const int physical_block = block_table[seq_idx * max_blocks + bid];
-            if (physical_block >= 0) {
-                atomicAdd(&accum[(size_t) score_slots[seq_idx] * max_blocks + bid], w);
-            }
-        }
+        score_row[token] = w;
     }
+}
+
+// Reduce one observation chunk to one atomic add per token instead of one add
+// for every query/token pair.  The following page reduction is non-atomic and
+// reproduces the host-side max-pool-then-sum operation exactly.
+static __global__ void paged_attention_obs_token_reduce_kernel(
+        const float * __restrict__ scores,
+        const int * __restrict__ block_table,
+        const int * __restrict__ context_lens,
+        const int * __restrict__ batch_lens,
+        const int * __restrict__ capture_from,
+        const int * __restrict__ score_slots,
+        const size_t max_context,
+        const size_t token_stride,
+        const int block_size,
+        const int max_blocks,
+        const int n_heads,
+        const int obs_offset,
+        const int chunk_n,
+        float * __restrict__ token_accum) {
+    const int head_idx = blockIdx.y;
+    const int seq_idx  = blockIdx.z;
+    const size_t token = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (head_idx >= n_heads || token >= max_context) {
+        return;
+    }
+
+    const int slot = score_slots[seq_idx];
+    if (slot < 0) {
+        return;
+    }
+
+    const int num_tokens = batch_lens[seq_idx];
+    float sum = 0.0f;
+    for (int obs_idx = 0; obs_idx < chunk_n; ++obs_idx) {
+        const int token_idx = obs_offset + obs_idx;
+        if (obs_idx >= num_tokens || token_idx >= num_tokens) {
+            continue;
+        }
+        const int q_pos = context_lens[seq_idx] - num_tokens + token_idx;
+        if (q_pos < capture_from[seq_idx] || (int) token > q_pos) {
+            continue;
+        }
+        const int bid = (int) token / block_size;
+        if (bid >= max_blocks || block_table[seq_idx * max_blocks + bid] < 0) {
+            continue;
+        }
+        const size_t score_idx = (((size_t) seq_idx * chunk_n + obs_idx) * n_heads + head_idx) * max_context + token;
+        sum += scores[score_idx];
+    }
+
+    if (sum != 0.0f) {
+        const size_t token_idx = ((size_t) slot * n_heads + head_idx) * token_stride + token;
+        atomicAdd(&token_accum[token_idx], sum);
+    }
+}
+
+static __global__ void paged_attention_snapkv_page_reduce_kernel(
+        const float * __restrict__ token_accum,
+        float * __restrict__ page_accum,
+        const int * __restrict__ score_slots,
+        const size_t max_context,
+        const size_t token_stride,
+        const int block_size,
+        const int max_blocks,
+        const int n_heads) {
+    const int bid      = blockIdx.x * blockDim.x + threadIdx.x;
+    const int head_idx = blockIdx.y;
+    const int seq_idx  = blockIdx.z;
+    if (bid >= max_blocks || head_idx >= n_heads) {
+        return;
+    }
+
+    const int slot = score_slots[seq_idx];
+    if (slot < 0) {
+        return;
+    }
+
+    constexpr int pool_radius = 2; // five-token max pool, matching the old CPU path
+    const size_t token_base = ((size_t) slot * n_heads + head_idx) * token_stride;
+    const size_t token_begin = (size_t) bid * block_size;
+    const size_t token_end = min(max_context, token_begin + (size_t) block_size);
+    float page_score = 0.0f;
+    for (size_t token = token_begin; token < token_end; ++token) {
+        const size_t pool_begin = token > (size_t) pool_radius ? token - pool_radius : 0;
+        const size_t pool_end = min(max_context, token + pool_radius + 1);
+        float pooled = 0.0f;
+        for (size_t neighbor = pool_begin; neighbor < pool_end; ++neighbor) {
+            pooled = fmaxf(pooled, token_accum[token_base + neighbor]);
+        }
+        page_score += pooled;
+    }
+
+    page_accum[((size_t) slot * n_heads + head_idx) * max_blocks + bid] = page_score;
 }
 
 static int paged_attn_flash_decode_gqa(int gqa_ratio);
@@ -892,11 +1006,13 @@ static void paged_attn_snapkv_capture(
         const int head_dim,
         const int block_size,
         const int max_blocks,
+        const int score_blocks,
         const float scale,
         const int * capture_from_by_seq,
         const int * score_slots_by_seq,
-        float * accum) {
-    if (capture_from_by_seq == nullptr || score_slots_by_seq == nullptr || accum == nullptr) {
+        float * page_accum,
+        float * token_accum) {
+    if (capture_from_by_seq == nullptr || score_slots_by_seq == nullptr || page_accum == nullptr || token_accum == nullptr) {
         return;
     }
     const int gqa_ratio = n_heads / n_heads_kv;
@@ -904,19 +1020,33 @@ static void paged_attn_snapkv_capture(
     const int obs_offset = 0;
     const int active_context = ((const int32_t *) ((const float *) dst->op_params + 1))[2];
     const size_t max_context = (size_t) ((active_context + block_size - 1) / block_size) * block_size;
+    const size_t token_stride = (size_t) score_blocks * block_size;
 
+    const int obs_chunk = paged_attn_snapkv_observation_chunk(max_context, n_heads, n_seq);
     auto launch_obs = [&](auto launch_scores) {
-        for (int chunk_beg = 0; chunk_beg < n_obs; chunk_beg += PAGED_ATTN_OBS_CHUNK) {
-            const int chunk_n = std::min(PAGED_ATTN_OBS_CHUNK, n_obs - chunk_beg);
+        for (int chunk_beg = 0; chunk_beg < n_obs; chunk_beg += obs_chunk) {
+            const int chunk_n = std::min(obs_chunk, n_obs - chunk_beg);
             ggml_cuda_pool_alloc<float> scores(ctx.pool(),
                 (size_t) n_seq * chunk_n * n_heads * max_context);
             launch_scores(chunk_n, obs_offset + chunk_beg, scores.ptr);
             const size_t reduce_smem = (size_t) ((head_dim + 31) / 32) * sizeof(float);
             paged_attention_obs_softmax_accum_kernel<<<
                 dim3(n_heads, n_seq, chunk_n), dim3(head_dim), reduce_smem, ctx.stream()>>>(
+                    scores.ptr, (const int *) context_lens->data, (const int *) batch_lens->data,
+                    max_context, obs_offset + chunk_beg, capture_from_by_seq, score_slots_by_seq);
+            constexpr int reduce_threads = 256;
+            paged_attention_obs_token_reduce_kernel<<<
+                dim3((max_context + reduce_threads - 1) / reduce_threads, n_heads, n_seq),
+                dim3(reduce_threads), 0, ctx.stream()>>>(
                     scores.ptr, (const int *) block_table->data, (const int *) context_lens->data,
-                    (const int *) batch_offsets->data, (const int *) batch_lens->data,
-                    max_context, block_size, max_blocks, obs_offset + chunk_beg, capture_from_by_seq, score_slots_by_seq, accum);
+                    (const int *) batch_lens->data, capture_from_by_seq, score_slots_by_seq,
+                    max_context, token_stride, block_size, max_blocks, n_heads,
+                    obs_offset + chunk_beg, chunk_n, token_accum);
+            if (paged_attn_snapkv_sync_debug() && active_context >= 45000 && chunk_beg + chunk_n == n_obs) {
+                fprintf(stderr, "SNAPKVDBG dims active_context=%d max_context=%zu max_blocks=%d score_blocks=%d n_heads=%d n_seq=%d obs_chunk=%d token_stride=%zu\n",
+                        active_context, max_context, max_blocks, score_blocks, n_heads, n_seq, obs_chunk, token_stride);
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            }
         }
     };
 
@@ -959,6 +1089,16 @@ static void paged_attn_snapkv_capture(
             });
         }
 #undef SNAPKV_OBS_GQA_CASE
+    }
+
+    constexpr int reduce_threads = 256;
+    paged_attention_snapkv_page_reduce_kernel<<<
+        dim3((score_blocks + reduce_threads - 1) / reduce_threads, n_heads, n_seq),
+        dim3(reduce_threads), 0, ctx.stream()>>>(
+            token_accum, page_accum, score_slots_by_seq, max_context, token_stride,
+            block_size, score_blocks, n_heads);
+    if (paged_attn_snapkv_sync_debug() && active_context >= 45000) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     }
 }
 
@@ -1212,6 +1352,8 @@ static void ggml_cuda_op_paged_attn_quantized(ggml_backend_cuda_context & ctx, g
     const int n_seq           = batch_lens->ne[0];
     const int n_heads_kv      = k_new->ne[1];
     const int n_tokens        = q->ne[2];
+    const bool snapkv_streaming = paged_attn_snapkv_streaming(op_params_f);
+    const int snapkv_score_blocks = paged_attn_snapkv_score_blocks(op_params_f, max_blocks);
 
     GGML_ASSERT(head_dim % QK == 0 && "paged quantized KV head_dim must align to its quantization block size");
     GGML_ASSERT(head_dim % 32 == 0 && head_dim <= 1024);
@@ -1229,24 +1371,26 @@ static void ggml_cuda_op_paged_attn_quantized(ggml_backend_cuda_context & ctx, g
         stride_token, stride_head, stride_block, n_heads_kv, block_size);
 
     float * snapkv_accum = paged_attn_snapkv_accum(op_params_f);
+    float * snapkv_token_scores = paged_attn_snapkv_token_scores(op_params_f);
     const int * snapkv_capture_from = paged_attn_snapkv_capture_from(op_params_f);
     const int * snapkv_score_slots = paged_attn_snapkv_score_slots(op_params_f);
-    if (snapkv_accum != nullptr) {
+    if (snapkv_accum != nullptr && snapkv_token_scores != nullptr) {
         paged_attn_snapkv_capture<block_t, true>(
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,
-            head_dim, block_size, max_blocks, scale, snapkv_capture_from, snapkv_score_slots, snapkv_accum);
+            head_dim, block_size, max_blocks, snapkv_score_blocks, scale, snapkv_capture_from, snapkv_score_slots,
+            snapkv_accum, snapkv_token_scores);
     }
 
-    if (ggml_cuda_paged_attn_prefill<block_t, true>(
+    if (!snapkv_streaming && ggml_cuda_paged_attn_prefill<block_t, true>(
             ctx, dst, q, k_new, kv_cache, block_table, batch_lens,
             stride_token, stride_head, stride_block, block_size, max_blocks, scale)) {
         return;
     }
 
     const int contiguous_base = n_seq == 1
-        ? ((const int32_t *) (op_params_f + 1))[3] - 1 : -1;
-    if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS) {
+        ? ((const int32_t *) (op_params_f + 1))[13] - 1 : -1;
+    if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || snapkv_streaming) {
         paged_attn_flash_decode<block_t, true>(
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,
@@ -1283,6 +1427,8 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int n_seq      = batch_lens->ne[0];
     const int n_heads_kv = k_new->ne[1];
     const int n_tokens   = q->ne[2];
+    const bool snapkv_streaming = paged_attn_snapkv_streaming(op_params_f);
+    const int snapkv_score_blocks = paged_attn_snapkv_score_blocks(op_params_f, max_blocks);
 
     GGML_ASSERT(n_heads != 0 && "n_head cannot be 0.");
     GGML_ASSERT(n_heads_kv != 0 && "n_heads_kv cannot be 0.");
@@ -1292,6 +1438,7 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT(n_tokens <= 65535 && "paged CUDA token batch exceeds grid.z limit");
 
     float * snapkv_accum = paged_attn_snapkv_accum(op_params_f);
+    float * snapkv_token_scores = paged_attn_snapkv_token_scores(op_params_f);
     const int * snapkv_capture_from = paged_attn_snapkv_capture_from(op_params_f);
     const int * snapkv_score_slots = paged_attn_snapkv_score_slots(op_params_f);
 
@@ -1319,22 +1466,23 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const int *) write_slots->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
         stride_token, stride_head, stride_block, n_heads_kv, block_size);
 
-    if (snapkv_accum != nullptr) {
+    if (snapkv_accum != nullptr && snapkv_token_scores != nullptr) {
         paged_attn_snapkv_capture<half, false>(
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,
-            head_dim, block_size, max_blocks, scale, snapkv_capture_from, snapkv_score_slots, snapkv_accum);
+            head_dim, block_size, max_blocks, snapkv_score_blocks, scale, snapkv_capture_from, snapkv_score_slots,
+            snapkv_accum, snapkv_token_scores);
     }
 
-    if (ggml_cuda_paged_attn_prefill<half, false>(
+    if (!snapkv_streaming && ggml_cuda_paged_attn_prefill<half, false>(
             ctx, dst, q, k_new, kv_cache, block_table, batch_lens,
             stride_token, stride_head, stride_block, block_size, max_blocks, scale)) {
         return;
     }
 
     const int contiguous_base = n_seq == 1
-        ? ((const int32_t *) (op_params_f + 1))[3] - 1 : -1;
-    if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS) {
+        ? ((const int32_t *) (op_params_f + 1))[13] - 1 : -1;
+    if (n_tokens <= PAGED_ATTN_PARALLEL_MAX_TOKENS || snapkv_streaming) {
         paged_attn_flash_decode<half, false>(
             ctx, dst, q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
             stride_token, stride_head, stride_block, n_heads, n_heads_kv, n_seq, n_tokens,

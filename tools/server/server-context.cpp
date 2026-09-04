@@ -3522,6 +3522,14 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        const int32_t snapkv_prefill_end = slot.task->n_tokens();
+                        if (getenv("LLAMA_SNAPKV_DEBUG")) {
+                            fprintf(stderr, "SNAPKVDBG server_prefill_hint seq=%d expected_prefill_end=%d\n",
+                                    slot.id, snapkv_prefill_end);
+                        }
+                        llama_set_snapkv_prefill_end(ctx_tgt, slot.id, snapkv_prefill_end);
+                        llama_set_snapkv_prefill_end(ctx_dft, slot.id, snapkv_prefill_end);
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {

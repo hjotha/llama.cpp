@@ -1243,7 +1243,9 @@ ggml_tensor * build_attn_mha_paged(
                  int   block_size,
                  int   max_blocks,
                  int   active_context,
-         ggml_tensor * snapkv_scores,   // [max_blocks, batch_size] page importance accumulator, nullable
+         bool   snapkv_streaming,
+         ggml_tensor * snapkv_scores,   // [max_blocks * n_heads, batch_size] page scores, nullable
+         ggml_tensor * snapkv_token_scores, // [max_blocks * block_size * n_heads, batch_size]
          ggml_tensor * snapkv_capture_from,
          ggml_tensor * snapkv_score_slots) const;
 

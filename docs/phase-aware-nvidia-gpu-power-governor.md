@@ -222,11 +222,14 @@ Permissions`; the governor logged the error and disabled further writes, as
 designed. The fake backend test covers successful writes and restoration.
 
 The pytest server suite was not run because `pytest` is not installed in this
-environment. After explicit deployment, the user unit
-`~/.config/systemd/user/llama-server.service` points to the committed
-`build/bin/llama-server` and enables the `200/165/0` profiles. A real production
-request returned successfully and the service stayed healthy. The host denied
-the decode write with `NVML code 4: Insufficient Permissions`, so the governor
-disabled itself and the device remained at 200 W. Router deployments with
-multiple independent processes targeting the same physical GPU remain
-unsupported because the power limit is device-global.
+environment. After explicit deployment, the system unit
+`/etc/systemd/system/llama-server-root.service` runs the committed
+`build/bin/llama-server` as root and enables the `200/165/0` profiles. The
+previous user unit remains at
+`~/.config/systemd/user/llama-server.service`, disabled for rollback. Real
+production requests returned successfully and the service stayed healthy. The
+root process produced the transitions `idle -> prefill -> decode -> idle`, and
+`nvidia-smi` confirmed the active decode limit at 165 W. A controlled stop
+restored the original 200 W limit before the service was started again. Router
+deployments with multiple independent processes targeting the same physical GPU
+remain unsupported because the power limit is device-global.

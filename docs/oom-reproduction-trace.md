@@ -140,6 +140,23 @@ previous `ctx-checkpoints 0` failure is therefore fixed; the setting is not
 itself an invalid or crashing mode. The failure was the CUDA graph
 capture/update and allocation-fragmentation bug described below.
 
+### Follow-up test with `--ctx-checkpoints 2`
+
+The same current binary was then tested with `--ctx-checkpoints 2`. The first
+eight completion cases and the 38,359-token chat completed successfully. The
+final temporary chat run was interrupted before its result could be recorded.
+After promotion to production, a fresh long chat request with approximately
+50,000 prompt tokens caused a real failure: the server processed 49,945 tokens
+and aborted in `cudaGraphInstantiate` with CUDA OOM. systemd recorded a core
+dump and restarted the service (`NRestarts=1`).
+
+The production configuration was immediately reverted to
+`--ctx-checkpoints 1`, which remains the validated setting. This indicates
+that two persistent checkpoints add enough state/allocation pressure in this
+12 GB configuration to cross the remaining CUDA graph margin for some prompt
+shapes. `--ctx-checkpoints 2` is therefore not promoted or recommended for
+this deployment, even though the original graph-capture bug is fixed.
+
 ## Clean upstream comparison
 
 The intact upstream binaries passed a first-request chat at 50,175 tokens:

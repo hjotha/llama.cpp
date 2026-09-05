@@ -1,9 +1,9 @@
 # OOM reproduction trace
 
 Status: root cause isolated to repeated CUDA graph capture/update under very
-tight VRAM. A backend fix was validated with CUDA graphs enabled. This record
-is for the RTX 4070 12 GB production model and configuration below, not a
-general CUDA limit.
+tight VRAM. A backend fix was validated with CUDA graphs enabled, both with
+context checkpoints enabled and disabled. This record is for the RTX 4070
+12 GB production model and configuration below, not a general CUDA limit.
 
 ## Configuration
 
@@ -107,11 +107,38 @@ graph shapes. It is not proof of a single leaked allocation: the CUDA
 allocator may retain graph/workspace blocks by design, or the fork's graph
 inputs may prevent correct reuse/eviction.
 
-Disabling context checkpoints was also tested separately. With CUDA graphs
-enabled, `--cache-ram 4096`, and `--ctx-checkpoints 0`, the process still
-crashed during the third request of the sequence. The log contained zero
-context-checkpoint events. Checkpoints can add memory pressure, but they are
-not the root cause for this model and reproduction.
+Before the backend fix, disabling context checkpoints was also tested
+separately. With CUDA graphs enabled, `--cache-ram 4096`, and
+`--ctx-checkpoints 0`, the process crashed during the third request of the
+sequence. The log contained zero context-checkpoint events. Checkpoints can
+add memory pressure, but they were not the root cause for this model and
+reproduction.
+
+### Post-fix validation with `--ctx-checkpoints 0`
+
+On 2026-09-05, the current binary (`acf5ea5b0`) was tested from a clean
+server start with CUDA graphs enabled, `--cache-ram 4096`, the same RTX 4070
+configuration, and `--ctx-checkpoints 0`. The complete sequence passed:
+
+| Step | Endpoint | Prompt tokens | Generated | Result |
+|---:|---|---:|---:|---|
+| 1 | completion | 36,864 | 64 | HTTP 200 |
+| 2 | completion | 38,308 | 4,096 | HTTP 200 |
+| 3 | completion | 50,176 | 4,094 | HTTP 200 |
+| 4 | completion | 43,008 | 256 | HTTP 200 |
+| 5 | completion | 48,128 | 1,024 | HTTP 200; 36,927 cached |
+| 6 | completion | 24,576 | 256 | HTTP 200 |
+| 7 | completion | 40,960 | 512 | HTTP 200 |
+| 8 | completion | 32,768 | 1,024 | HTTP 200 |
+| 9 | chat | 38,359 | 386 | HTTP 200; stop |
+| 10 | chat | 50,175 | 149 | HTTP 200; stop |
+
+The server remained alive for all ten requests, with no CUDA OOM, core dump,
+empty reply, or restart. The test log contained no persistent context
+checkpoint events, confirming that the result exercises the `0` setting. The
+previous `ctx-checkpoints 0` failure is therefore fixed; the setting is not
+itself an invalid or crashing mode. The failure was the CUDA graph
+capture/update and allocation-fragmentation bug described below.
 
 ## Clean upstream comparison
 
@@ -161,8 +188,10 @@ GGML_CUDA_GRAPH_DEBUG=1
 ```
 
 The corrected binary passed all ten requests with CUDA graphs enabled,
-`--cache-ram 4096`, and `--ctx-checkpoints 1`. The final 50,175-token chat
-returned HTTP 200, the process remained alive, and no restart occurred.
+`--cache-ram 4096`, and `--ctx-checkpoints 1`. The same corrected binary also
+passed the complete sequence with `--ctx-checkpoints 0`; the final 50,175-token
+chat returned HTTP 200 in both runs, the process remained alive, and no
+restart occurred.
 Across the eight completion requests, the previous graph-enabled behavior
 averaged 586.990 prompt tok/s and 49.113 decode tok/s; the fix averaged 586.261
 and 49.107 tok/s respectively (approximately -0.12% and -0.01%). Production

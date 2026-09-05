@@ -1244,6 +1244,7 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_memory_pressure = false;
     bool warmup_complete = false;
     int                          warmup_stable_calls     = 0;
     size_t                       capture_count           = 0;
@@ -1260,7 +1261,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_memory_pressure || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1432,6 +1433,7 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    bool disable_cuda_graphs_due_to_memory_pressure = false;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1454,6 +1456,7 @@ struct ggml_backend_cuda_context {
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
+        it->second->disable_due_to_memory_pressure = disable_cuda_graphs_due_to_memory_pressure;
         it->second->last_used_time = time_now;
         return it->second.get();
     }
@@ -1461,6 +1464,9 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {
+        if (disable_cuda_graphs_due_to_memory_pressure) {
+            return false;
+        }
         for (const auto & [key, graph] : cuda_graphs) {
             if (graph && graph->is_enabled()) {
                 return true;

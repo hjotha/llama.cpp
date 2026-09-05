@@ -1869,6 +1869,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (src0->type == GGML_TYPE_IQ1_M && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        // IQ1_M has no MMQ kernel. Use bounded MMVQ batches instead of materializing
+        // the entire weight matrix in FP16 for cuBLAS (170 MiB for a 5120x17408 FFN).
+        for (int64_t col = 0; col < ne11; col += MMVQ_MAX_BATCH_SIZE) {
+            const int64_t ncols = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ne11 - col);
+            ggml_tensor src1_batch = *src1;
+            ggml_tensor dst_batch = *dst;
+            src1_batch.ne[1] = dst_batch.ne[1] = ncols;
+            src1_batch.nb[2] = src1_batch.nb[3] = src1_batch.nb[1] * ncols;
+            dst_batch.nb[2] = dst_batch.nb[3] = dst_batch.nb[1] * ncols;
+            src1_batch.data = (char *) src1->data + col * src1->nb[1];
+            dst_batch.data = (char *) dst->data + col * dst->nb[1];
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_batch, nullptr, &dst_batch);
+        }
+        return;
+    }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
@@ -2638,7 +2655,47 @@ static void ggml_cuda_graph_debug_log(ggml_backend_cuda_context * cuda_ctx,
         (void) cudaGetLastError();
     }
 
+#if defined(GGML_USE_VMM)
+    if (ggml_cuda_info().devices[cuda_ctx->device].vmm) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            const auto & pool = cuda_ctx->pools[cuda_ctx->device][stream];
+            if (pool) {
+                const auto * vmm = static_cast<const ggml_cuda_pool_vmm *>(pool.get());
+                fprintf(stderr, "CUDA graph pool: context=%p stream=%d mapped=%.2f MiB used=%.2f MiB\n",
+                        (void *) cuda_ctx, stream, vmm->pool_size / (1024.0 * 1024.0), vmm->pool_used / (1024.0 * 1024.0));
+            }
+        }
+    }
+#endif
     fflush(stderr);
+}
+
+static bool ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    GGML_ASSERT(graph->instance == nullptr);
+
+    const cudaError_t status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+    if (status == cudaSuccess) {
+        ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "instantiate");
+        return true;
+    }
+
+    if (status != cudaErrorMemoryAllocation) {
+        CUDA_CHECK(status);
+    }
+
+    (void) cudaGetLastError();
+    ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "instantiate-oom");
+    GGML_LOG_WARN("%s: CUDA graph instantiation ran out of memory; falling back to direct execution\n", __func__);
+
+    CUDA_CHECK(cudaGraphDestroy(graph->graph));
+    graph->graph = nullptr;
+    cuda_ctx->disable_cuda_graphs_due_to_memory_pressure = true;
+    graph->disable_due_to_memory_pressure = true;
+    graph->warmup_complete = false;
+    graph->warmup_stable_calls = 0;
+    return false;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2683,7 +2740,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     graph->update_count++;
@@ -2709,12 +2766,16 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        if (!ggml_cuda_graph_instantiate(cuda_ctx, graph_key)) {
+            return false;
+        }
         ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "update-reinstantiate");
     } else {
         GGML_ASSERT(stat == cudaSuccess);
         ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "update-complete");
     }
+
+    return true;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4443,13 +4504,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-            ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "instantiate");
+            if (!ggml_cuda_graph_instantiate(cuda_ctx, graph_key)) {
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+                return;
+            }
         } else if (cuda_graph_update_required) {  // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            if (!ggml_cuda_graph_update_executable(cuda_ctx, graph_key)) {
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+                return;
+            }
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (cuda_graph_update_required) {
+            ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "launch-after-capture");
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;

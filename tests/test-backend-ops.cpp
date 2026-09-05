@@ -9499,6 +9499,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
     }
 
+    // IQ1_M falls back to several MMVQ batches when MMQ is unavailable. Exercise
+    // partial final batches, odd row counts, and the 5120-element FFN input size.
+    for (int n : {9, 15, 16, 17, 31, 32, 63, 64, 65}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ1_M, GGML_TYPE_F32, 33, n, 5120, {1, 1}, {1, 1}));
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {

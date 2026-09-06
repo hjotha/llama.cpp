@@ -107,6 +107,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-hft, --hf-token TOKEN` | Hugging Face access token (default: value from HF_TOKEN environment variable)<br/>(env: HF_TOKEN) |
 | `--log-disable` | Log disable |
 | `--log-file FNAME` | Log to file<br/>(env: LLAMA_ARG_LOG_FILE) |
+| `--log-jsonl, --no-log-jsonl` | Log as JSONL (one JSON object per line) to stdout, this also disables colored logging (default: disabled)<br/>(env: LLAMA_ARG_LOG_JSONL) |
 | `--log-colors [on\|off\|auto]` | Set colored logging ('on', 'off', or 'auto', default: 'auto')<br/>'auto' enables colors when output is to a terminal<br/>(env: LLAMA_ARG_LOG_COLORS) |
 | `-v, --verbose, --log-verbose` | Set verbosity level to infinity (i.e. log all messages, useful for debugging) |
 | `--offline` | Offline mode: forces use of cache, prevents network access<br/>(env: LLAMA_ARG_OFFLINE) |

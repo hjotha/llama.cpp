@@ -1095,6 +1095,86 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    // IQ1_M has two per-block scales and four per-quant deltas, so the dot product
+    // needs two separate 16-value sums. The dp4a layout is used on all hardware.
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_S, I);
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_ds = (half2 *) (x_qs + txs.qs);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR1_M);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_m * bxi = (const block_iq1_m *) x + kbx0 + i*stride;
+
+        const int       qs4 = get_int_b4(bxi->qs, kqsx);
+        const uint8_t * qs  = (const uint8_t *) &qs4;
+        const uint8_t   qh0 = bxi->qh[2*kqsx + 0];
+        const uint8_t   qh1 = bxi->qh[2*kqsx + 1];
+
+        int sgn[4];
+        sgn[0] = (qh0 & 0x08) ? -1 : 1;
+        sgn[1] = (qh0 & 0x80) ? -1 : 1;
+        sgn[2] = (qh1 & 0x08) ? -1 : 1;
+        sgn[3] = (qh1 & 0x80) ? -1 : 1;
+
+#pragma unroll
+        for (int l = 0; l < QR1_M/2; ++l) {
+            const int qhb = (l < 2) ? qh0 : qh1;
+            const int ql  = qs[l] | (((qhb >> (4*(l%2))) & 0x07) << 8);
+
+            const int grid = iq1s_grid_gpu[ql];
+
+            const int g0 = (grid >> 0) & 0x0F0F0F0F;
+            const int g1 = (grid >> 4) & 0x0F0F0F0F;
+
+            // Dequantized value is d*(v + delta). The grid lookup stores v+1 (bias).
+            // Store 8*v + sign(delta) per value so the delta is folded into the int8
+            // dot product and the bias cancels without needing a partial y sum.
+            int f0 = 0;
+            int f1 = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int v0 = ((g0 >> (8*b)) & 0xFF) - 1;
+                const int v1 = ((g1 >> (8*b)) & 0xFF) - 1;
+                const int e0 = 8*v0 + sgn[l];
+                const int e1 = 8*v1 + sgn[l];
+                f0 |= (e0 & 0xFF) << (8*b);
+                f1 |= (e1 & 0xFF) << (8*b);
+            }
+
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = f0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = f1;
+        }
+
+        const uint16_t * sc = (const uint16_t *) bxi->scales;
+
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d = __half2float(scale.f16);
+
+        const int tmp = sc[kqsx/2] >> (6*(kqsx%2));
+        const float dl0 = d * (2*((tmp >> 0) & 0x07) + 1);
+        const float dl1 = d * (2*((tmp >> 3) & 0x07) + 1);
+
+        x_ds[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = make_half2(dl0/8, dl1/8);
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq2_xxs(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

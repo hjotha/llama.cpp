@@ -1871,8 +1871,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (src0->type == GGML_TYPE_IQ1_M && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
-        // IQ1_M has no MMQ kernel. Use bounded MMVQ batches instead of materializing
-        // the entire weight matrix in FP16 for cuBLAS (170 MiB for a 5120x17408 FFN).
+        // Reached only if MMQ is unavailable (e.g. less than 48 KiB shared memory per block).
+        // Use bounded MMVQ batches instead of materializing the entire weight matrix in FP16
+        // for cuBLAS (170 MiB for a 5120x17408 FFN).
         for (int64_t col = 0; col < ne11; col += MMVQ_MAX_BATCH_SIZE) {
             const int64_t ncols = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ne11 - col);
             ggml_tensor src1_batch = *src1;

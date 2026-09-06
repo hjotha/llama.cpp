@@ -1100,12 +1100,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
 
-    // IQ1_M has two per-block scales and four per-quant deltas, so the dot product
-    // needs two separate 16-value sums. The dp4a layout is used on all hardware.
-    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_S, I);
+    // IQ1_M has two scales per 32 values, so it uses the same q8_0_16 tile layout as IQ2_XS:
+    // one float scale per 16 values, i.e. per 4 int32 of quantized data.
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int   * x_qs = (int   *)  x_tile;
-    half2 * x_ds = (half2 *) (x_qs + txs.qs);
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_M, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     constexpr int threads_per_row = MMQ_ITER_K / (4 * QR1_M);
     constexpr int nrows = warp_size / threads_per_row;
@@ -1157,8 +1163,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 f1 |= (e1 & 0xFF) << (8*b);
             }
 
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = f0;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = f1;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride               + 8*kqsx + (2*l+0)] = f0;
+            x_qs[i*sram_stride               + 8*kqsx + (2*l+1)] = f1;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + 8*kqsx + (2*l+0)] = f0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + 8*kqsx + (2*l+1)] = f1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
 
         const uint16_t * sc = (const uint16_t *) bxi->scales;
@@ -1168,10 +1179,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const float d = __half2float(scale.f16);
 
         const int tmp = sc[kqsx/2] >> (6*(kqsx%2));
-        const float dl0 = d * (2*((tmp >> 0) & 0x07) + 1);
-        const float dl1 = d * (2*((tmp >> 3) & 0x07) + 1);
 
-        x_ds[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = make_half2(dl0/8, dl1/8);
+        // The tile values are scaled by 8 to fold the +-1/8 delta into the int8 dot product.
+        const float dl0 = d * (2*((tmp >> 0) & 0x07) + 1) / 8;
+        const float dl1 = d * (2*((tmp >> 3) & 0x07) + 1) / 8;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                             + 2*kqsx+0] = dl0;
+        x_df[i*sram_stride                             + 2*kqsx+1] = dl1;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+0] = dl0;
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+1] = dl1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
 

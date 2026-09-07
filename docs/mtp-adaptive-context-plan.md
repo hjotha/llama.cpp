@@ -1,6 +1,22 @@
 # Plan: adaptive MTP disable based on a separate draft context size
 
-Status: design only, not implemented. Revised after tracing the code paths end to end
+> **SUPERSEDED — do not implement. See `docs/mtp-router-split-plan.md`.**
+>
+> The goal below (one process offering the full 97,280-token ceiling while still doing MTP
+> under a smaller draft budget) is arithmetically impossible on this model/GPU. Re-deriving
+> the numbers from `docs/kv-calibration-findings.md` shows the MTP draft KV is only
+> ~1.2 KiB/token out of ~19.3 KiB/token (6.8%); the real cost of MTP is ~358 MiB of fixed
+> context/workspace overhead plus ~334 MiB of extra weights in the `-mtp` GGUF. Capping the
+> draft context therefore raises the target ceiling from 54,272 to **at most ~57,900** — and
+> only by shrinking the draft budget to zero, i.e. by disabling the very speedup the plan
+> exists to keep. The remaining ~39,300 tokens are fixed costs that only a process boundary
+> can reclaim. Full derivation in section 1 of the router plan.
+>
+> The code-path analysis below stays on record because it is correct and non-obvious: the
+> always-on `common_speculative_process()` shadow decode (which would have turned
+> over-budget requests into 500s) and the five static-capability uses of `can_speculate()`.
+
+Status: superseded design, not implemented. Revised after tracing the code paths end to end
 (`common/speculative.cpp`, `tools/server/server-context.cpp`, `common/common.cpp`,
 `common/arg.cpp`, `src/llama-context.cpp`) plus the calibration data in
 `docs/kv-calibration-findings.md` (measured on GOKAYA, `192.168.1.57`).

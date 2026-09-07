@@ -240,6 +240,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--gpu-power-prefill W` | NVIDIA GPU power limit in watts during prompt processing (requires --gpu-power-decode)<br/>(env: LLAMA_ARG_GPU_POWER_PREFILL) |
 | `--gpu-power-decode W` | NVIDIA GPU power limit in watts during token generation (requires --gpu-power-prefill)<br/>(env: LLAMA_ARG_GPU_POWER_DECODE) |
 | `--gpu-power-device N` | NVML device index used by the NVIDIA GPU power governor (default: 0)<br/>(env: LLAMA_ARG_GPU_POWER_DEVICE) |
+| `--gpu-mem-clock-decode MHz` | NVIDIA GPU memory clock in MHz locked during token generation<br/>(env: LLAMA_ARG_GPU_MEM_CLOCK_DECODE) |
+| `--gpu-mem-clock-prefill MHz` | NVIDIA GPU memory clock in MHz locked during prompt processing<br/>(env: LLAMA_ARG_GPU_MEM_CLOCK_PREFILL) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |

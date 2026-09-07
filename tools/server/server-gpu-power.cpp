@@ -84,7 +84,15 @@ server_gpu_power_phase server_gpu_power_phase_arbitrator::phase() const {
 }
 
 bool server_gpu_power_config::enabled() const {
+    return power_enabled() || mem_clock_enabled();
+}
+
+bool server_gpu_power_config::power_enabled() const {
     return prefill_w != -1 || decode_w != -1;
+}
+
+bool server_gpu_power_config::mem_clock_enabled() const {
+    return mem_clock_decode > 0 || mem_clock_prefill > 0;
 }
 
 namespace {
@@ -102,6 +110,9 @@ using nvml_device_get_power_management_limit_constraints_t = nvml_return_t (*)(n
                                                                                unsigned int *);
 using nvml_device_get_power_management_limit_t             = nvml_return_t (*)(nvml_device_t, unsigned int *);
 using nvml_device_set_power_management_limit_t             = nvml_return_t (*)(nvml_device_t, unsigned int);
+using nvml_device_get_supported_memory_clocks_t            = nvml_return_t (*)(nvml_device_t, unsigned int *, unsigned int *);
+using nvml_device_set_memory_locked_clocks_t               = nvml_return_t (*)(nvml_device_t, unsigned int, unsigned int);
+using nvml_device_reset_memory_locked_clocks_t             = nvml_return_t (*)(nvml_device_t);
 using nvml_error_string_t                                  = const char * (*) (nvml_return_t);
 
 #if defined(_WIN32)
@@ -218,6 +229,20 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
         info.original_power_limit_mw = current_mw;
         info.min_power_limit_mw      = min_mw;
         info.max_power_limit_mw      = max_mw;
+
+        if (nvml_device_get_supported_memory_clocks_ != nullptr) {
+            unsigned int count = 0;
+            nvml_return_t clk_res = nvml_device_get_supported_memory_clocks_(device_, &count, nullptr);
+            if (count > 0) {
+                std::vector<unsigned int> clocks(count);
+                clk_res = nvml_device_get_supported_memory_clocks_(device_, &count, clocks.data());
+                if (clk_res == 0) {
+                    for (unsigned int c : clocks) {
+                        info.supported_mem_clocks_mhz.push_back(c);
+                    }
+                }
+            }
+        }
         return true;
 #else
         (void) info;
@@ -237,6 +262,38 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
         return check_result(result, "nvmlDeviceSetPowerManagementLimit", error);
 #else
         (void) power_limit_mw;
+        error = "NVML runtime loading is not supported on this platform";
+        return false;
+#endif
+    }
+
+    bool set_memory_locked_clocks(uint32_t min_mhz, uint32_t max_mhz, std::string & error) override {
+#if defined(_WIN32) || defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+        if (!initialized_ || device_ == nullptr || nvml_device_set_memory_locked_clocks_ == nullptr) {
+            error = "NVML backend memory locked clocks not supported or not initialized";
+            return false;
+        }
+
+        const nvml_return_t result = nvml_device_set_memory_locked_clocks_(device_, min_mhz, max_mhz);
+        return check_result(result, "nvmlDeviceSetMemoryLockedClocks", error);
+#else
+        (void) min_mhz;
+        (void) max_mhz;
+        error = "NVML runtime loading is not supported on this platform";
+        return false;
+#endif
+    }
+
+    bool reset_memory_locked_clocks(std::string & error) override {
+#if defined(_WIN32) || defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+        if (!initialized_ || device_ == nullptr || nvml_device_reset_memory_locked_clocks_ == nullptr) {
+            error = "NVML backend memory locked clocks not supported or not initialized";
+            return false;
+        }
+
+        const nvml_return_t result = nvml_device_reset_memory_locked_clocks_(device_);
+        return check_result(result, "nvmlDeviceResetMemoryLockedClocks", error);
+#else
         error = "NVML runtime loading is not supported on this platform";
         return false;
 #endif
@@ -304,6 +361,13 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
 
         server_gpu_power_resolve_symbol(library_, "nvmlErrorString", nvml_error_string_);
 
+        server_gpu_power_resolve_symbol(library_, "nvmlDeviceGetSupportedMemoryClocks",
+                                        nvml_device_get_supported_memory_clocks_);
+        server_gpu_power_resolve_symbol(library_, "nvmlDeviceSetMemoryLockedClocks",
+                                        nvml_device_set_memory_locked_clocks_);
+        server_gpu_power_resolve_symbol(library_, "nvmlDeviceResetMemoryLockedClocks",
+                                        nvml_device_reset_memory_locked_clocks_);
+
         if (!resolved) {
             error = "NVML runtime is missing one of the required symbols";
             return false;
@@ -339,6 +403,9 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
     nvml_device_get_power_management_limit_constraints_t nvml_device_get_power_management_limit_constraints_ = nullptr;
     nvml_device_get_power_management_limit_t             nvml_device_get_power_management_limit_             = nullptr;
     nvml_device_set_power_management_limit_t             nvml_device_set_power_management_limit_             = nullptr;
+    nvml_device_get_supported_memory_clocks_t            nvml_device_get_supported_memory_clocks_            = nullptr;
+    nvml_device_set_memory_locked_clocks_t               nvml_device_set_memory_locked_clocks_               = nullptr;
+    nvml_device_reset_memory_locked_clocks_t             nvml_device_reset_memory_locked_clocks_             = nullptr;
     nvml_error_string_t                                  nvml_error_string_                                  = nullptr;
 #endif
 };
@@ -363,21 +430,32 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         return true;
     }
 
-    if (config_.prefill_w <= 0 || config_.decode_w <= 0) {
-        LOG_ERR(
-            "GPU power governor requires both --gpu-power-prefill and --gpu-power-decode with positive watt values\n");
-        return false;
-    }
-
     if (config_.device < 0) {
-        LOG_ERR("GPU power governor device index must be non-negative\n");
+        LOG_ERR("GPU governor device index must be non-negative\n");
         return false;
     }
 
-    if (!server_gpu_power_w_to_mw(config_.prefill_w, prefill_power_limit_mw_) ||
-        !server_gpu_power_w_to_mw(config_.decode_w, decode_power_limit_mw_)) {
-        LOG_ERR("GPU power governor watt value is too large\n");
-        return false;
+    if (config_.power_enabled()) {
+        if (config_.prefill_w <= 0 || config_.decode_w <= 0) {
+            LOG_ERR(
+                "GPU power governor requires both --gpu-power-prefill and --gpu-power-decode with positive watt values\n");
+            return false;
+        }
+
+        if (!server_gpu_power_w_to_mw(config_.prefill_w, prefill_power_limit_mw_) ||
+            !server_gpu_power_w_to_mw(config_.decode_w, decode_power_limit_mw_)) {
+            LOG_ERR("GPU power governor watt value is too large\n");
+            return false;
+        }
+    }
+
+    if (config_.mem_clock_enabled()) {
+        if (config_.mem_clock_decode > 0) {
+            decode_mem_clock_mhz_ = static_cast<uint32_t>(config_.mem_clock_decode);
+        }
+        if (config_.mem_clock_prefill > 0) {
+            prefill_mem_clock_mhz_ = static_cast<uint32_t>(config_.mem_clock_prefill);
+        }
     }
 
     if (!backend_) {
@@ -386,42 +464,80 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
 
     std::string error;
     if (!backend_->init(config_.device, device_info_, error)) {
-        LOG_ERR("GPU power governor initialization failed: %s\n", error.c_str());
+        LOG_ERR("GPU governor initialization failed: %s\n", error.c_str());
         return false;
     }
     backend_initialized_ = true;
 
-    const auto validate_limit = [&](uint32_t power_mw, const char * profile) {
-        if (power_mw < device_info_.min_power_limit_mw || power_mw > device_info_.max_power_limit_mw) {
-            LOG_ERR("GPU power governor %s limit %s W is outside the allowed range %s-%s W\n", profile,
-                    server_gpu_power_mw_to_string(power_mw).c_str(),
-                    server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
-                    server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+    if (config_.power_enabled()) {
+        const auto validate_limit = [&](uint32_t power_mw, const char * profile) {
+            if (power_mw < device_info_.min_power_limit_mw || power_mw > device_info_.max_power_limit_mw) {
+                LOG_ERR("GPU power governor %s limit %s W is outside the allowed range %s-%s W\n", profile,
+                        server_gpu_power_mw_to_string(power_mw).c_str(),
+                        server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
+                        server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+                return false;
+            }
+            return true;
+        };
+
+        if (!validate_limit(prefill_power_limit_mw_, "prefill") || !validate_limit(decode_power_limit_mw_, "decode")) {
+            backend_->shutdown();
+            backend_initialized_ = false;
             return false;
         }
-        return true;
-    };
+    }
 
-    if (!validate_limit(prefill_power_limit_mw_, "prefill") || !validate_limit(decode_power_limit_mw_, "decode")) {
-        backend_->shutdown();
-        backend_initialized_ = false;
-        return false;
+    if (config_.mem_clock_enabled() && !device_info_.supported_mem_clocks_mhz.empty()) {
+        const auto is_supported = [&](uint32_t mhz) {
+            if (mhz == 0) return true;
+            for (uint32_t c : device_info_.supported_mem_clocks_mhz) {
+                if (c == mhz) return true;
+            }
+            return false;
+        };
+        if (decode_mem_clock_mhz_ > 0 && !is_supported(decode_mem_clock_mhz_)) {
+            LOG_ERR("GPU memory clock governor: decode clock %u MHz is not in the list of supported memory clocks\n",
+                    decode_mem_clock_mhz_);
+            backend_->shutdown();
+            backend_initialized_ = false;
+            return false;
+        }
+        if (prefill_mem_clock_mhz_ > 0 && !is_supported(prefill_mem_clock_mhz_)) {
+            LOG_ERR("GPU memory clock governor: prefill clock %u MHz is not in the list of supported memory clocks\n",
+                    prefill_mem_clock_mhz_);
+            backend_->shutdown();
+            backend_initialized_ = false;
+            return false;
+        }
     }
 
     phase_                       = server_gpu_power_phase::idle;
     transition_count_            = 0;
     last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
+    last_applied_mem_clock_mhz_  = 0;
+    mem_clock_locked_            = false;
     power_limit_changed_         = false;
     enabled_                     = true;
 
-    LOG_INF("GPU power governor enabled\n");
+    LOG_INF("GPU governor enabled\n");
     LOG_INF("  device: %s\n", device_info_.name.c_str());
     LOG_INF("  NVML index: %d\n", device_info_.device);
-    LOG_INF("  original PL: %s W\n", server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str());
-    LOG_INF("  allowed range: %s-%s W\n", server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
-            server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
-    LOG_INF("  prefill PL: %s W\n", server_gpu_power_mw_to_string(prefill_power_limit_mw_).c_str());
-    LOG_INF("  decode PL: %s W\n", server_gpu_power_mw_to_string(decode_power_limit_mw_).c_str());
+    if (config_.power_enabled()) {
+        LOG_INF("  original PL: %s W\n", server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str());
+        LOG_INF("  allowed range: %s-%s W\n", server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
+                server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+        LOG_INF("  prefill PL: %s W\n", server_gpu_power_mw_to_string(prefill_power_limit_mw_).c_str());
+        LOG_INF("  decode PL: %s W\n", server_gpu_power_mw_to_string(decode_power_limit_mw_).c_str());
+    }
+    if (config_.mem_clock_enabled()) {
+        if (decode_mem_clock_mhz_ > 0) {
+            LOG_INF("  decode memory clock: %u MHz\n", decode_mem_clock_mhz_);
+        }
+        if (prefill_mem_clock_mhz_ > 0) {
+            LOG_INF("  prefill memory clock: %u MHz\n", prefill_mem_clock_mhz_);
+        }
+    }
     return true;
 }
 
@@ -434,29 +550,60 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
     phase_                                = phase;
     transition_count_++;
 
-    if (phase == server_gpu_power_phase::idle) {
-        LOG_INF("GPU power: %s -> idle\n", server_gpu_power_phase_name(previous));
-        return;
+    if (config_.power_enabled()) {
+        if (phase == server_gpu_power_phase::idle) {
+            LOG_INF("GPU power: %s -> idle\n", server_gpu_power_phase_name(previous));
+        } else {
+            const uint32_t target = phase == server_gpu_power_phase::prefill ? prefill_power_limit_mw_ : decode_power_limit_mw_;
+            if (target != last_applied_power_limit_mw_) {
+                std::string error;
+                if (!backend_->set_power_limit(target, error)) {
+                    disable_after_error(error);
+                    return;
+                }
+
+                last_applied_power_limit_mw_ = target;
+                power_limit_changed_         = target != device_info_.original_power_limit_mw;
+                LOG_INF("GPU power: %s -> %s, limit %s W\n", server_gpu_power_phase_name(previous),
+                        server_gpu_power_phase_name(phase), server_gpu_power_mw_to_string(target).c_str());
+            }
+        }
     }
 
-    const uint32_t target = phase == server_gpu_power_phase::prefill ? prefill_power_limit_mw_ : decode_power_limit_mw_;
+    if (config_.mem_clock_enabled()) {
+        uint32_t target_mem = 0;
+        if (phase == server_gpu_power_phase::decode) {
+            target_mem = decode_mem_clock_mhz_;
+        } else if (phase == server_gpu_power_phase::prefill) {
+            target_mem = prefill_mem_clock_mhz_;
+        } else {
+            target_mem = 0;
+        }
 
-    if (target == last_applied_power_limit_mw_) {
-        LOG_INF("GPU power: %s -> %s, limit %s W\n", server_gpu_power_phase_name(previous),
-                server_gpu_power_phase_name(phase), server_gpu_power_mw_to_string(target).c_str());
-        return;
+        if (target_mem != last_applied_mem_clock_mhz_) {
+            std::string error;
+            if (target_mem > 0) {
+                if (!backend_->set_memory_locked_clocks(target_mem, target_mem, error)) {
+                    disable_after_error(error);
+                    return;
+                }
+                mem_clock_locked_ = true;
+                LOG_INF("GPU memory clock: %s -> %s, locked %u MHz\n", server_gpu_power_phase_name(previous),
+                        server_gpu_power_phase_name(phase), target_mem);
+            } else {
+                if (mem_clock_locked_) {
+                    if (!backend_->reset_memory_locked_clocks(error)) {
+                        disable_after_error(error);
+                        return;
+                    }
+                    mem_clock_locked_ = false;
+                    LOG_INF("GPU memory clock: %s -> %s, reset (dynamic)\n", server_gpu_power_phase_name(previous),
+                            server_gpu_power_phase_name(phase));
+                }
+            }
+            last_applied_mem_clock_mhz_ = target_mem;
+        }
     }
-
-    std::string error;
-    if (!backend_->set_power_limit(target, error)) {
-        disable_after_error(error);
-        return;
-    }
-
-    last_applied_power_limit_mw_ = target;
-    power_limit_changed_         = target != device_info_.original_power_limit_mw;
-    LOG_INF("GPU power: %s -> %s, limit %s W\n", server_gpu_power_phase_name(previous),
-            server_gpu_power_phase_name(phase), server_gpu_power_mw_to_string(target).c_str());
 }
 
 void server_gpu_power::on_sleeping(bool sleeping) {
@@ -472,6 +619,9 @@ void server_gpu_power::on_sleeping(bool sleeping) {
     if (!power_limit_changed_) {
         last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
     }
+    if (!mem_clock_locked_) {
+        last_applied_mem_clock_mhz_ = 0;
+    }
 }
 
 void server_gpu_power::shutdown() {
@@ -481,9 +631,11 @@ void server_gpu_power::shutdown() {
         backend_initialized_ = false;
     }
 
-    enabled_             = false;
-    phase_               = server_gpu_power_phase::idle;
-    power_limit_changed_ = false;
+    enabled_                    = false;
+    phase_                      = server_gpu_power_phase::idle;
+    power_limit_changed_        = false;
+    mem_clock_locked_           = false;
+    last_applied_mem_clock_mhz_ = 0;
 }
 
 bool server_gpu_power::enabled() const {
@@ -499,23 +651,38 @@ const server_gpu_power_device_info & server_gpu_power::device_info() const {
 }
 
 bool server_gpu_power::restore_original() {
-    if (!backend_initialized_ || !power_limit_changed_) {
+    if (!backend_initialized_) {
         return true;
     }
 
-    std::string error;
-    if (!backend_->set_power_limit(device_info_.original_power_limit_mw, error)) {
-        LOG_WRN("GPU power: failed to restore original limit %s W: %s\n",
-                server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str(), error.c_str());
-        return false;
+    bool success = true;
+    if (power_limit_changed_) {
+        std::string error;
+        if (!backend_->set_power_limit(device_info_.original_power_limit_mw, error)) {
+            LOG_WRN("GPU power: failed to restore original limit %s W: %s\n",
+                    server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str(), error.c_str());
+            success = false;
+        } else {
+            last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
+            power_limit_changed_         = false;
+        }
     }
 
-    last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
-    power_limit_changed_         = false;
-    return true;
+    if (mem_clock_locked_) {
+        std::string error;
+        if (!backend_->reset_memory_locked_clocks(error)) {
+            LOG_WRN("GPU memory clock: failed to reset memory locked clocks: %s\n", error.c_str());
+            success = false;
+        } else {
+            mem_clock_locked_           = false;
+            last_applied_mem_clock_mhz_ = 0;
+        }
+    }
+
+    return success;
 }
 
 void server_gpu_power::disable_after_error(const std::string & error) {
-    LOG_WRN("GPU power: disabling governor after power-limit error: %s\n", error.c_str());
+    LOG_WRN("GPU governor: disabling governor after error: %s\n", error.c_str());
     enabled_ = false;
 }

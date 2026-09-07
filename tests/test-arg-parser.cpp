@@ -287,6 +287,16 @@ static void test(void) {
         assert(power_params.gpu_power_decode == 165);
         assert(power_params.gpu_power_device == 1);
 
+        common_params mem_params;
+        argv = {
+            "binary_name",
+            "--gpu-mem-clock-decode", "10501",
+            "--gpu-mem-clock-prefill", "10251",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mem_params, LLAMA_EXAMPLE_SERVER));
+        assert(mem_params.gpu_mem_clock_decode == 10501);
+        assert(mem_params.gpu_mem_clock_prefill == 10251);
+
         common_params incomplete_power_params;
         argv = {"binary_name", "--gpu-power-prefill", "200"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), incomplete_power_params, LLAMA_EXAMPLE_SERVER));
@@ -392,6 +402,16 @@ static void test(void) {
     unsetenv("LLAMA_ARG_GPU_POWER_PREFILL");
     unsetenv("LLAMA_ARG_GPU_POWER_DECODE");
     unsetenv("LLAMA_ARG_GPU_POWER_DEVICE");
+
+    setenv("LLAMA_ARG_GPU_MEM_CLOCK_DECODE", "10501", true);
+    setenv("LLAMA_ARG_GPU_MEM_CLOCK_PREFILL", "10251", true);
+    common_params mem_env_params;
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mem_env_params, LLAMA_EXAMPLE_SERVER));
+    assert(mem_env_params.gpu_mem_clock_decode == 10501);
+    assert(mem_env_params.gpu_mem_clock_prefill == 10251);
+    unsetenv("LLAMA_ARG_GPU_MEM_CLOCK_DECODE");
+    unsetenv("LLAMA_ARG_GPU_MEM_CLOCK_PREFILL");
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");

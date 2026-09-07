@@ -3798,6 +3798,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_DEVICE"));
     add_opt(common_arg(
+        {"--gpu-mem-clock-decode"}, "MHz",
+        "NVIDIA GPU memory clock in MHz locked during token generation",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--gpu-mem-clock-decode must be positive");
+            }
+            params.gpu_mem_clock_decode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_MEM_CLOCK_DECODE"));
+    add_opt(common_arg(
+        {"--gpu-mem-clock-prefill"}, "MHz",
+        "NVIDIA GPU memory clock in MHz locked during prompt processing",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--gpu-mem-clock-prefill must be positive");
+            }
+            params.gpu_mem_clock_prefill = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_MEM_CLOCK_PREFILL"));
+    add_opt(common_arg(
         {"--cache-reuse"}, "N",
         string_format(
             "min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: %d)\n"

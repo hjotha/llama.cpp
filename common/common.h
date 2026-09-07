@@ -660,6 +660,10 @@ struct common_params {
     int32_t gpu_power_decode  = -1;
     int32_t gpu_power_device  = 0;
 
+    // NVIDIA GPU memory clock governor; -1 keeps the feature disabled
+    int32_t gpu_mem_clock_decode  = -1;
+    int32_t gpu_mem_clock_prefill = -1;
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

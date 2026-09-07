@@ -995,6 +995,8 @@ private:
             if (!gpu_power.init({
                     params_base.gpu_power_prefill,
                     params_base.gpu_power_decode,
+                    params_base.gpu_mem_clock_decode,
+                    params_base.gpu_mem_clock_prefill,
                     params_base.gpu_power_device,
                 })) {
                 GGML_ABORT("failed to reinitialize GPU power governor after sleeping");
@@ -1465,6 +1467,8 @@ private:
         if (!gpu_power.init({
                 params_base.gpu_power_prefill,
                 params_base.gpu_power_decode,
+                params_base.gpu_mem_clock_decode,
+                params_base.gpu_mem_clock_prefill,
                 params_base.gpu_power_device,
             })) {
             return false;

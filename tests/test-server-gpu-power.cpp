@@ -7,19 +7,23 @@
 #include <vector>
 
 struct fake_gpu_power_backend : server_gpu_power_backend {
-    int                   init_calls     = 0;
-    int                   set_calls      = 0;
-    int                   shutdown_calls = 0;
-    int                   fail_on_call   = 0;
+    int                   init_calls      = 0;
+    int                   set_calls       = 0;
+    int                   set_mem_calls   = 0;
+    int                   reset_mem_calls = 0;
+    int                   shutdown_calls  = 0;
+    int                   fail_on_call    = 0;
     std::vector<uint32_t> applied_limits;
+    std::vector<uint32_t> applied_mem_clocks;
 
     bool init(int32_t device, server_gpu_power_device_info & info, std::string &) override {
         init_calls++;
-        info.name                    = "fake NVIDIA device";
-        info.device                  = device;
-        info.original_power_limit_mw = 160000;
-        info.min_power_limit_mw      = 100000;
-        info.max_power_limit_mw      = 200000;
+        info.name                     = "fake NVIDIA device";
+        info.device                   = device;
+        info.original_power_limit_mw  = 160000;
+        info.min_power_limit_mw       = 100000;
+        info.max_power_limit_mw       = 200000;
+        info.supported_mem_clocks_mhz = { 10501, 10251, 5001, 810, 405 };
         return true;
     }
 
@@ -29,6 +33,20 @@ struct fake_gpu_power_backend : server_gpu_power_backend {
             return false;
         }
         applied_limits.push_back(power_limit_mw);
+        return true;
+    }
+
+    bool set_memory_locked_clocks(uint32_t, uint32_t max_mhz, std::string &) override {
+        set_mem_calls++;
+        if (set_mem_calls == fail_on_call) {
+            return false;
+        }
+        applied_mem_clocks.push_back(max_mhz);
+        return true;
+    }
+
+    bool reset_memory_locked_clocks(std::string &) override {
+        reset_mem_calls++;
         return true;
     }
 
@@ -58,78 +76,161 @@ int main() {
     assert(arbitrate({ server_gpu_power_slot_state::generating, server_gpu_power_slot_state::wait_other }) ==
            server_gpu_power_phase::decode);
 
-    auto             backend     = std::make_unique<fake_gpu_power_backend>();
-    auto *           backend_ptr = backend.get();
-    server_gpu_power governor(std::move(backend));
+    // 1. Test pure power governor
+    {
+        auto             backend     = std::make_unique<fake_gpu_power_backend>();
+        auto *           backend_ptr = backend.get();
+        server_gpu_power governor(std::move(backend));
 
-    assert(governor.init({ 200, 165, 0 }));
-    assert(governor.enabled());
-    assert(backend_ptr->init_calls == 1);
-    assert(backend_ptr->set_calls == 0);
+        assert(governor.init({ 200, 165, -1, -1, 0 }));
+        assert(governor.enabled());
+        assert(backend_ptr->init_calls == 1);
+        assert(backend_ptr->set_calls == 0);
 
-    governor.update(server_gpu_power_phase::prefill);
-    assert(backend_ptr->set_calls == 1);
-    assert(backend_ptr->applied_limits.back() == 200000);
+        governor.update(server_gpu_power_phase::prefill);
+        assert(backend_ptr->set_calls == 1);
+        assert(backend_ptr->applied_limits.back() == 200000);
 
-    governor.update(server_gpu_power_phase::prefill);
-    assert(backend_ptr->set_calls == 1);
+        governor.update(server_gpu_power_phase::prefill);
+        assert(backend_ptr->set_calls == 1);
 
-    governor.update(server_gpu_power_phase::decode);
-    assert(backend_ptr->set_calls == 2);
-    assert(backend_ptr->applied_limits.back() == 165000);
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_calls == 2);
+        assert(backend_ptr->applied_limits.back() == 165000);
 
-    governor.update(server_gpu_power_phase::idle);
-    assert(backend_ptr->set_calls == 2);
+        governor.update(server_gpu_power_phase::idle);
+        assert(backend_ptr->set_calls == 2);
 
-    governor.update(server_gpu_power_phase::idle);
-    assert(backend_ptr->set_calls == 2);
+        governor.update(server_gpu_power_phase::idle);
+        assert(backend_ptr->set_calls == 2);
 
-    governor.update(server_gpu_power_phase::decode);
-    assert(backend_ptr->set_calls == 2);
-    assert(backend_ptr->applied_limits.back() == 165000);
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_calls == 2);
+        assert(backend_ptr->applied_limits.back() == 165000);
 
-    governor.on_sleeping(true);
-    assert(backend_ptr->set_calls == 3);
-    assert(backend_ptr->applied_limits.back() == 160000);
+        governor.on_sleeping(true);
+        assert(backend_ptr->set_calls == 3);
+        assert(backend_ptr->applied_limits.back() == 160000);
 
-    governor.on_sleeping(false);
-    governor.update(server_gpu_power_phase::prefill);
-    assert(backend_ptr->set_calls == 4);
-    assert(backend_ptr->applied_limits.back() == 200000);
+        governor.on_sleeping(false);
+        governor.update(server_gpu_power_phase::prefill);
+        assert(backend_ptr->set_calls == 4);
+        assert(backend_ptr->applied_limits.back() == 200000);
 
-    governor.shutdown();
-    assert(backend_ptr->set_calls == 5);
-    assert(backend_ptr->applied_limits.back() == 160000);
-    assert(backend_ptr->shutdown_calls == 1);
+        governor.shutdown();
+        assert(backend_ptr->set_calls == 5);
+        assert(backend_ptr->applied_limits.back() == 160000);
+        assert(backend_ptr->shutdown_calls == 1);
+    }
 
-    auto             disabled_backend     = std::make_unique<fake_gpu_power_backend>();
-    auto *           disabled_backend_ptr = disabled_backend.get();
-    server_gpu_power disabled(std::move(disabled_backend));
-    assert(disabled.init({ -1, -1, 0 }));
-    assert(!disabled.enabled());
-    assert(disabled_backend_ptr->init_calls == 0);
-    disabled.update(server_gpu_power_phase::prefill);
-    assert(disabled_backend_ptr->set_calls == 0);
+    // 2. Test pure memory governor (decode only)
+    {
+        auto             backend     = std::make_unique<fake_gpu_power_backend>();
+        auto *           backend_ptr = backend.get();
+        server_gpu_power governor(std::move(backend));
 
-    auto             invalid_backend = std::make_unique<fake_gpu_power_backend>();
-    server_gpu_power invalid(std::move(invalid_backend));
-    assert(!invalid.init({ 201, 165, 0 }));
+        assert(governor.init({ -1, -1, 10501, -1, 0 }));
+        assert(governor.enabled());
+        assert(backend_ptr->init_calls == 1);
+        assert(backend_ptr->set_mem_calls == 0);
 
-    auto   failing_backend        = std::make_unique<fake_gpu_power_backend>();
-    auto * failing_backend_ptr    = failing_backend.get();
-    failing_backend->fail_on_call = 2;
-    server_gpu_power failing(std::move(failing_backend));
-    assert(failing.init({ 200, 165, 0 }));
-    failing.update(server_gpu_power_phase::prefill);
-    assert(failing_backend_ptr->set_calls == 1);
-    failing.update(server_gpu_power_phase::decode);
-    assert(!failing.enabled());
-    assert(failing_backend_ptr->set_calls == 2);
-    failing.update(server_gpu_power_phase::idle);
-    assert(failing_backend_ptr->set_calls == 2);
-    failing.shutdown();
-    assert(failing_backend_ptr->set_calls == 3);
-    assert(failing_backend_ptr->applied_limits.back() == 160000);
+        governor.update(server_gpu_power_phase::prefill);
+        assert(backend_ptr->set_mem_calls == 0);
+
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_mem_calls == 1);
+        assert(backend_ptr->applied_mem_clocks.back() == 10501);
+
+        // Deduplicated
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_mem_calls == 1);
+
+        // Transition to idle resets memory clock
+        governor.update(server_gpu_power_phase::idle);
+        assert(backend_ptr->reset_mem_calls == 1);
+
+        // Transition back to decode relocks memory
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_mem_calls == 2);
+        assert(backend_ptr->applied_mem_clocks.back() == 10501);
+
+        governor.shutdown();
+        assert(backend_ptr->reset_mem_calls == 2);
+    }
+
+    // 3. Test combined power + memory governor
+    {
+        auto             backend     = std::make_unique<fake_gpu_power_backend>();
+        auto *           backend_ptr = backend.get();
+        server_gpu_power governor(std::move(backend));
+
+        assert(governor.init({ 200, 165, 10501, 10251, 0 }));
+        assert(governor.enabled());
+
+        governor.update(server_gpu_power_phase::prefill);
+        assert(backend_ptr->set_calls == 1);
+        assert(backend_ptr->applied_limits.back() == 200000);
+        assert(backend_ptr->set_mem_calls == 1);
+        assert(backend_ptr->applied_mem_clocks.back() == 10251);
+
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_calls == 2);
+        assert(backend_ptr->applied_limits.back() == 165000);
+        assert(backend_ptr->set_mem_calls == 2);
+        assert(backend_ptr->applied_mem_clocks.back() == 10501);
+
+        governor.update(server_gpu_power_phase::idle);
+        assert(backend_ptr->reset_mem_calls == 1);
+
+        governor.shutdown();
+        assert(backend_ptr->set_calls == 3);
+        assert(backend_ptr->applied_limits.back() == 160000);
+    }
+
+    // 4. Test unsupported memory clock rejected
+    {
+        auto             backend = std::make_unique<fake_gpu_power_backend>();
+        server_gpu_power governor(std::move(backend));
+        assert(!governor.init({ -1, -1, 99999, -1, 0 }));
+    }
+
+    // 5. Test disabled backend
+    {
+        auto             disabled_backend     = std::make_unique<fake_gpu_power_backend>();
+        auto *           disabled_backend_ptr = disabled_backend.get();
+        server_gpu_power disabled(std::move(disabled_backend));
+        assert(disabled.init({ -1, -1, -1, -1, 0 }));
+        assert(!disabled.enabled());
+        assert(disabled_backend_ptr->init_calls == 0);
+        disabled.update(server_gpu_power_phase::prefill);
+        assert(disabled_backend_ptr->set_calls == 0);
+    }
+
+    // 6. Test invalid power config rejected
+    {
+        auto             invalid_backend = std::make_unique<fake_gpu_power_backend>();
+        server_gpu_power invalid(std::move(invalid_backend));
+        assert(!invalid.init({ 201, 165, -1, -1, 0 }));
+    }
+
+    // 7. Test failing power backend
+    {
+        auto   failing_backend        = std::make_unique<fake_gpu_power_backend>();
+        auto * failing_backend_ptr    = failing_backend.get();
+        failing_backend->fail_on_call = 2;
+        server_gpu_power failing(std::move(failing_backend));
+        assert(failing.init({ 200, 165, -1, -1, 0 }));
+        failing.update(server_gpu_power_phase::prefill);
+        assert(failing_backend_ptr->set_calls == 1);
+        failing.update(server_gpu_power_phase::decode);
+        assert(!failing.enabled());
+        assert(failing_backend_ptr->set_calls == 2);
+        failing.update(server_gpu_power_phase::idle);
+        assert(failing_backend_ptr->set_calls == 2);
+        failing.shutdown();
+        assert(failing_backend_ptr->set_calls == 3);
+        assert(failing_backend_ptr->applied_limits.back() == 160000);
+    }
 
     return 0;
 }

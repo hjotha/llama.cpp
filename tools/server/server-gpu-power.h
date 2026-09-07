@@ -4,6 +4,8 @@
 #include <memory>
 #include <string>
 
+#include <vector>
+
 enum class server_gpu_power_phase {
     idle,
     prefill,
@@ -31,28 +33,35 @@ class server_gpu_power_phase_arbitrator {
 };
 
 struct server_gpu_power_config {
-    int32_t prefill_w = -1;
-    int32_t decode_w  = -1;
-    int32_t device    = 0;
+    int32_t prefill_w         = -1;
+    int32_t decode_w          = -1;
+    int32_t mem_clock_decode  = -1;
+    int32_t mem_clock_prefill = -1;
+    int32_t device            = 0;
 
     bool enabled() const;
+    bool power_enabled() const;
+    bool mem_clock_enabled() const;
 };
 
 struct server_gpu_power_device_info {
-    std::string name;
-    int32_t     device                  = 0;
-    uint32_t    original_power_limit_mw = 0;
-    uint32_t    min_power_limit_mw      = 0;
-    uint32_t    max_power_limit_mw      = 0;
+    std::string           name;
+    int32_t               device                  = 0;
+    uint32_t              original_power_limit_mw = 0;
+    uint32_t              min_power_limit_mw      = 0;
+    uint32_t              max_power_limit_mw      = 0;
+    std::vector<uint32_t> supported_mem_clocks_mhz;
 };
 
 class server_gpu_power_backend {
   public:
     virtual ~server_gpu_power_backend() = default;
 
-    virtual bool init(int32_t device, server_gpu_power_device_info & info, std::string & error) = 0;
-    virtual bool set_power_limit(uint32_t power_limit_mw, std::string & error)                  = 0;
-    virtual void shutdown()                                                                     = 0;
+    virtual bool init(int32_t device, server_gpu_power_device_info & info, std::string & error)     = 0;
+    virtual bool set_power_limit(uint32_t power_limit_mw, std::string & error)                     = 0;
+    virtual bool set_memory_locked_clocks(uint32_t min_mhz, uint32_t max_mhz, std::string & error) = 0;
+    virtual bool reset_memory_locked_clocks(std::string & error)                                   = 0;
+    virtual void shutdown()                                                                        = 0;
 };
 
 std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_nvml_backend();
@@ -83,6 +92,11 @@ class server_gpu_power {
     uint32_t prefill_power_limit_mw_      = 0;
     uint32_t decode_power_limit_mw_       = 0;
     uint32_t last_applied_power_limit_mw_ = 0;
+
+    uint32_t decode_mem_clock_mhz_        = 0;
+    uint32_t prefill_mem_clock_mhz_       = 0;
+    uint32_t last_applied_mem_clock_mhz_  = 0;
+    bool     mem_clock_locked_            = false;
 
     server_gpu_power_phase phase_               = server_gpu_power_phase::idle;
     uint64_t               transition_count_    = 0;

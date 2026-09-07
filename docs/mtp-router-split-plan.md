@@ -334,6 +334,20 @@ prompt. That, not the 8 s model load, is where the latency actually is.
 Flow: `save` on the outgoing child before eviction → swap → `restore` on the incoming child →
 the next request finds its prefix already in the slot and prefills only the delta.
 
+What `save` actually captures, precisely (`server-context.cpp:2688-2737`): the **live KV of one
+slot**, via `slot->prompt.tokens.serialize()` (`:2710`) plus
+`llama_state_seq_save_file(ctx_tgt, …, slot->id, …)` (`:2717`). It does **not** dump the
+`server_prompt_cache`. So:
+
+- **One slot per call.** At `parallel = 1` that is the single resident conversation. Prefixes
+  parked in `-cram` (idle slots pushed there by `--cache-idle-slots`) are not captured — a
+  `server_prompt_cache` entry only becomes real again by passing through a slot.
+- **Target only.** `ctx_tgt`; the `ctx_dft` (nextn) state never enters the file. Harmless in the
+  small→large direction, the only permitted one — the long child has no `ctx_dft`.
+- **Ordering is free.** A save on a processing slot is *deferred*, not failed (`:2696-2701`), so
+  a "save before evict" hook waits for the generation to finish on its own, matching the
+  never-evict-a-busy-child rule.
+
 ### 11.3 Two hard constraints
 
 **(a) Both children must run the same GGUF.** Restore validation is purely structural — KV layer

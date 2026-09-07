@@ -2253,7 +2253,22 @@ void server_models_routes::init_routes() {
         }
         auto res = std::make_unique<server_http_res>();
         json models_json = json::array();
+        // the "models" array a child also returns here: Codex reads its context_window from it, so
+        // the router must produce it too, for names it has not loaded yet
+        json codex_json  = json::array();
         auto all_models = models.get_all_meta();
+        // configured --ctx-size of a model, 0 if it does not declare one
+        auto preset_n_ctx = [](const server_model_meta & m) {
+            std::string ctx_size;
+            if (m.preset.get_option("LLAMA_ARG_CTX_SIZE", ctx_size)) {
+                try {
+                    return std::stoll(ctx_size);
+                } catch (...) {
+                    // not a number we can use; fall through
+                }
+            }
+            return 0LL;
+        };
         std::time_t t = std::time(0);
         for (const auto & meta : all_models) {
             if (meta.hidden) {
@@ -2314,6 +2329,14 @@ void server_models_routes::init_routes() {
                 }
             }
             models_json.push_back(model_info);
+
+            // a loaded child reports its real n_ctx; before that, the configured one is all we have
+            int64_t n_ctx = model_info.value("meta", json::object()).value("n_ctx", (int64_t) 0);
+            if (n_ctx <= 0) {
+                n_ctx = preset_n_ctx(meta);
+            }
+            codex_json.push_back(format_codex_model_entry(meta.name, n_ctx,
+                meta.multimodal.inp_vision || meta.multimodal.inp_audio));
         }
 
         // routing groups: the members are hidden above, advertise the group itself so a client
@@ -2337,15 +2360,13 @@ void server_models_routes::init_routes() {
                 }},
             };
             int64_t group_n_ctx = 0;
+            bool group_multimodal = false;
             for (const auto & m : members) {
                 auto member_meta = models.get_meta(m.name);
-                std::string ctx_size;
-                if (member_meta.has_value() && member_meta->preset.get_option("LLAMA_ARG_CTX_SIZE", ctx_size)) {
-                    try {
-                        group_n_ctx = std::max<int64_t>(group_n_ctx, std::stoll(ctx_size));
-                    } catch (...) {
-                        // leave it out rather than advertise a number we cannot parse
-                    }
+                if (member_meta.has_value()) {
+                    group_n_ctx = std::max<int64_t>(group_n_ctx, preset_n_ctx(*member_meta));
+                    group_multimodal = group_multimodal
+                        || member_meta->multimodal.inp_vision || member_meta->multimodal.inp_audio;
                 }
                 if (member_meta.has_value() && member_meta->is_running() && member_meta->loaded_info.is_object()) {
                     // mirror the child's own model info (same weights, same shape) like a
@@ -2366,8 +2387,10 @@ void server_models_routes::init_routes() {
                 group_info["meta"]["n_ctx"] = group_n_ctx;
             }
             models_json.push_back(std::move(group_info));
+            codex_json.push_back(format_codex_model_entry(group, group_n_ctx, group_multimodal));
         }
         res_ok(res, {
+            {"models", codex_json},
             {"data", models_json},
             {"object", "list"},
         });

@@ -92,6 +92,11 @@ struct server_grammar_trigger {
 
 json format_error_response(const std::string & message, const enum error_type type);
 
+// one entry of the "models" array that Codex reads from GET /v1/models (and /models). shared with
+// the router, which advertises models it has not loaded — hence a plain name + context window
+// instead of a server_context_meta
+json format_codex_model_entry(const std::string & name, int64_t n_ctx, bool multimodal);
+
 //
 // random string / id
 //

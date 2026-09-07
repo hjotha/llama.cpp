@@ -16,6 +16,61 @@
 #include <cstring>
 #include <type_traits>
 
+json format_codex_model_entry(const std::string & name, int64_t n_ctx, bool multimodal) {
+    return json {
+        {"name",  name},
+        {"slug",  name},
+        {"display_name", name},
+        {"default_reasoning_level", "low"},
+        {"supported_reasoning_levels", json::array({
+            {{"effort", "low"}, {"description", "Fast responses with lighter reasoning"}},
+            {{"effort", "medium"}, {"description", "Balances speed and reasoning depth"}},
+            {{"effort", "xhigh"}, {"description", "Extra high reasoning depth"}},
+        })},
+        {"shell_type", "unified_exec"},
+        {"visibility", "list"},
+        {"supported_in_api", true},
+        {"priority", 100},
+        {"support_verbosity", false},
+        {"default_verbosity", "medium"},
+        {"truncation_policy", json{{"mode", "tokens"}, {"limit", 4096}}},
+        {"context_window", n_ctx},
+        {"max_context_window", n_ctx},
+        {"effective_context_window_percent", 100},
+        {"input_modalities", json::array({"text"})},
+        {"supports_search_tool", false},
+        {"use_responses_lite", false},
+        {"node_repl_auto_review_required", false},
+        {"node_repl_disabled", true},
+        {"supports_image_detail_original", false},
+        {"default_reasoning_summary", "none"},
+        {"experimental_supported_tools", json::array()},
+        {"apply_patch_tool_type", "freeform"},
+        {"web_search_tool_type", "text"},
+        {"tool_mode", nullptr},
+        {"multi_agent_version", nullptr},
+        {"multi_agent_reasoning_effort", nullptr},
+        {"base_instructions", ""},
+        {"model", name},
+        {"modified_at", ""},
+        {"size", ""},
+        {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
+        {"type", "model"},
+        {"description", ""},
+        {"tags", json::array({""})},
+        {"capabilities", multimodal ? json::array({"completion","multimodal"}) : json::array({"completion"})},
+        {"parameters", ""},
+        {"details", {
+            {"parent_model", ""},
+            {"format", "gguf"},
+            {"family", ""},
+            {"families", json::array({""})},
+            {"parameter_size", ""},
+            {"quantization_level", ""}
+        }}
+    };
+}
+
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
     int code = 500;

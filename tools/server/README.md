@@ -1930,6 +1930,8 @@ own name (useful for staging the group before relying on it).
 - A member's `--alias` is forced to the **group** name, so every response's `"model"` field is the
   public name on every tier. A client that echoes it back keeps addressing the group instead of
   pinning itself to one tier.
+- The same response's `models` array (the one Codex reads) has one entry per public name, with
+  `context_window` set to that same widest-member `ctx-size`.
 
 The group is defined entirely in the preset file: later tiers are added or removed by editing
 the INI, no code changes.

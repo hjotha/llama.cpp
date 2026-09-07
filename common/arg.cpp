@@ -4998,6 +4998,18 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_DEDUP_CACHE_MODELS).set_preset_only());
 
+    args.push_back(common_arg(
+        {"route-group"}, "NAME",
+        "in server router mode, routing group this model belongs to: one public model name that resolves to this and the other members by request size. members are hidden from the model list and only reachable through the group name (or directly by name)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_ROUTE_GROUP).set_preset_only());
+
+    args.push_back(common_arg(
+        {"route-max-tokens"}, "N",
+        "in server router mode, serve only requests whose prompt+output token budget fits this cap; the group member without this key (uncapped) is the fallback for everything larger",
+        [](common_params &, int) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_ROUTE_MAX_TOKENS).set_preset_only());
+
     // args.push_back(common_arg(
     //     {"pin"},
     //     "in server router mode, do not unload this model if models_max is exceeded",

@@ -1823,6 +1823,8 @@ We also offer additional options that are exclusive to presets (these aren't tre
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts. Only applies at startup: if the model list is reloaded later (for example after editing the preset file), a newly added model is listed but not loaded
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 - `dedup-cache-models` (boolean): When the preset uses `hf-repo` pointing to a model that is already downloaded, hide the corresponding cached model entry from `GET /models` (the preset entry remains visible). Set it in the `[*]` section to apply to all presets.
+- `route-group` (string): assigns this preset to a **routing group** (see below). Members of a group are hidden from `GET /models` and are only reachable through the group name, or directly by their own name
+- `route-max-tokens` (int): for a member of a `route-group`, the largest request budget (prompt tokens + output tokens) this member serves. Members without this key are the group's uncapped fallback
 
 ### Routing requests
 
@@ -1849,6 +1851,88 @@ GET /props?model=ggml-org%2Fgemma-3-4b-it-GGUF%3AQ4_K_M
 ```
 
 By default, the model will be loaded automatically if it's not loaded. To disable this, add `--no-models-autoload` when starting the server. Additionally, you can include `?autoload=true|false` in the query param to control this behavior per-request.
+
+### Routing groups: one public model name, several children
+
+A routing group lets several presets share one public model name: the request is served by the
+child whose `route-max-tokens` cap covers its size, so a client that only knows one name gets
+transparently routed between e.g. a small-fast tier and a large-slow tier. The tier choice is
+**server-side and automatic**; members of the group are hidden from `GET /models` and a synthetic
+group entry is listed in their place.
+
+Example — two tiers off the *same* GGUF (speculative decoding on for short contexts, off for
+long ones), with `--models-max 1` so the children evict each other:
+
+```ini
+version = 1
+
+[*]
+model = /path/to/model-mtp.gguf
+batch-size = 64
+ubatch-size = 64
+fit = off            ; the ceilings below are --fit off numbers
+cache-ram = 2048
+
+[qwen3-fast]
+ctx-size = 60928     ; measured ceiling of this GPU/config
+spec-type = draft-mtp
+route-group = qwen-3.8-27b
+route-max-tokens = 56000       ; leaves 4096 output + slack inside 60928
+
+[qwen3-long]
+ctx-size = 105472    ; same file, MTP off
+route-group = qwen-3.8-27b     ; no route-max-tokens = the group's uncapped fallback
+```
+
+```sh
+llama-server --models-preset ./my-models.ini --models-max 1
+```
+
+All requests that name `qwen-3.8-27b` are routed by size; each member keeps working under its
+own name (useful for staging the group before relying on it).
+
+**How the size is decided** (all of it is router-side, the router never loads a model itself):
+
+- The budget is `prompt tokens + output tokens`. The output is read from the request
+  (`max_tokens` / `max_completion_tokens` / `max_output_tokens` / `n_predict`); when the request
+  omits it, the router's own `-n` is assumed, and if that is not set either, a default of 4096
+  output tokens. The reserve is never 0 so an implicit output cannot be under-budgeted — except
+  on the embedding routes, which generate nothing.
+- **Exact counting when a member is already loaded**: the router asks a loaded child to count
+  the prompt the way the generation itself will — `POST /tokenize` for raw prompts, and the
+  input-token endpoints (`/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`,
+  `/v1/messages/count_tokens`) for template-shaped bodies, which apply the chat template exactly.
+- **Cold start (nothing loaded):** the estimate falls back to `body bytes / 3.5` and, on doubt,
+  the request is biased toward the wider tier. Loading a model just to count tokens would cost
+  more than being one tier too high.
+- **No demotion within a conversation:** a conversation pinned to a wider tier stays there; it
+  migrates up at most once (conversations grow monotonically). Without this, a conversation near
+  the threshold would swap children on nearly every turn, and each swap also drops the child's
+  in-RAM prompt cache.
+- **Only generating routes decide a tier.** `/tokenize`, `/detokenize`, `/apply-template` and the
+  input-token counting endpoints carry a prompt-shaped body but produce nothing, and every member
+  answers them identically: they go to whichever member is already loaded, so counting an 80k text
+  never boots the wide tier.
+
+**What clients will notice** (the price of the contract):
+
+- TTFT spikes: a small request that follows a big one pays the child swap (`--models-max 1`).
+- Prompt-cache loss on migration: the child's cached prefix dies with the child, the migrating
+  conversation re-prefills from scratch once (the no-demotion rule limits this to a single hop).
+- No style shift across the swap if both tiers load the same GGUF (only the speculative head
+  changes), which also keeps any slot-state transfer between tiers legal — slot save/restore
+  validates KV geometry only, **never load a state file written by other weights into a tier**.
+
+**What the group looks like from outside:**
+
+- `GET /models` lists the group name only, with `meta.n_ctx` set to the widest member's
+  `ctx-size` — what the group can actually serve — and `meta.route_members` describing the ladder.
+- A member's `--alias` is forced to the **group** name, so every response's `"model"` field is the
+  public name on every tier. A client that echoes it back keeps addressing the group instead of
+  pinning itself to one tier.
+
+The group is defined entirely in the preset file: later tiers are added or removed by editing
+the INI, no code changes.
 
 ### GET `/models`: List available models
 

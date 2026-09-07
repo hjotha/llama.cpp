@@ -28,6 +28,7 @@
 #include <random>
 #include <sstream>
 #include <cstring>
+#include <limits>
 
 #ifndef _WIN32
 extern char **environ;
@@ -256,6 +257,17 @@ struct server_lru_sched {
 // delete). distinct from params.timeout_read/write which only applies to the generation proxy
 static constexpr int STREAM_LOOKUP_TIMEOUT_MS = 250;
 
+// bounds for the router's estimator round-trips to a loaded child. tokenizing an 80k prompt
+// takes milliseconds and the child's HTTP thread answers while a generation is in flight, but
+// a wedged child must not stall routing
+static constexpr int ROUTE_ESTIMATE_TIMEOUT_MS = 5000;
+
+// output reserve assumed when a request omits max_tokens/n_predict and the router itself was
+// not started with a positive -n: the deployment contract is 4096 output tokens. never 0,
+// otherwise an 80k prompt with an implicit output lands on the capped tier and dies at the
+// boundary
+static constexpr int64_t ROUTE_DEFAULT_OUTPUT_RESERVE = 4096;
+
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
     wchar_t buf[32768] = { 0 };  // Large buffer to handle long paths
@@ -361,7 +373,14 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     unset_reserved_args(preset, false);
     preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
-    preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
+    // a child echoes its own alias back in every response's "model" field. a route-group member
+    // must echo the public group name instead: otherwise the tier leaks to the client, and a
+    // client that sends response["model"] back on the next turn would address the tier directly
+    // and skip routing. the router keeps addressing the child by its own name, this alias only
+    // shapes what the child calls itself
+    std::string route_group;
+    const bool in_group = preset.get_option(COMMON_ARG_PRESET_ROUTE_GROUP, route_group) && !route_group.empty();
+    preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", in_group ? route_group : name);
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
@@ -626,7 +645,75 @@ void server_models::load_models() {
     };
     auto apply_hidden = [&]() {
         for (auto & [name, inst] : mapping) {
-            inst.meta.hidden = hidden_models.count(name) > 0;
+            std::string group;
+            // members of a routing group are hidden from the model list: only the group name is
+            // advertised, the tiers are still reachable by their own names
+            const bool group_member = inst.meta.preset.get_option(COMMON_ARG_PRESET_ROUTE_GROUP, group) && !group.empty();
+            inst.meta.hidden = hidden_models.count(name) > 0 || group_member;
+        }
+    };
+
+    // build the routing groups from the (already reconciled) mapping. a public name maps to an
+    // ordered ladder of members, ascending max_tokens with the uncapped member last, so the
+    // first tier whose cap covers a request's budget wins and the uncapped one is the fallback
+    auto rebuild_route_groups = [&]() {
+        route_groups.clear();
+        if (mapping.empty()) {
+            return;
+        }
+        std::unordered_map<std::string, std::map<std::string, int64_t>> raw;
+        for (const auto & [name, inst] : mapping) {
+            std::string group;
+            if (!inst.meta.preset.get_option(COMMON_ARG_PRESET_ROUTE_GROUP, group) || group.empty()) {
+                continue;
+            }
+            if (mapping.find(group) != mapping.end()) {
+                SRV_WRN("route group '%s' collides with the model of the same name; requests for '%s' will be served by the group\n",
+                        group.c_str(), group.c_str());
+            }
+            int64_t cap = -1;
+            std::string cap_str;
+            if (inst.meta.preset.get_option(COMMON_ARG_PRESET_ROUTE_MAX_TOKENS, cap_str)) {
+                try {
+                    cap = std::stoll(cap_str);
+                    if (cap <= 0) {
+                        SRV_WRN("non-positive route-max-tokens value '%s' for model '%s', treating it as an uncapped member\n",
+                                cap_str.c_str(), name.c_str());
+                        cap = -1;
+                    }
+                } catch (...) {
+                    SRV_WRN("invalid route-max-tokens value '%s' for model '%s', treating it as an uncapped member\n",
+                            cap_str.c_str(), name.c_str());
+                    cap = -1;
+                }
+            }
+            raw[group][name] = cap;
+        }
+        for (auto & [group, members] : raw) {
+            auto & ladder = route_groups[group];
+            for (const auto & [member_name, cap] : members) {
+                ladder.push_back({member_name, cap});
+            }
+            // stable: raw is keyed by member name, so equal caps keep a deterministic (alphabetical)
+            // order across reloads instead of whatever the sort happens to produce
+            std::stable_sort(ladder.begin(), ladder.end(), [](const route_group_member & a, const route_group_member & b) {
+                const int64_t ac = a.max_tokens >= 0 ? a.max_tokens : std::numeric_limits<int64_t>::max();
+                const int64_t bc = b.max_tokens >= 0 ? b.max_tokens : std::numeric_limits<int64_t>::max();
+                return ac < bc;
+            });
+            std::string ladder_str;
+            int uncapped = 0;
+            for (const auto & m : ladder) {
+                if (!ladder_str.empty()) ladder_str += " -> ";
+                ladder_str += m.name;
+                ladder_str += m.max_tokens < 0 ? " (uncapped)" : " (<= " + std::to_string(m.max_tokens) + ")";
+                uncapped += m.max_tokens < 0 ? 1 : 0;
+            }
+            if (uncapped > 1) {
+                SRV_WRN("route group '%s' has %d uncapped members; only the last one is reachable, give the others a route-max-tokens\n",
+                        group.c_str(), uncapped);
+            }
+            SRV_INF("route group '%s': %s\n", group.c_str(), ladder_str.c_str());
         }
     };
     // update_args() injects HOST/PORT/ALIAS, so strip them before comparing presets
@@ -670,6 +757,7 @@ void server_models::load_models() {
         }
         apply_stop_timeout();
         apply_hidden();
+        rebuild_route_groups();
         log_available_models();
 
         // skipped on reload, see startup_models
@@ -848,6 +936,7 @@ void server_models::load_models() {
 
         apply_stop_timeout();
         apply_hidden();
+        rebuild_route_groups();
 
         // clear reload flag under the lock, this releases the load() calls waiting on !is_reloading
         is_reloading = false;
@@ -933,6 +1022,198 @@ std::vector<server_model_meta> server_models::get_all_meta() {
         result.push_back(inst.meta);
     }
     return result;
+}
+
+std::unordered_map<std::string, std::vector<route_group_member>> server_models::get_route_groups() {
+    std::lock_guard<std::mutex> lk(mutex);
+    return route_groups;
+}
+
+// does this request carry a prompt whose token budget matters for routing? control, slots,
+// detokenize, lora and similar routes have no prompt to measure: they always land on the
+// loaded member (or the capped tier when nothing is loaded), regardless of body size
+static bool route_request_has_prompt(const std::string & path, const json & body) {
+    // metadata routes carry a prompt-shaped body but never generate: tokenizing or counting an
+    // 80k text must not boot the wide tier, and every member answers them identically. checked
+    // before the field probes because their paths contain the generation paths as substrings
+    // (/v1/chat/completions/input_tokens, /v1/messages/count_tokens)
+    if (path.find("/tokenize")       != std::string::npos ||   // also /detokenize
+        path.find("/apply-template") != std::string::npos ||
+        path.find("input_tokens")    != std::string::npos ||
+        path.find("count_tokens")    != std::string::npos) {
+        return false;
+    }
+    if (body.contains("messages") || body.contains("prompt") || body.contains("input")) {
+        return true;
+    }
+    return path.find("/chat/completions") != std::string::npos
+        || path.find("/responses")     != std::string::npos
+        || path.find("/messages")      != std::string::npos // anthropic
+        || path.find("/infill")        != std::string::npos
+        || path.find("/completions")   != std::string::npos
+        || path.find("embedding")      != std::string::npos;
+}
+
+// try to learn the exact prompt token count from a loaded child, mirroring the tokenization
+// the request itself will later go through on that child: raw prompts go to /tokenize (the
+// plain completions path tokenizes with add_special=true; infill also contributes its suffix),
+// template-shaped bodies go to the input-token counting endpoints, which apply the chat
+// template exactly as the generation would. returns the count, or -1 when the child does not
+// answer or the request shape has no countable prompt
+static int64_t route_count_prompt_tokens(const std::string & path, const json & body, int port) {
+    const bool has_messages = body.contains("messages");
+    const bool has_prompt   = body.contains("prompt");
+
+    std::string count_path;
+    json count_body = body;
+    if (path.find("/chat/completions") != std::string::npos && has_messages) {
+        count_path = "/v1/chat/completions/input_tokens";
+    } else if (path.find("/responses") != std::string::npos && body.contains("input")) {
+        count_path = "/v1/responses/input_tokens";
+    } else if (path.find("/messages") != std::string::npos && has_messages) { // anthropic
+        count_path = "/v1/messages/count_tokens";
+    } else if (has_messages) {
+        // template-shaped body on a route the classifier above did not name (apply-template)
+        count_path = "/v1/chat/completions/input_tokens";
+    } else if (has_prompt || path.find("/infill") != std::string::npos || path.find("/completions") != std::string::npos) {
+        if (!has_prompt) {
+            return -1;
+        }
+        count_path = "/tokenize";
+        if (path.find("/infill") != std::string::npos && body.contains("suffix")) {
+            // the suffix goes into the KV cache too, count both sides of the infill prompt
+            count_body = json{{"content", json::array({body.at("prompt"), body.at("suffix")})}, {"add_special", true}};
+        } else {
+            count_body = json{{"content", body.at("prompt")}, {"add_special", true}};
+        }
+    } else if (path.find("embedding") != std::string::npos && body.contains("input")) {
+        count_path = "/tokenize";
+        count_body = json{{"content", body.at("input")}};
+    } else {
+        return -1;
+    }
+
+    try {
+        httplib::Client cli(CHILD_ADDR, port);
+        cli.set_connection_timeout(0, ROUTE_ESTIMATE_TIMEOUT_MS * 1000);
+        cli.set_read_timeout(0, ROUTE_ESTIMATE_TIMEOUT_MS * 1000);
+        cli.set_write_timeout(0, ROUTE_ESTIMATE_TIMEOUT_MS * 1000);
+        auto resp = cli.Post(count_path, count_body.dump(), "application/json");
+        if (!resp || resp->status != 200) {
+            return -1;
+        }
+        const json out = json::parse(resp->body);
+        if (count_path == "/tokenize") {
+            return out.contains("tokens") && out.at("tokens").is_array()
+                ? (int64_t) out.at("tokens").size() : -1;
+        }
+        return out.is_object() && out.contains("input_tokens") && out.at("input_tokens").is_number_integer()
+            ? out.at("input_tokens").get<int64_t>() : -1;
+    } catch (const std::exception &) {
+        return -1;
+    }
+}
+
+std::string server_models::resolve_route_target(const std::string & name, const server_http_req & req, const json & body, const std::string & conv_id) {
+    // snapshot the groups under the lock; everything past this point locks on its own
+    std::unordered_map<std::string, std::vector<route_group_member>> groups;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        groups = route_groups;
+    }
+    auto git = groups.find(name);
+    if (git == groups.end() || git->second.empty()) {
+        return name; // not a routing group: all existing behaviour is preserved
+    }
+    const std::vector<route_group_member> & members = git->second;
+
+    // a non-object body (e.g. a bare JSON array) is malformed for every proxied route; treat
+    // it as a prompt-less request rather than letting the field probes below throw
+    const bool prompt_relevant = body.is_object() && route_request_has_prompt(req.path, body);
+    if (!prompt_relevant) {
+        // body-less or non-prompt requests (GET /props, control, slots, ...) must not get to
+        // pick which child boots: go to the loaded member, or the first (capped) tier cold
+        for (const auto & m : members) {
+            auto meta = get_meta(m.name);
+            if (meta.has_value() && meta->is_ready()) {
+                return m.name;
+            }
+        }
+        return members.front().name;
+    }
+
+    // exact counting needs a loaded child; any member works, they share the same tokenizer
+    int counting_port = -1;
+    for (const auto & m : members) {
+        auto meta = get_meta(m.name);
+        if (meta.has_value() && meta->is_ready()) {
+            counting_port = meta->port;
+            break;
+        }
+    }
+    int64_t prompt_tokens = counting_port > 0
+        ? route_count_prompt_tokens(req.path, body, counting_port)
+        : -1;
+    if (prompt_tokens < 0) {
+        // cold start (no member loaded) or the child did not answer: bytes/token heuristic,
+        // biased upward in practice because the raw body carries JSON overhead
+        prompt_tokens = (int64_t) (req.body.size() / 3.5);
+    }
+
+    // output reserve: what the request asked to generate; when omitted, the router's -n, else
+    // the deployment default. never 0 on omission, an implicit output must not be under-budgeted
+    int64_t reserve = -1;
+    for (const auto & key : {"max_tokens", "max_completion_tokens", "max_output_tokens", "n_predict"}) {
+        if (body.contains(key) && body.at(key).is_number_integer()) {
+            reserve = body.at(key).get<int64_t>();
+            break;
+        }
+    }
+    if (reserve < 0) {
+        // an embedding request generates nothing, so reserving output for it would push prompts
+        // near the boundary onto the wide tier for no reason
+        reserve = req.path.find("embedding") != std::string::npos
+            ? 0
+            : (base_params.n_predict > 0 ? base_params.n_predict : ROUTE_DEFAULT_OUTPUT_RESERVE);
+    }
+    const int64_t budget = prompt_tokens + reserve;
+
+    // first tier whose cap covers the budget, else the group's fallback (the last member: the
+    // uncapped one, or the largest cap when the config declared none)
+    std::string chosen      = members.back().name;
+    int64_t     chosen_rank = (int64_t) (members.size() - 1);
+    for (size_t i = 0; i < members.size(); i++) {
+        const auto & m = members[i];
+        if (m.max_tokens < 0 || m.max_tokens >= budget) {
+            chosen      = m.name;
+            chosen_rank = (int64_t) i;
+            break;
+        }
+    }
+
+    // no-demotion: a conversation pinned to a wider tier stays there, it never flips back to a
+    // smaller one. conversations grow monotonically, so each one migrates at most once instead
+    // of flapping around the threshold (and each migration also drops the child's prompt cache)
+    if (!conv_id.empty()) {
+        auto pinned = conv_models.lookup(conv_id);
+        if (pinned.has_value() && !pinned->empty()) {
+            for (size_t i = 0; i < members.size(); i++) {
+                if (members[i].name == *pinned) {
+                    if ((int64_t) i > chosen_rank) {
+                        chosen = *pinned;
+                    } else if ((int64_t) i < chosen_rank) {
+                        SRV_INF("route group '%s': conversation %s migrates up: %s -> %s\n",
+                                name.c_str(), conv_id.c_str(), pinned->c_str(), chosen.c_str());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    SRV_INF("route group '%s': %lld prompt + %lld output = %lld tokens -> %s\n",
+            name.c_str(), (long long) prompt_tokens, (long long) reserve, (long long) budget, chosen.c_str());
+    return chosen;
 }
 
 void server_models::unload_lru() {
@@ -1900,6 +2181,8 @@ void server_models_routes::init_routes() {
     this->proxy_get = [this](const server_http_req & req) {
         std::string method = "GET";
         std::string name = req.get_param("model");
+        // body-less requests resolve to the loaded member of a group, or the capped tier cold
+        name = models.resolve_route_target(name, req, json::object(), std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
@@ -1915,6 +2198,10 @@ void server_models_routes::init_routes() {
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
+        // route group resolution happens before validation: a group name is not a mapping
+        // entry, and the no-demotion rule needs the conversation pin from the previous turn
+        std::string conv_id = server_stream_conv_id_from_headers(req.headers);
+        name = models.resolve_route_target(name, req, body, conv_id);
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
@@ -1924,7 +2211,6 @@ void server_models_routes::init_routes() {
         // to it without polling, keyed on the exact conv id from the header. registered before
         // the load wait so a stop issued while the model loads can erase the entry and cancel
         // this request instead of leaving an orphan generation
-        std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         uint64_t ticket = models.conv_models.remember(conv_id, name);
         // a dead socket must not cancel a session request, only a stop does (checked right below)
         auto should_stop = ticket == 0 ? req.should_stop : nullptr;
@@ -2028,6 +2314,58 @@ void server_models_routes::init_routes() {
                 }
             }
             models_json.push_back(model_info);
+        }
+
+        // routing groups: the members are hidden above, advertise the group itself so a client
+        // that inspects the list sees one entry per public name. the advertised n_ctx is the
+        // widest member's configured --ctx-size (what the group can actually serve), read from
+        // the preset so it is known before any member loads; omitted if no member declares one
+        for (const auto & [group, members] : models.get_route_groups()) {
+            json group_info = {
+                {"id",            group},
+                {"aliases",       json::array()},
+                {"tags",          json::array()},
+                {"object",        "model"},
+                {"owned_by",      "llamacpp"},
+                {"created",       t},
+                {"status",        json{{"value", "unloaded"}, {"args", json::array()}}},
+                {"architecture",  json{{"input_modalities", json::array({"text"})}, {"output_modalities", json::array({"text"})}}},
+                {"source",        "route-group"},
+                {"can_remove",    false},
+                {"meta",          {
+                    {"route_members",  json::array()},
+                }},
+            };
+            int64_t group_n_ctx = 0;
+            for (const auto & m : members) {
+                auto member_meta = models.get_meta(m.name);
+                std::string ctx_size;
+                if (member_meta.has_value() && member_meta->preset.get_option("LLAMA_ARG_CTX_SIZE", ctx_size)) {
+                    try {
+                        group_n_ctx = std::max<int64_t>(group_n_ctx, std::stoll(ctx_size));
+                    } catch (...) {
+                        // leave it out rather than advertise a number we cannot parse
+                    }
+                }
+                if (member_meta.has_value() && member_meta->is_running() && member_meta->loaded_info.is_object()) {
+                    // mirror the child's own model info (same weights, same shape) like a
+                    // running member does; our n_ctx/meta and id already exist, so they win
+                    for (auto it = member_meta->loaded_info.begin(); it != member_meta->loaded_info.end(); ++it) {
+                        if (!group_info.contains(it.key())) {
+                            group_info[it.key()] = it.value();
+                        }
+                    }
+                    group_info["status"]["value"] = "loaded";
+                }
+                group_info["meta"]["route_members"].push_back({
+                    {"name",       m.name},
+                    {"max_tokens", m.max_tokens},
+                });
+            }
+            if (group_n_ctx > 0) {
+                group_info["meta"]["n_ctx"] = group_n_ctx;
+            }
+            models_json.push_back(std::move(group_info));
         }
         res_ok(res, {
             {"data", models_json},

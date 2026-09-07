@@ -1,9 +1,16 @@
-# Plan: one public model name, a ladder of router children (MTP 54k / no-MTP 76k / overflow 97k)
+# Plan: one public model name, two router children off the *same* GGUF (MTP 61k / no-MTP 105k)
 
-Status: design only, not implemented. Written after tracing
+Status: **implemented and tested on GOKAYA** (sections 6 and 13; the code is in
+`tools/server/server-models.{h,cpp}` and documented in `tools/server/README.md`). Sections 5 and 11
+are the parts still not done: the production unit is not yet switched over, and the KV-state
+transfer across a swap remains optional. Written after tracing
 `tools/server/server-models.{h,cpp}`, `common/arg.cpp` (preset-only keys), `common/preset.h`,
 `common/common.cpp` (`common_fit_normal_kv_context`) and re-deriving the VRAM arithmetic from
 `docs/kv-calibration-findings.md` (GOKAYA, `192.168.1.57`).
+
+**Both ceilings are now measured, not derived** — see 1.1. The measurement killed the third
+tier: the `-mtp` GGUF with MTP *off* reaches 105,472 tokens, so one file serves both tiers and
+the second GGUF is not needed at all.
 
 **This plan supersedes `docs/mtp-adaptive-context-plan.md`**, whose goal is arithmetically
 impossible on this model/GPU — see section 1.
@@ -20,35 +27,36 @@ Whether a request is served with or without MTP must be invisible to them. That 
 hard consequences:
 
 1. **The tier choice is server-side and automatic.** Letting the client name the tier
-   (`qwen3-fast` / `qwen3-mid` / `qwen3-long`) is off the table as a deliverable — it survives
-   only as a staging step to validate the children before the routing code exists (section 5).
+   (`qwen3-fast` / `qwen3-long`) is off the table as a deliverable — it survives only as a
+   staging step to validate the children before the routing code exists (section 5).
 2. **The single-process plan is dead, not just suboptimal.** Its ceiling is ~57,900 tokens
    (section 1); the clients are configured for 80,000. It cannot satisfy the contract at all.
 3. **Under-estimating a request's size becomes a client-visible bug**, not a performance
-   detail. If a 60k request is routed to the 54,264 child, the client gets an error or a
+   detail. If a 60k request is routed to the 60,928 child, the client gets an error or a
    truncation on a request its own config says is legal. So the exact `/tokenize` estimator
    (section 6) is mandatory, not an optimization.
 
-Ceiling check: 80,000 (client) + 4,096 output = 84,096 fits inside the **validated** 97,280 of
-the no-MTP GGUF, with a real maximum-size request behind that number
-(`kv-calibration-findings.md:238-241`). The contract is servable.
+Ceiling check: 80,000 (client) + 4,096 output = 84,096 fits inside the **measured** 105,472 of
+the `-mtp` GGUF with MTP off (1.1), with a real 101,376 + 4,096 request behind that number. The
+contract is servable, with ~21k of headroom.
 
-### 0.1 Three tiers, because two of them can share weights
+### 0.1 Both tiers run off one file
 
-The group is a ladder of members, ascending cap (the resolution in 6.1 is already an ordered
-list, so a third member costs one INI section and zero code):
+| Member | GGUF | MTP | `ctx-size` | b/ub | Serves | Why it exists |
+|---|---|---|---:|---:|---|---|
+| `qwen3-fast` | `-mtp.gguf` | on | 60,928 | 64 | ≤ 56,000 budget | the speedup, ~44 decode tok/s |
+| `qwen3-long` | `-mtp.gguf` | off | 105,472 | 64 | > 56,000, uncapped fallback | **same weights** → no style shift across the swap, KV state transfer legal (section 11), covers the whole 84,096 contract |
 
-| Member | GGUF | MTP | `ctx-size` | Serves | Why it exists |
-|---|---|---|---:|---|---|
-| `qwen3-fast` | `-mtp.gguf` | on | 54,264 | ≤ 50k budget | the speedup, ~47 decode tok/s |
-| `qwen3-mid` | `-mtp.gguf` | off | ~76,000 (measure) | 50k–72k | **same weights as fast** → no style shift, and KV state transfer becomes legal (section 11) |
-| `qwen3-long` | `...XXS.gguf` | off | 97,280 | > 72k, uncapped fallback | keeps the 80,000 contract honest for the rare oversized request |
+One GGUF, two children, two `ctx-size` values. Consequences, all of them good:
 
-`qwen3-mid` is the workhorse of the long half: same file as `qwen3-fast`, so a conversation
-crossing 50k keeps identical weights and can in principle carry its KV across (section 11).
-`qwen3-long` exists only so that a prompt above ~72k still answers instead of erroring — without
-it, the 80,000 in the client config would be a lie. It should be rare; when it happens it costs
-a second GGUF load and, mid-thread, a possible subtle style shift (section 7).
+- **No second model file** to load, cache or keep in sync; a swap in either direction reads the
+  same warm page cache.
+- **No style shift** mid-thread — the weights are byte-identical, only the MTP head is idle in
+  the long child.
+- **Section 11's KV transfer is legal on the only hop there is**, since the structural checks
+  (`src/llama-kv-cache.cpp:2535,2563,2572`) compare a state file written by the same weights.
+- The old `qwen3-mid` / `qwen3-long` split and the second `...XXS.gguf` are **dropped**. They
+  existed only because the `-mtp` file was believed to cap out near 77k.
 
 ## 1. Why one process cannot do it
 
@@ -94,34 +102,76 @@ at all. That is a process boundary. No per-request gating inside one process rea
 Confidence: two datapoints, one linear model, but it reproduces both measured candidates and
 the implied 6.8% nextn share is sensible for one extra layer.
 
-### 1.1 The `-mtp` GGUF with MTP off tops out around 77,200
+### 1.1 Measured: the `-mtp` GGUF reaches 60,928 with MTP on and 105,472 with MTP off
 
-The earlier compute-aware matrix (`kv-calibration-findings.md:54-59`) is titled "GSQ-RCO MTP
-model" and its `MTP = no` row reports 96,000, which reads like the `-mtp` file reaching 96k with
-MTP disabled. It is not: that matrix predates per-GGUF accounting, as the next section says
-outright — "the model size, free VRAM, KV geometry, and probe result are **not** reused between
-the MTP and non-MTP files" (`:66-69`). The 96,000 reproduces exactly from the *non*-MTP file's
-free VRAM: `2,499.6 − 643 − 165.2 = 1,691.4` MiB / 18.0 KiB/token = **96,200**.
+Measured on GOKAYA 2026-09-07 with `mtp_ctx_sweep3.py`, one GGUF
+(`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`), traditional KV `q4_0`, `--flash-attn on`,
+`--fit off`, `--parallel 1`, the production power/clock flags
+(`--gpu-power-prefill 200 --gpu-power-decode 165 --gpu-mem-clock-decode 11001`). Two ceilings per
+config, because they are not the same number:
 
-Redo it with the `-mtp` file's own free VRAM and its MTP-off probe overhead:
-`2,165.6 − 643 − 165.2 = 1,357.4` MiB / 18.0 KiB/token ≈ **77,200 tokens**. The 334 MiB of extra
-weights stay resident whether the head is used or not, so the ceiling drops with them.
+- **startup ceiling** — the largest `--ctx-size` that reaches `/health`.
+- **usable ceiling** — the largest one whose *full-length* prefill also survives. This is the
+  number that matters; `kv-calibration-findings.md:36-46` warned about it and it is real:
+  `ggml_cuda_pool_vmm::alloc` grabs VRAM inside `launch_mul_mat_q` at prefill time, outside
+  everything reserved at load.
 
-Consequence: the `-mtp` file with MTP off **cannot** carry the full contract — 84,096 is out of
-reach by ~7k tokens (~121 MiB) — but it comfortably covers a **~72k prompt + 4k output**. Do not
-try to close the ~7k with the 643 MiB `fit-params-target` margin: the ceiling is a cliff (54,272
-works, 54,273 OOMs, `:144-159`) and that margin is exactly what keeps a maximum-size request from
-dying at the boundary.
+| MTP | b/ub | startup ceiling | usable ceiling | gap |
+|---|---:|---:|---:|---:|
+| off | 64 | 105,728 | **105,472** | 256 |
+| off | 512 | 98,560 | **98,048** | 512 |
+| on | 64 | 61,440 | **60,928** | 512 |
+| on | 512 | 52,736 | **51,712** | 1,024 |
 
-So this becomes `qwen3-mid` (section 0.1), capped at 72,000, with `qwen3-long` on the no-MTP file
-behind it for the rare overflow. Two things follow: the same weights as `qwen3-fast` make section
-11's state transfer legal again, and a conversation that grows past 50k sees no model change at
-all until it passes 72k.
+All boundaries are sharp and land on multiples of 256 (the FA KV padding): 105,984 fails to load,
+105,728 loads but OOMs on a 101,632-token prefill, 105,472 serves 101,376 + 4,096 cleanly.
 
-**77,200 is derived, not measured**, and the two plausible probe-overhead figures bracket it at
-77,200–78,400. So `ctx-size` for `qwen3-mid` must come from a measurement, not from this
-paragraph — staging (section 5) produces it with one extra INI section, and the `route-max-tokens`
-cap is then set to (measured − 4,096), rounded down.
+Three findings that change the plan:
+
+1. **The 77,200 in the previous version of this section was wrong by ~28k**, and wrong by method:
+   it applied fit-*probe* accounting (which subtracts a 643 MiB `fit-params-target` margin plus
+   probe overhead) to a `--fit off` configuration, which subtracts neither. The 96,000 row in
+   `kv-calibration-findings.md:54-59` does belong to the non-MTP file — that part was right — but
+   the correct comparison for prod is `--fit off` against `--fit off`, and there the `-mtp` file
+   with MTP off gives **105,472**. Never carry a probe candidate across into a `--fit off` budget.
+2. **MTP costs 44,544 tokens of context on this GPU** (105,472 → 60,928 at b/ub 64), i.e. the
+   speedup is bought at 42% of the available context. That is the whole reason two children exist.
+3. **The current production `--ctx-size 54272` for the MTP child leaves 6,656 tokens unused** —
+   60,928 works at b/ub 64. The old 54,272 was a fit-probe candidate, not a measured limit.
+
+**Batch size is a context/throughput knob, not a free choice.** b/ub 512 costs context and buys
+prefill speed; b/ub 64 does the opposite:
+
+| MTP | b/ub 64 usable | b/ub 512 usable | context cost of 512 | prefill tok/s (64 → 512) |
+|---|---:|---:|---:|---|
+| on | 60,928 | 51,712 | **−9,216** | 598.6 → 855.1 (+43%) |
+| off | 105,472 | 98,048 | **−7,424** | 632.4 → 916.6 (+45%) |
+
+(prefill measured on the same 32,768-token prompt at a common `ctx-size` of 40,960 — see 12.3;
+the ceiling runs are not comparable to each other, their prompts differ by design)
+
+For `qwen3-fast` that trade is worth taking in favour of context: b/ub 64 gives 9,216 more tokens
+before a swap to the long child is needed, and a swap costs far more than the prefill difference.
+Production runs b/ub 512 today, which is why its MTP child was stuck below 52k.
+
+**Methodological trap, recorded so the next run does not lose two hours to it.** GOKAYA has
+15 GiB of RAM, its swap is **zram** (compressed RAM, so there is no real swap headroom), other
+services hold ~5 GiB, and the model is a 10.4 GiB mmap. A load burst on top of a warm page cache
+plus the production `--cache-ram 3072` gets the child **SIGKILLed by the kernel OOM killer**
+(`rc=-9`, `dmesg`: `Out of memory: Killed process llama-server ... file-rss:9.7GB`) *before* VRAM
+is ever the constraint. An earlier run read those kills as VRAM ceilings and reported a false
+usable ceiling of 75,520 for the MTP-off/b64 config — 30k too low. Any ceiling harness must:
+run with `--cache-ram 0` (host-side prompt cache, irrelevant to a VRAM ceiling), `drop_caches`
+and wait for `MemAvailable` between children, and treat `rc=-9` with no CUDA OOM in the log as
+**retry**, never as a ceiling.
+
+### 1.2 A zero-code win available today
+
+Production currently serves the *non-MTP* `...XXS.gguf` at `--ctx-size 65536`, b/ub 512, no MTP.
+The same box, same `--fit off`, running the `-mtp` file with MTP off at b/ub 64 is measured at
+**105,472** — a 61% larger context, from a single unit-file edit and no router at all. The price is
+prefill throughput (516 vs 776 tok/s) and giving up nothing else, since that child is not using MTP
+either way. If the router work slips, this is the interim configuration to run.
 
 ## 2. Why the swap cost is acceptable
 
@@ -133,9 +183,17 @@ The requests that need the long tier are the ones where a model load is noise:
 
 A swap is one model load per direction — sleeping is a full `destroy()`
 (`server-context.cpp:964-1005`), so waking is a full load; there is no cheap warm swap. At the
-assumed 8 s that is ~16 s against ~180 s, **≈ 9%**. And for these requests the honest baseline
-is not "8 s slower" but **"completes" versus "CUDA OOM"**. The fast↔mid swap is cheaper still:
-same file, so the second load reads a warm page cache (measure it, section 5 item 2).
+measured 10 s (13.1) that is ~20 s against ~180 s, **≈ 11%**. And for these requests the honest
+baseline is not "10 s slower" but **"completes" versus "CUDA OOM"**. Both children name the same
+file, so every swap in either direction reads a warm page cache — that is what the 10 s figure
+assumes; cold from disk it is worse.
+
+**But the swap path has a host-RAM constraint, not just a VRAM one.** 15 GiB of RAM, zram swap
+(no real headroom), ~5 GiB held by other services, a 10.4 GiB mmap — the calibration run had
+children SIGKILLed by the OOM killer while cycling loads (1.1). The router will do exactly that
+cycling. So: keep `cache-ram` modest (≤ 2048, not the 3072 prod uses today), and make sure the
+evicted child is fully gone before the next one loads — `unload_lru()` already destroys before
+loading, which is what keeps this safe; do not raise `--models-max` above 1 on this box.
 
 ## 3. What the router already does (no code)
 
@@ -166,64 +224,67 @@ size.** Aliases cannot express it — `get_meta()` resolves an alias to a single
 version = 1
 
 [*]
-batch-size = 64
+model = /home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf   ; one file, both children
+batch-size = 64                ; 64 not 512: buys 7,680 tokens of ctx on the MTP child (1.1)
 ubatch-size = 64
 cache-type-k = q4_0
 cache-type-v = q4_0
 parallel = 1
 flash-attn = on
+fit = off                      ; the measured ceilings below are --fit off numbers
+cache-ram = 2048               ; not 3072: host RAM is the tight resource on this box (2)
+ctx-checkpoints = 1
+gpu-power-prefill = 200
+gpu-power-decode = 165
+gpu-power-device = 0
+gpu-mem-clock-decode = 11001
 sleep-idle-seconds = 300
 
 [qwen3-fast]
-model = /path/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf
-ctx-size = 54264
-spec-draft-mtp = true          ; whatever this repo names the MTP enable flag
+ctx-size = 60928               ; measured usable ceiling, b/ub 64, MTP on (1.1)
+spec-type = draft-mtp
 spec-draft-n-max = 2
 spec-draft-p-min = 0.80
+spec-draft-type-k = q4_0
+spec-draft-type-v = q4_0
 route-group = qwen-3.8-27b     ; new preset-only key
-route-max-tokens = 50000       ; new preset-only key: serve only requests up to this budget
-
-[qwen3-mid]
-model = /path/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf   ; same file as qwen3-fast, MTP off
-ctx-size = 76000               ; PLACEHOLDER - replace with the staged measurement (1.1)
-route-group = qwen-3.8-27b
-route-max-tokens = 72000       ; = ctx-size - 4096, rounded down
+route-max-tokens = 56000       ; new preset-only key: serve only requests up to this budget
 
 [qwen3-long]
-model = /path/Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf
-ctx-size = 97280
+ctx-size = 105472              ; measured usable ceiling, b/ub 64, MTP off (1.1)
 route-group = qwen-3.8-27b
-; no route-max-tokens = the group's uncapped fallback, for prompts above ~72k
+; no route-max-tokens = the group's uncapped fallback; 105,472 covers the whole 84,096 contract
 ```
 
 ```sh
 llama-server --models-preset ./my-models.ini --models-max 1
 ```
 
-`route-max-tokens = 50000` against a 54,264 ceiling leaves 4,264 tokens of margin. That
-matters because the boundary is sharp: `54,272` works and `54,273` OOMs
-(`kv-calibration-findings.md:144-159`). Apply the same rule to `qwen3-mid`: cap = ceiling − 4,096
-output − a few hundred of slack, never the ceiling itself.
+`route-max-tokens = 56000` against a 60,928 ceiling leaves 4,928 tokens of margin — the 4,096-token
+output the clients ask for plus 832 of slack. That margin is not optional: the boundary is a cliff
+(60,928 serves a full-length request, 61,184 loads and then dies on the prefill, 61,696 does not
+load at all). Never set a cap to the ceiling itself.
 
-`qwen3-fast` and `qwen3-mid` name the **same file**, so the second load hits a warm page cache and
-the two never coexist anyway at `--models-max 1`.
+`qwen3-long` needs no cap: 105,472 − 4,096 = 101,376 usable prompt, comfortably above the 80,000
+the clients are configured for, and a 101,376 + 4,096 request is measured working.
 
 ## 5. Staging step (config only, no code)
 
 Before the routing code exists, run the same INI **without** the `route-*` keys and have a
-test client name `qwen3-fast` / `qwen3-mid` / `qwen3-long` directly. Nothing to code-review, and
+test client name `qwen3-fast` / `qwen3-long` directly. Nothing to code-review, and
 it produces every number the rest of the plan assumes:
 
-1. **The `qwen3-mid` ceiling** — the one figure the whole three-tier shape rests on. Run it with
-   `ctx-size = 0` and read the candidate the fit probe picks; then pin that value explicitly and
-   send a maximum-size request to confirm it is a *usable* limit, not just a startup one
-   (`kv-calibration-findings.md:36-46` is the cautionary tale). Expect 77k–78k per 1.1. If it
-   lands materially lower, re-derive the caps; if it somehow clears 84,096, drop `qwen3-long`
-   entirely and the plan gets simpler.
-2. **The real load time**, replacing the assumed 8 s — separately for a cold file and for the warm
-   `-mtp.gguf` page cache that a fast↔mid swap sees.
-3. **The two known ceilings** still hold: 50,168 + 4,096 on fast, 93,184 + 4,096 on long.
-4. **Eviction and VRAM reclaim** across each pair, via `nvidia-smi`.
+1. ~~The ceilings~~ — **done**, measured directly (1.1): 60,928 for the MTP child and 105,472 for
+   the MTP-off child, both at b/ub 64, both confirmed with a full-length prompt + 4,096 output.
+   Both configs also loaded and served **when spawned by the router** (13.1), so its arg rendering
+   costs no extra VRAM. Still untested through the router: a *full-length* 101,376-token prompt on
+   the long child — 13.1 only went to 70,019, and the cliff is 256 tokens wide.
+2. ~~The real load time~~ — **done** (13.1): 7.5 s of child startup, ~10 s for a swap, page cache
+   warm. A cold-file number is still missing.
+3. **Eviction and VRAM reclaim** across the pair, via `nvidia-smi`. Also watch host RAM: the
+   swap cycle is exactly the pattern that hit the OOM killer during calibration (1.1, 2).
+4. **The b/ub choice**, if prefill latency turns out to matter more than context: b/ub 512 costs
+   the MTP child 7,680 tokens of ceiling and buys +49% prefill throughput (1.1).
 
 ## 6. The routing code
 
@@ -248,8 +309,8 @@ std::string resolve_route_target(name, /* optional */ body)
 - name is a group, `body` present → estimate the budget (6.2) and return the first member
   whose `max_tokens` covers it, else the uncapped member
 - name is a group, no `body` (GET `/props`, `/tokenize`, …) → return the currently loaded
-  member, else the group's **largest-capped** member (`qwen3-mid`), not the uncapped overflow —
-  `/props` should not be able to boot the rarely-used third child
+  member, else the group's **capped** member (`qwen3-fast`) — a metadata request should not get to
+  pick which child boots
 
 Call it in `proxy_post` right after `json::parse(req.body)`, before
 `router_validate_model` (`server-models.cpp:1914-1920`). Everything downstream —
@@ -270,7 +331,7 @@ proxies HTTP. Given consequence 3 of the contract, undershoot is a client-visibl
   being wrong.
 - **Always add the output reserve:** the budget is `prompt + n_predict`. When the request omits
   `max_tokens`/`n_predict`, assume the router's `-n` default (4,096 here, matching the client
-  config) rather than 0 — otherwise a 52k prompt with an implicit 4k output routes to the 54,264
+  config) rather than 0 — otherwise a 57k prompt with an implicit 4k output routes to the 60,928
   child and dies at the boundary.
 
 ### 6.3 No demotion within a conversation
@@ -279,18 +340,18 @@ proxies HTTP. Given consequence 3 of the contract, undershoot is a client-visibl
 child, and `proxy_post` re-`remember()`s it on every POST *after* name resolution
 (`server-models.cpp:1928`) — so a migrating conversation re-pins itself with no extra code.
 
-Add one rule: **a conversation never moves down the ladder.** If it is pinned to `qwen3-mid`,
-a turn that estimates under 50k still goes to `qwen3-mid`; same for `qwen3-long`. Conversations
-grow monotonically, so this makes each one migrate at most twice instead of flapping around a
-threshold, and it costs a single map lookup. Without it, a conversation hovering near 50k would
-swap models on nearly every turn — and each swap also throws away the prompt cache (see 7).
+Add one rule: **a conversation never moves down the ladder.** If it is pinned to `qwen3-long`, a
+turn that estimates under 56k still goes to `qwen3-long`. Conversations grow monotonically, so this
+makes each one migrate at most **once** instead of flapping around a threshold, and it costs a
+single map lookup. Without it, a conversation hovering near 56k would swap models on nearly every
+turn — and each swap also throws away the prompt cache (see 7).
 
 ### 6.4 `/v1/models` (same phase, cheap)
 
 Mark all members `hidden` (extend the existing flag with a preset-only key, or derive it from
 `route-group` membership) and append one synthetic entry for the group in the listing loop
 (`server-models.cpp:1995-2035`). Advertise 80,000 (the contract) so a client that inspects the
-list sees that rather than a 54,264 ceiling. This is cosmetic for the
+list sees that rather than a 60,928 ceiling. This is cosmetic for the
 current clients — they already know the name — but any OpenAI-compatible library that
 validates the model list would otherwise break on a name that answers requests yet is absent
 from `/v1/models`.
@@ -299,23 +360,23 @@ from `/v1/models`.
 
 Worth agreeing on these before implementing, because they are the price of the contract:
 
-- **TTFT spikes.** A small request that follows a big one pays the swap: ~8 s of first-token
-  latency on a request that would otherwise answer in ~2 s. Same single model name, wildly
+- **TTFT spikes.** A small request that follows a big one pays the swap: ~10 s of first-token
+  latency, measured (13.1), on a request that would otherwise answer in ~2 s. Same model name, wildly
   variable TTFT. Unavoidable at `--models-max 1`; the mitigation is 6.3 plus, if measurement
-  justifies it, a hysteresis timer keeping the upper tier resident for N seconds. A fast↔mid swap
-  is the cheap one — same file, warm page cache.
+  justifies it, a hysteresis timer keeping the long child resident for N seconds. Every swap here
+  is the cheap kind — one file, warm page cache.
 - **Prompt cache loss on migration.** A swap discards the child's cached prefix. A 60k
-  conversation crossing the threshold re-prefills from scratch, ~110 s. 6.3 limits this to twice
-  per conversation; interleaved conversations of mixed sizes are the bad case. The fast→mid hop is
-  the one that can be optimised away later, because those two share weights (section 11).
-- **A style shift, but only on the rare overflow.** `qwen3-fast` and `qwen3-mid` are the same
-  file, so crossing 50k changes nothing about the weights (MTP is distribution-preserving anyway —
-  every draft token is verified against the target). Only a jump to `qwen3-long`, above ~72k,
-  switches artifacts: same base model and quant class, but a separate file, so a subtle mid-thread
-  style shift is possible there. That is the price of honouring the 80,000 in the client config;
-  if it ever shows up in practice, the fix is to requantize a matching pair.
-- **Throughput asymmetry stays visible.** ~47 decode tok/s under 50k, ~21 above it. Nothing to
-  do about that — it is the point of the exercise.
+  conversation crossing the threshold re-prefills from scratch, ~110 s. 6.3 limits this to **once**
+  per conversation; interleaved conversations of mixed sizes are the bad case. This is the hop that
+  section 11 can optimise away, since both children share weights.
+- **No style shift.** Both children load the same GGUF, so crossing 56k changes nothing about the
+  weights — only whether the MTP head is used, and MTP is distribution-preserving anyway (every
+  draft token is verified against the target). This was the main risk of the earlier two-GGUF
+  design and the measurement in 1.1 removed it.
+- **Throughput asymmetry stays visible**, and it is large: **42.9 decode tok/s** on the fast child
+  against **19.15** on the long one, each at its own full length (both measured, section 12). A
+  4,096-token answer takes 95 s on the fast tier and 214 s on the long one. Nothing to do about
+  that — it is the point of the exercise.
 
 ## 8. Files touched
 
@@ -330,58 +391,62 @@ Routing:
 | `tools/server/server-models.cpp` | build `route_groups` in `load_models()`; `resolve_route_target()` (estimator + no-demotion rule); call it in `proxy_post` (`:1917`) and `proxy_get`; hide members and emit the group entry in the `/v1/models` loop |
 | `tools/server/README.md` | document the routing group, the estimator fallback and the TTFT/prompt-cache caveats |
 
-Adding the third tier changes none of these rows: `route_groups` holds an ordered list of members,
-so the ladder is INI-only.
+`route_groups` holds an ordered list of members, so adding or removing a tier later is INI-only and
+touches none of these rows.
 
 Nothing in `common/speculative.cpp`, nothing in `server-context.cpp`, no change to
 `can_speculate()`, no new inference-side flag.
 
 ## 9. Validation
 
-1. **Staging, every tier named explicitly.** `qwen3-fast` with 50,168 prompt + 4,096 output →
-   HTTP 200, ~47 decode tok/s. `qwen3-long` with 93,184 + 4,096 → HTTP 200, ~21 decode tok/s.
-   Must match `kv-calibration-findings.md:414` and `:238` within noise.
-2. **The `qwen3-mid` ceiling** (section 5, item 1). Fit-probe candidate with `ctx-size = 0`, then a
-   maximum-size request at the pinned value → HTTP 200, no OOM. This number sets `qwen3-mid`'s
-   `ctx-size` and cap; everything about the three-tier shape depends on it.
+Status after the 2026-09-07 session (13): **1, 2, 5, 7, 8 done** — including the largest request the
+contract allows (80,036 tokens) through the router, on the long child, at 11,887 MiB of 12,282.
+**3 partly**: the swap was timed (~10 s) but VRAM reclaim was not watched *across* the eviction.
+**4, 6, 9 open** (13.3).
+
+1. **Staging, both tiers named explicitly.** `qwen3-fast` with 56,832 prompt + 4,096 output →
+   HTTP 200, ~44 decode tok/s. `qwen3-long` with 101,376 + 4,096 → HTTP 200. Both are already
+   measured directly (1.1); this repeats them through the router's own child spawn.
+2. **The ceilings survive the router.** The children must reach 60,928 and 105,472 when the router
+   renders their args, not only when launched by hand. A few extra MiB of VRAM would push a
+   full-length request over the cliff, and the cliff is 256 tokens wide.
 3. **Swap cost and VRAM reclaim.** Time the second request's queue-to-first-token delta and
    watch `nvidia-smi` across the eviction: VRAM must return to the idle baseline between
-   children. Measure fast↔mid (same file, warm cache) separately from mid↔long. The measured load
-   time replaces the assumed 8 s everywhere in this doc.
+   children. Also watch host `MemAvailable` — the swap cycle is the OOM-killer pattern from 1.1.
+   The measured load time replaces the assumed 8 s everywhere in this doc.
 4. **A busy child is never evicted.** Start a long generation on the fast tier, then fire a
-   mid-tier request: the first completes normally, the second queues and only then swaps. The
+   long-tier request: the first completes normally, the second queues and only then swaps. The
    whole design leans on this (`server-models.cpp:92`, `:203`, `:113`).
 5. **Transparency, the actual acceptance test.** With only `qwen-3.8-27b` configured, send
-   8k / 40k / 52k / 60k / 78k-token prompts each with `max_tokens=4096`. All must return HTTP
-   200; log which child served each. Two boundaries to get right: the 52k case must land on
-   `qwen3-mid` (52k + 4k > 50k cap), and the 78k case must land on `qwen3-long` (78k + 4k > 72k
-   cap) — that second one is the whole reason the third tier exists.
+   8k / 40k / 55k / 60k / 80k-token prompts each with `max_tokens=4096`. All must return HTTP
+   200; log which child served each. The boundary to get right: 55k + 4k > the 56,000 cap, so that
+   one must land on `qwen3-long`, while 40k + 4k stays on `qwen3-fast`.
 6. **Estimator accuracy**, Portuguese and English, `/tokenize` truth vs bytes ÷ 3.5, at the same
-   sizes. Record the worst-case undershoot; it must stay inside the tightest margin, which is
-   `qwen3-mid`'s (ceiling − cap − 4,096).
-7. **Omitted `max_tokens`.** A 52k prompt with no `max_tokens` must still route to `qwen3-mid`
+   sizes. Record the worst-case undershoot; it must stay inside `qwen3-fast`'s margin
+   (60,928 − 56,000 − 4,096 = 832 tokens). 832 is not much — this is why the exact `/tokenize` path
+   is mandatory and the byte heuristic is a cold-start fallback only.
+7. **Omitted `max_tokens`.** A 55k prompt with no `max_tokens` must still route to `qwen3-long`
    (implicit 4k reserve applied).
-8. **No demotion.** A conversation growing 40k → 52k → 55k must migrate once to `qwen3-mid` and
-   never come back; count the model loads (exactly one). Then push the same conversation past 72k
-   and confirm exactly one more load, to `qwen3-long`.
+8. **No demotion.** A conversation growing 40k → 55k → 60k must migrate exactly once, to
+   `qwen3-long`, and never come back; count the model loads (exactly one).
 9. **Thrash cost.** Alternate small/large 5× and record total wall clock, to decide whether a
    hysteresis timer is worth building.
 
 ## 10. Sequencing
 
-1. Section 5 staging config — today, no code. Produces the `qwen3-mid` ceiling (the number the
-   three-tier shape rests on) and the real load times.
+1. Section 5 staging config — today, no code. The ceilings are already measured (1.1); staging now
+   only has to confirm them through the router and produce the real load times.
 2. Sections 6.1–6.3 — the routing itself. This is the deliverable the clients need.
 3. Section 6.4 — `/v1/models` cosmetics, same phase if cheap.
 4. Hysteresis only if test 9 says so.
-5. Section 11 KV state transfer between `qwen3-fast` and `qwen3-mid`, only if test 9 says the
-   migration cost hurts. It is legal (same weights) but it is real code, not config.
+5. Section 11 KV state transfer between the two children, only if test 9 says the migration cost
+   hurts. It is legal (same weights) but it is real code, not config.
 
 ## 11. Carrying the KV state across the swap
 
 The question this answers: can the RAM cache make the context load faster when the router
-switches tiers? Not the RAM cache — but a file-backed path already in the tree can, for the
-fast↔mid hop, because those two children run the same GGUF.
+switches tiers? Not the RAM cache — but a file-backed path already in the tree can, and now that
+both children run the same GGUF it applies to the only hop there is.
 
 ### 11.1 `--cache-ram` cannot cross a swap
 
@@ -396,9 +461,10 @@ child. It accelerates turns **within** a tier and does nothing for the crossing.
 `--slot-save-path` (`arg.cpp:3853`) plus `SERVER_TASK_TYPE_SLOT_SAVE`/`_RESTORE`
 (`server-context.cpp:2688`/`:2738`, HTTP `action=save|restore` at `:4974-4977`) over
 `llama_state_seq_save_file`/`load_file` (`src/llama-context.cpp:4348`/`:4359`) moves a slot's KV
-between processes through a file. Sizing at 18.0 KiB/token: ~954 MiB for 54,264 tokens, ~1.3 GiB
-at 72k. On **tmpfs** that is a few seconds of write plus read against **~110 s of prefill** for a
-60k prompt. That, not the model load, is where the latency is.
+between processes through a file. Sizing at 18.0 KiB/token: ~1.05 GiB for a full 60,928-token fast
+slot. **Not tmpfs on this box** — tmpfs is RAM and RAM is the scarce resource here (1.1, 2); write
+it to disk, or cap it well below `MemAvailable`. Either way it is a few seconds of write plus read
+against **~110 s of prefill** for a 60k prompt. That, not the model load, is where the latency is.
 
 Flow: `save` on the outgoing child before eviction → swap → `restore` on the incoming child → the
 next request finds its prefix in the slot and prefills only the delta.
@@ -424,12 +490,14 @@ What `save` captures, precisely (`server-context.cpp:2688-2737`): the **live KV 
 A state file from a different GGUF either fails those checks or, worse, is accepted and serves KV
 computed by other weights, silently. So:
 
-- **`qwen3-fast` → `qwen3-mid`: legal.** Same file, so same hparams and the same target KV
+- **`qwen3-fast` → `qwen3-long`: legal.** Same file, so same hparams and the same target KV
   geometry; MTP on/off only decides whether a separate `ctx_dft` exists, which is not in the file.
-  This is the hop the three-tier shape was chosen to make possible.
-- **anything ↔ `qwen3-long`: forbidden.** Different artifact. Never write a restore path that can
-  reach it.
-- **Only upward.** 54k of cells fit in a 76k cache, never the reverse — and the no-demotion rule
+  Since the measurement collapsed the ladder onto one GGUF (1.1), this is the only hop and it is
+  the legal one.
+- **Any second GGUF: forbidden.** If a differently-quantized file is ever added as a third tier,
+  no restore path may reach it — the checks would pass structurally and serve KV computed by other
+  weights, silently.
+- **Only upward.** 61k of cells fit in a 105k cache, never the reverse — and the no-demotion rule
   (6.3) already forbids the other direction.
 
 ### 11.4 Why it is still step 5, not step 2
@@ -439,10 +507,11 @@ the restore has to be issued after the load completes, and a tmpfs directory nee
 and a reaper. The guard against the forbidden hop above is also code that has to be written and
 reviewed.
 
-Meanwhile the cheap version is already in the plan: **no-demotion plus a generous `-cram` on the
-upper children**. A conversation migrates once, then lives in `qwen3-mid`, where the in-RAM cache
-works normally for every later turn. That leaves exactly one expensive turn per conversation.
-Build 11.2 when test 9 shows those turns add up.
+Meanwhile the cheap version is already in the plan: **no-demotion plus `-cram` on the long child**.
+A conversation migrates once, then lives in `qwen3-long`, where the in-RAM cache works normally for
+every later turn. That leaves exactly one expensive turn per conversation. Build 11.2 when test 9
+shows those turns add up. Keep `-cram` at 2048, not 3072: on this box the host RAM is what breaks
+first (1.1).
 
 Unrelated config win, cheap and independent: **do not pass `--ctx-size 0` to the children in
 production.** With 0 the fitting probe builds and frees full target + MTP contexts on every load,
@@ -451,3 +520,191 @@ inflating swap time. Use it once during staging to *find* the numbers, then pin 
 Keep `docs/mtp-adaptive-context-plan.md` for its code-path analysis — the always-on
 `common_speculative_process()` shadow decode and the five static-capability uses of
 `can_speculate()` are correct findings worth having on record — but do not implement it.
+
+## 12. Test session: how these numbers were produced
+
+Run on GOKAYA (`192.168.1.57`, RTX 4070 12 GiB, 15 GiB RAM) on 2026-09-07, with the production
+`llama-server-root` unit stopped for the duration. Harness: `mtp_ctx_sweep3.py` at the repo root
+(an earlier version produced the contaminated numbers described in 12.4 and is not kept).
+
+### 12.1 What the harness does
+
+Per config (MTP on/off × b/ub 64/512), against one GGUF and one set of flags where only those two
+axes vary:
+
+1. **Phase A — startup ceiling.** Binary search over multiples of 256 (the FA KV pad) for the
+   largest `--ctx-size` that reaches `GET /health`.
+2. **Phase B — usable ceiling.** From that ceiling downward, binary search for the largest
+   `--ctx-size` whose **full-length prefill** (`ctx − 4096` tokens, `n_predict=1`) returns 200
+   without the child dying. A pass/fail here is a real request, not an allocation guess.
+3. **Confirm.** At the usable ceiling, one maximum-size request: `ctx − 4096` prompt +
+   4,096 forced tokens (`ignore_eos`), recording wall time, prefill tok/s and decode tok/s.
+4. **Comparison.** The same request (32,768 + 1,024) on every config at a common `ctx-size`
+   of 40,960, which isolates the b/ub effect on throughput from the ceiling effect.
+
+Prompts are built by tokenizing one phrase via `/tokenize` and repeating the ids to an exact
+token count, so "50,176 tokens" means exactly that and not an estimate. The unit is stopped and
+restarted by the harness itself in a `finally`, so an abort still returns the box to production.
+
+### 12.2 Flags held constant
+
+```
+--model Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf --device CUDA0 --parallel 1
+--flash-attn on --cache-type-k q4_0 --cache-type-v q4_0
+--fit off --ctx-checkpoints 1 --cache-ram 0
+--gpu-power-prefill 200 --gpu-power-decode 165 --gpu-power-device 0 --gpu-mem-clock-decode 11001
+[MTP only] --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80
+           --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
+```
+
+Same as the production unit except `--cache-ram` (0 instead of 3072, see 12.4) and the two axes
+under test. `--fit off` matters: these are hard ceilings, not probe candidates.
+
+### 12.3 Results
+
+Ceilings — see the table in 1.1. Maximum-size requests at each usable ceiling:
+
+| Config | ctx | prompt + output | wall | prefill tok/s | decode tok/s |
+|---|---:|---|---:|---:|---:|
+| MTP off, b/ub 64 | 105,472 | 101,376 + 4,096 | 449.9 s | 432.98 | **19.15** |
+| MTP on, b/ub 64 | 60,928 | 56,832 + 4,096 | 205.6 s | 516.10 | **42.90** |
+| MTP on, b/ub 512 | 51,712 | 47,616 + 4,096 | 152.2 s | 776.46 | 45.08 |
+| MTP off, b/ub 512 | 98,048 | 93,952 + 4,096 | 345.8 s | 674.32 | 19.84 |
+
+Each row runs at its own ceiling, so the prompt lengths differ and the throughputs are **not**
+comparable across rows. That is what the last phase is for — the same 32,768 + 1,024 request on all
+four configs at a common `--ctx-size 40960`:
+
+| Config | prefill tok/s | decode tok/s | wall | VRAM |
+|---|---:|---:|---:|---:|
+| MTP off, b/ub 64 | 632.41 | 28.46 | 87.8 s | 10,519 MiB |
+| MTP off, b/ub 512 | **916.61** | 28.88 | 71.2 s | 10,633 MiB |
+| MTP on, b/ub 64 | 598.63 | 51.09 | 74.8 s | 11,385 MiB |
+| MTP on, b/ub 512 | 855.09 | **51.82** | 58.1 s | 11,613 MiB |
+
+Reading it, with everything but one axis held fixed:
+
+- **MTP buys 1.80× on decode** (51.09 vs 28.46 at b/ub 64) and costs 44,544 tokens of ceiling.
+- **b/ub 512 buys +45% on prefill** (916.61 vs 632.41) and costs 7,424–9,216 tokens of ceiling,
+  while leaving decode alone (28.46 → 28.88). It is a pure prefill/context trade.
+- MTP also costs ~5% of prefill (632.41 → 598.63): the draft head is evaluated during prefill too.
+
+Caveat on the decode figures: the prompt is a repeated phrase, so the continuation is unusually
+predictable and MTP's acceptance rate is flattered. The *relative* comparison across configs holds
+(same prompt everywhere), the absolute 1.80× is an upper bound; real conversational text will be
+lower.
+
+### 12.4 What went wrong twice, and what to do about it
+
+- **Missing `LD_LIBRARY_PATH`** (the production unit sets it) — every child exited `rc=127`.
+- **Host OOM masquerading as a VRAM ceiling.** Detailed in 1.1. Symptom: `rc=-9` with no CUDA
+  message in the log; the same config that had loaded at 79,360 minutes earlier "failed" at
+  78,848. It produced a usable ceiling of 75,520 that was 30k too low, and it is the reason
+  `--cache-ram 0` plus `drop_caches` plus retry-on-`rc=-9` are in the harness now. **A ceiling
+  measurement on this box is only trustworthy if the failure at the boundary is a CUDA OOM in the
+  log.**
+
+### 12.5 Reproducing
+
+```sh
+scp mtp_ctx_sweep3.py 192.168.1.57:/home/hjotha/
+ssh 192.168.1.57 'cd /home/hjotha && nohup python3 -u mtp_ctx_sweep3.py > sweep3.out 2>&1 &'
+```
+
+Results land in `/home/hjotha/mtp-ctx-sweep3-results.json`; progress in `sweep3.out`. Budget
+~2 h of production downtime for the full four-config matrix — each usable-ceiling probe is a real
+100k-token prefill.
+
+## 13. Test session: the routing code itself
+
+Harness: `route_group_smoke.py` at the repo root. It writes a `--models-preset` INI, starts the
+router with `--models-max 1`, fires real requests at the **public name only**, and asserts against
+the router's own `route group '...': N prompt + M output = ... -> child` log lines plus the response
+bodies. Two profiles:
+
+- `tiny` — a 4B GGUF, `tiny-fast` (ctx 2,048, cap 300) + `tiny-long` (ctx 8,192). Same decisions,
+  seconds per request instead of minutes. Use this one while changing the code.
+- `real` — the deployment: one `-mtp` GGUF, `qwen3-fast` (60,928, MTP) + `qwen3-long` (105,472),
+  public name `qwen-3.8-27b`, cap 56,000. This is the acceptance test.
+
+```sh
+scp route_group_smoke.py 192.168.1.57:/home/hjotha/
+ssh 192.168.1.57 'echo $PASS | sudo -S systemctl stop llama-server-root'
+ssh 192.168.1.57 'cd /home/hjotha && python3 -u route_group_smoke.py tiny'   # ~15 s
+ssh 192.168.1.57 'cd /home/hjotha && python3 -u route_group_smoke.py real'   # ~10 min
+ssh 192.168.1.57 'cd /home/hjotha && python3 -u route_group_smoke.py real worst'   # ~6 min
+ssh 192.168.1.57 'echo $PASS | sudo -S systemctl start llama-server-root'
+```
+
+### 13.1 Results — 2026-09-07, both profiles 15/15
+
+The `real` run, one line per assertion (prompt/output are the router's counts, not the aim):
+
+| Check | Result |
+|---|---|
+| `/v1/models` lists `qwen-3.8-27b` and nothing else | PASS |
+| group `meta.n_ctx` = widest member's ctx-size | PASS 105,472 |
+| `meta.route_members` ordered, capped tier first | PASS `[(qwen3-fast, 56000), (qwen3-long, -1)]` |
+| 512-token ask → fast tier | PASS (660 + 32) |
+| response `model` field | PASS `qwen-3.8-27b` |
+| exact `/tokenize` count, not bytes ÷ 3.5 | PASS aimed 50,000, counted 50,024 |
+| 50,024 + 32 (under the cap) stays on fast | PASS |
+| 57,526 + 32 (over the cap) → long | PASS, swapped mid-request |
+| 70,019-token ask → long | PASS, 502.2 prefill / 22.6 decode tok/s |
+| omitted `max_tokens` reserves 4,096 | PASS |
+| conversation pinned wide is never demoted | PASS long → long |
+| a *different* conversation still routes by size | PASS → fast |
+| 93,001-token `/tokenize` answered | PASS |
+| …and logged no routing decision | PASS |
+
+Plus `route_group_smoke.py real worst`, run separately because it costs ~6 minutes: **the largest
+request the advertised contract allows** — ctx 80,000 minus the 4,096 output the client also asks
+for, decoded to the last token with `ignore_eos`.
+
+| | |
+|---|---|
+| counted | 75,940 prompt + 4,096 output = 80,036 → `qwen3-long` |
+| result | HTTP 200 in 354 s, prefill 489.5 tok/s, decode 21.5 tok/s |
+| output | exactly 4,096 completion tokens, no truncation |
+| model field | `qwen-3.8-27b` |
+| VRAM | 11,887 MiB with the long child resident (of 12,282 available) |
+
+Two numbers worth keeping:
+
+- **Swap cost is ~10 s, not the 8 s assumed throughout this doc.** Child startup is 7.5 s
+  (`load_model` → `model loaded`) with the GGUF warm in page cache, and a 512-token request that
+  forced a tier swap took 10 s end to end. Cold from disk it will be worse — the 10.4 GiB file is
+  read twice per alternation.
+- **Transparency is real, verified two ways.** The child's rendered args carry
+  `--alias qwen-3.8-27b` (not `qwen3-fast`), and every response body echoed `qwen-3.8-27b`. Without
+  the forced alias a client that replays `response["model"]` would address a tier directly and
+  bypass routing entirely.
+
+### 13.2 What the harness got wrong, and the fix
+
+Both failures were in the test, not the router — worth recording because both look like routing
+bugs at first glance:
+
+- **`%` binds tighter than `+`.** `COMMON_INI + """...""" % dict(...)` substituted only the second
+  string, so the children were launched with a literal `%(model)s` path and died with
+  `failed to open GGUF file '%(model)s'`. Surfaced as HTTP 500 `failed to load`, which reads exactly
+  like a VRAM problem.
+- **BPE merges across a repetition boundary.** Calibrating on one copy of the filler phrase (32
+  tokens) overestimated by ~3%: a prompt aimed at 56,200 tokens arrived as 54,488, landed *under*
+  the 56,000 cap, and the correct routing decision was scored as a failure. Calibrating on 100
+  repetitions (31.01 tokens each) brought the error to 0.05%. The lesson transfers to the router's
+  own estimator: any tokens-per-unit-of-text constant measured on a short sample is optimistic.
+
+### 13.3 Not covered by this harness
+
+- **Test 4 of section 9** (a busy child is never evicted) — needs two concurrent clients; the
+  harness is sequential.
+- **Test 9** (thrash cost over an alternating series) — the swap cost above is a single measurement,
+  enough to defer hysteresis, not enough to price it.
+- **A full-length request through the router.** `worst` covers what clients can actually send
+  (80,036 tokens); it does not reach the long child's own ceiling of 101,376 + 4,096. The cliff is
+  256 tokens wide, so if the advertised context is ever raised above 80,000, re-measure — do not
+  assume the headroom is there.
+- **Estimator accuracy on natural text.** Every prompt here is one repeated phrase, so the
+  cold-start bytes ÷ 3.5 fallback was only exercised incidentally (it read 660 tokens for a
+  579-token prompt: a 14% *over*estimate, which is the safe direction).

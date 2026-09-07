@@ -106,6 +106,13 @@ struct server_model_meta {
     void update_caps();
 };
 
+// one tier of a routing group: a member child that serves requests up to max_tokens
+// (prompt + output budget). max_tokens < 0 means uncapped: the group's fallback tier
+struct route_group_member {
+    std::string name;
+    int64_t max_tokens = -1; // -1 = uncapped, serves everything the capped tiers reject
+};
+
 struct server_models_routes;
 struct server_subproc;   // defined in server-models.cpp
 struct server_lru_sched; // defined in server-models.cpp
@@ -125,6 +132,12 @@ private:
     std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
+
+    // public name -> member tiers (ascending max_tokens, uncapped member last), built by
+    // rebuild_route_groups() inside load_models(). kept deliberately outside mapping: a group
+    // is not a loadable child, and every existing invariant (LRU counting, status transitions)
+    // assumes a mapping entry is one
+    std::unordered_map<std::string, std::vector<route_group_member>> route_groups;
 
     // for stopping models
     std::condition_variable cv_stop;
@@ -246,6 +259,19 @@ public:
 
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();
+
+    // resolve a requested model name to the concrete child that must serve it. names that are
+    // not routing groups are returned unchanged. a group name resolves by request size: the
+    // prompt+output budget is estimated (exactly via a loaded member's tokenizer when one is
+    // up, bytes/3.5 fallback otherwise) and the first tier whose cap covers it is picked, else
+    // the group's uncapped fallback. a conversation never migrates to a smaller tier than the
+    // one it is already pinned to (no-demotion, see conv_model_tracker). body-less requests
+    // (GET /props, management endpoints, ...) go to the currently loaded member, or the first
+    // (capped) tier when nothing is loaded (thread-safe)
+    std::string resolve_route_target(const std::string & name, const server_http_req & req, const json & body, const std::string & conv_id);
+
+    // return a copy of the routing groups (thread-safe)
+    std::unordered_map<std::string, std::vector<route_group_member>> get_route_groups();
 
     struct load_options {
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;

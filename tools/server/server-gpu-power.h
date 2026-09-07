@@ -50,6 +50,10 @@ struct server_gpu_power_device_info {
     uint32_t              min_power_limit_mw      = 0;
     uint32_t              max_power_limit_mw      = 0;
     std::vector<uint32_t> supported_mem_clocks_mhz;
+    uint32_t              memory_clock_p2_mhz          = 0;
+    int32_t               min_memory_clock_offset_mhz = 0;
+    int32_t               max_memory_clock_offset_mhz = 0;
+    bool                  memory_clock_offset_supported = false;
 };
 
 class server_gpu_power_backend {
@@ -69,7 +73,8 @@ std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_nvml_backend()
 
 class server_gpu_power {
   public:
-    static constexpr uint32_t MAX_SAFE_MEM_CLOCK_MHZ = 11001;
+    // Requested overclock ceiling, not a stability guarantee for every GPU.
+    static constexpr uint32_t MAX_REQUESTED_MEM_CLOCK_MHZ = 11001;
 
     // All methods are confined to the server_context loop thread.
     explicit server_gpu_power(std::unique_ptr<server_gpu_power_backend> backend = nullptr);

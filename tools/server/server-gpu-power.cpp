@@ -2,6 +2,7 @@
 
 #include "log.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -113,7 +114,11 @@ using nvml_device_set_power_management_limit_t             = nvml_return_t (*)(n
 using nvml_device_get_supported_memory_clocks_t            = nvml_return_t (*)(nvml_device_t, unsigned int *, unsigned int *);
 using nvml_device_set_memory_locked_clocks_t               = nvml_return_t (*)(nvml_device_t, unsigned int, unsigned int);
 using nvml_device_reset_memory_locked_clocks_t             = nvml_return_t (*)(nvml_device_t);
-using nvml_device_set_mem_clk_vf_offset_t                 = nvml_return_t (*)(nvml_device_t, int);
+using nvml_device_set_mem_clk_vf_offset_t                   = nvml_return_t (*)(nvml_device_t, int);
+using nvml_device_get_mem_clk_vf_offset_t                   = nvml_return_t (*)(nvml_device_t, int *);
+using nvml_device_get_mem_clk_min_max_vf_offset_t           = nvml_return_t (*)(nvml_device_t, int *, int *);
+using nvml_device_get_min_max_clock_of_pstate_t             = nvml_return_t (*)(nvml_device_t, unsigned int, unsigned int,
+                                                                             unsigned int *, unsigned int *);
 using nvml_error_string_t                                  = const char * (*) (nvml_return_t);
 
 #if defined(_WIN32)
@@ -157,6 +162,7 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
 
     bool init(int32_t device, server_gpu_power_device_info & info, std::string & error) override {
         shutdown();
+        info = {};
 
         if (device < 0) {
             error = "NVML device index must be non-negative";
@@ -238,11 +244,29 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
                 std::vector<unsigned int> clocks(count);
                 clk_res = nvml_device_get_supported_memory_clocks_(device_, &count, clocks.data());
                 if (clk_res == 0) {
-                    for (unsigned int c : clocks) {
-                        info.supported_mem_clocks_mhz.push_back(c);
-                    }
+                    clocks.resize(count);
+                    info.supported_mem_clocks_mhz.assign(clocks.begin(), clocks.end());
                 }
             }
+        }
+
+        unsigned int min_p2_mhz = 0;
+        unsigned int max_p2_mhz = 0;
+        int min_offset = 0;
+        int max_offset = 0;
+        // NVML_CLOCK_MEM = 2, NVML_PSTATE_2 = 2 (CUDA compute state).
+        if (nvml_device_set_mem_clk_vf_offset_ != nullptr &&
+            nvml_device_get_mem_clk_vf_offset_ != nullptr &&
+            nvml_device_get_mem_clk_min_max_vf_offset_ != nullptr &&
+            nvml_device_get_min_max_clock_of_pstate_ != nullptr &&
+            nvml_device_get_mem_clk_vf_offset_(device_, &original_mem_offset_mhz_) == 0 &&
+            nvml_device_get_mem_clk_min_max_vf_offset_(device_, &min_offset, &max_offset) == 0 &&
+            nvml_device_get_min_max_clock_of_pstate_(device_, 2, 2, &min_p2_mhz, &max_p2_mhz) == 0 &&
+            max_p2_mhz > 0 && min_offset <= max_offset) {
+            info.memory_clock_p2_mhz = max_p2_mhz;
+            info.min_memory_clock_offset_mhz = min_offset;
+            info.max_memory_clock_offset_mhz = max_offset;
+            info.memory_clock_offset_supported = true;
         }
         return true;
 #else
@@ -317,7 +341,7 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
     }
 
     bool reset_memory_clock_offset(std::string & error) override {
-        return set_memory_clock_offset(0, error);
+        return set_memory_clock_offset(original_mem_offset_mhz_, error);
     }
 
     void shutdown() override {
@@ -329,14 +353,17 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
             }
         }
 
-        initialized_                       = false;
-        device_                            = nullptr;
+        initialized_                     = false;
+        device_                          = nullptr;
+        original_mem_offset_mhz_          = 0;
         nvml_device_set_mem_clk_vf_offset_ = nullptr;
         close_library();
 #endif
     }
 
   private:
+    int original_mem_offset_mhz_ = 0;
+
 #if defined(_WIN32) || defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     server_gpu_power_library_handle load_library(const char * name) {
 #    if defined(_WIN32)
@@ -370,7 +397,10 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
         nvml_device_get_supported_memory_clocks_            = nullptr;
         nvml_device_set_memory_locked_clocks_               = nullptr;
         nvml_device_reset_memory_locked_clocks_             = nullptr;
-        nvml_device_set_mem_clk_vf_offset_                 = nullptr;
+        nvml_device_set_mem_clk_vf_offset_                   = nullptr;
+        nvml_device_get_mem_clk_vf_offset_                   = nullptr;
+        nvml_device_get_mem_clk_min_max_vf_offset_           = nullptr;
+        nvml_device_get_min_max_clock_of_pstate_             = nullptr;
         nvml_error_string_                                  = nullptr;
 
         const bool resolved = server_gpu_power_resolve_symbol(library_, "nvmlInit_v2", nvml_init_) &&
@@ -395,6 +425,12 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
                                         nvml_device_reset_memory_locked_clocks_);
         server_gpu_power_resolve_symbol(library_, "nvmlDeviceSetMemClkVfOffset",
                                         nvml_device_set_mem_clk_vf_offset_);
+        server_gpu_power_resolve_symbol(library_, "nvmlDeviceGetMemClkVfOffset",
+                                        nvml_device_get_mem_clk_vf_offset_);
+        server_gpu_power_resolve_symbol(library_, "nvmlDeviceGetMemClkMinMaxVfOffset",
+                                        nvml_device_get_mem_clk_min_max_vf_offset_);
+        server_gpu_power_resolve_symbol(library_, "nvmlDeviceGetMinMaxClockOfPState",
+                                        nvml_device_get_min_max_clock_of_pstate_);
 
         if (!resolved) {
             error = "NVML runtime is missing one of the required symbols";
@@ -429,7 +465,10 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
     nvml_device_get_supported_memory_clocks_t            nvml_device_get_supported_memory_clocks_            = nullptr;
     nvml_device_set_memory_locked_clocks_t               nvml_device_set_memory_locked_clocks_               = nullptr;
     nvml_device_reset_memory_locked_clocks_t             nvml_device_reset_memory_locked_clocks_             = nullptr;
-    nvml_device_set_mem_clk_vf_offset_t                 nvml_device_set_mem_clk_vf_offset_                 = nullptr;
+    nvml_device_set_mem_clk_vf_offset_t                   nvml_device_set_mem_clk_vf_offset_                   = nullptr;
+    nvml_device_get_mem_clk_vf_offset_t                   nvml_device_get_mem_clk_vf_offset_                   = nullptr;
+    nvml_device_get_mem_clk_min_max_vf_offset_t           nvml_device_get_mem_clk_min_max_vf_offset_           = nullptr;
+    nvml_device_get_min_max_clock_of_pstate_t             nvml_device_get_min_max_clock_of_pstate_             = nullptr;
     nvml_error_string_t                                  nvml_error_string_                                  = nullptr;
 #endif
 };
@@ -512,11 +551,15 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         }
     }
 
-    if (config_.mem_clock_enabled() && !device_info_.supported_mem_clocks_mhz.empty()) {
+    if (config_.mem_clock_enabled()) {
+        if (device_info_.supported_mem_clocks_mhz.empty()) {
+            LOG_ERR("GPU memory clock governor: supported memory clocks are unavailable\n");
+            backend_->shutdown();
+            backend_initialized_ = false;
+            return false;
+        }
+        std::sort(device_info_.supported_mem_clocks_mhz.rbegin(), device_info_.supported_mem_clocks_mhz.rend());
         const uint32_t max_stock_mhz = device_info_.supported_mem_clocks_mhz.front();
-        const uint32_t base_p0_mhz   = device_info_.supported_mem_clocks_mhz.size() >= 2
-                                           ? device_info_.supported_mem_clocks_mhz[1]
-                                           : max_stock_mhz;
 
         const auto setup_clock_target = [&](uint32_t & clock_mhz, int32_t & offset_mhz, const char * phase_label) {
             if (clock_mhz == 0) {
@@ -531,13 +574,24 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
             }
 
             if (clock_mhz > max_stock_mhz) {
-                if (clock_mhz > MAX_SAFE_MEM_CLOCK_MHZ) {
-                    LOG_WRN("GPU memory clock governor: %s target %u MHz exceeds safe hardware limit (%u MHz), clamping to %u MHz\n",
-                            phase_label, clock_mhz, MAX_SAFE_MEM_CLOCK_MHZ, MAX_SAFE_MEM_CLOCK_MHZ);
-                    clock_mhz = MAX_SAFE_MEM_CLOCK_MHZ;
+                if (clock_mhz > MAX_REQUESTED_MEM_CLOCK_MHZ) {
+                    LOG_WRN("GPU memory clock governor: %s target %u MHz exceeds configured ceiling (%u MHz), clamping\n",
+                            phase_label, clock_mhz, MAX_REQUESTED_MEM_CLOCK_MHZ);
+                    clock_mhz = MAX_REQUESTED_MEM_CLOCK_MHZ;
                 }
 
-                offset_mhz = static_cast<int32_t>(clock_mhz - base_p0_mhz) * 2;
+                if (!device_info_.memory_clock_offset_supported || clock_mhz <= max_stock_mhz ||
+                    device_info_.memory_clock_p2_mhz == 0 || clock_mhz <= device_info_.memory_clock_p2_mhz) {
+                    LOG_ERR("GPU memory clock governor: %s overclock is unsupported or exceeds the configured ceiling\n",
+                            phase_label);
+                    return false;
+                }
+                const int64_t offset = (int64_t(clock_mhz) - device_info_.memory_clock_p2_mhz) * 2;
+                if (offset < device_info_.min_memory_clock_offset_mhz || offset > device_info_.max_memory_clock_offset_mhz) {
+                    LOG_ERR("GPU memory clock governor: %s offset is outside the driver limits\n", phase_label);
+                    return false;
+                }
+                offset_mhz = static_cast<int32_t>(offset);
                 LOG_INF("GPU memory clock governor: %s overclock target %u MHz -> lock %u MHz + offset %+d MHz\n",
                         phase_label, clock_mhz, max_stock_mhz, offset_mhz);
                 return true;
@@ -638,6 +692,20 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
                                            : 0;
         const uint32_t target_lock_mhz = target_offset != 0 ? max_stock_mhz : target_mem;
 
+        // Restore the offset before changing the lock or returning to dynamic clocks.
+        if (mem_offset_applied_ && (target_offset != last_applied_mem_offset_mhz_ ||
+                                    target_lock_mhz != last_applied_mem_clock_mhz_)) {
+            std::string error;
+            if (!backend_->reset_memory_clock_offset(error)) {
+                disable_after_error(error);
+                return;
+            }
+            mem_offset_applied_ = false;
+            last_applied_mem_offset_mhz_ = 0;
+            LOG_INF("GPU memory offset: %s -> %s, restored original\n",
+                    server_gpu_power_phase_name(previous), server_gpu_power_phase_name(phase));
+        }
+
         if (target_lock_mhz != last_applied_mem_clock_mhz_) {
             std::string error;
             if (target_lock_mhz > 0) {
@@ -672,16 +740,6 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
                 mem_offset_applied_ = true;
                 LOG_INF("GPU memory offset: %s -> %s, offset %+d MHz (target %u MHz)\n",
                         server_gpu_power_phase_name(previous), server_gpu_power_phase_name(phase), target_offset, target_mem);
-            } else {
-                if (mem_offset_applied_) {
-                    if (!backend_->reset_memory_clock_offset(error)) {
-                        disable_after_error(error);
-                        return;
-                    }
-                    mem_offset_applied_ = false;
-                    LOG_INF("GPU memory offset: %s -> %s, reset (0 MHz)\n", server_gpu_power_phase_name(previous),
-                            server_gpu_power_phase_name(phase));
-                }
             }
             last_applied_mem_offset_mhz_ = target_offset;
         }
@@ -783,4 +841,5 @@ bool server_gpu_power::restore_original() {
 void server_gpu_power::disable_after_error(const std::string & error) {
     LOG_WRN("GPU governor: disabling governor after error: %s\n", error.c_str());
     enabled_ = false;
+    restore_original();
 }

@@ -4747,13 +4747,45 @@ static json get_res_model_info(const server_context_meta & meta) {
     };
 }
 
-static json get_res_models(const server_context_meta & meta) {
+static json get_res_models(const server_context_meta & meta, const common_params & params) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
     return json{
         {"models", json::array({
             {
                 {"name",  meta.model_name},
+                {"slug",  meta.model_name},
+                {"display_name", meta.model_name},
+                {"default_reasoning_level", "low"},
+                {"supported_reasoning_levels", json::array({
+                    {{"effort", "low"}, {"description", "Fast responses with lighter reasoning"}},
+                    {{"effort", "medium"}, {"description", "Balances speed and reasoning depth"}},
+                    {{"effort", "xhigh"}, {"description", "Extra high reasoning depth"}},
+                })},
+                {"shell_type", "unified_exec"},
+                {"visibility", "list"},
+                {"supported_in_api", true},
+                {"priority", 100},
+                {"support_verbosity", false},
+                {"default_verbosity", "medium"},
+                {"truncation_policy", json{{"mode", "tokens"}, {"limit", 4096}}},
+                {"context_window", params.n_ctx},
+                {"max_context_window", params.n_ctx},
+                {"effective_context_window_percent", 100},
+                {"input_modalities", json::array({"text"})},
+                {"supports_search_tool", false},
+                {"use_responses_lite", false},
+                {"node_repl_auto_review_required", false},
+                {"node_repl_disabled", true},
+                {"supports_image_detail_original", false},
+                {"default_reasoning_summary", "none"},
+                {"experimental_supported_tools", json::array()},
+                {"apply_patch_tool_type", "freeform"},
+                {"web_search_tool_type", "text"},
+                {"tool_mode", nullptr},
+                {"multi_agent_version", nullptr},
+                {"multi_agent_reasoning_effort", nullptr},
+                {"base_instructions", ""},
                 {"model", meta.model_name},
                 {"modified_at", ""},
                 {"size", ""},
@@ -5260,7 +5292,7 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_models);
         } else {
-            res->ok(get_res_models(*meta));
+            res->ok(get_res_models(*meta, params));
         }
         return res;
     };
@@ -5725,7 +5757,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     std::unique_lock<std::mutex> lock(mutex_cache);
 
     if (is_sleeping) {
-        cached_models  = get_res_models(*meta);
+        cached_models  = get_res_models(*meta, params);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();
 

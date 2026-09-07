@@ -1,9 +1,8 @@
 # Plan: one public model name, two router children off the *same* GGUF (MTP 61k / no-MTP 105k)
 
-Status: **implemented and tested on GOKAYA** (sections 6 and 13; the code is in
-`tools/server/server-models.{h,cpp}` and documented in `tools/server/README.md`). Sections 5 and 11
-are the parts still not done: the production unit is not yet switched over, and the KV-state
-transfer across a swap remains optional. Written after tracing
+Status: **implemented, tested and in production on GOKAYA** since 2026-09-07 (sections 6, 13, 14;
+the code is in `tools/server/server-models.{h,cpp}`, documented in `tools/server/README.md`).
+Section 11, the KV-state transfer across a swap, remains optional and undone. Written after tracing
 `tools/server/server-models.{h,cpp}`, `common/arg.cpp` (preset-only keys), `common/preset.h`,
 `common/common.cpp` (`common_fit_normal_kv_context`) and re-deriving the VRAM arithmetic from
 `docs/kv-calibration-findings.md` (GOKAYA, `192.168.1.57`).
@@ -708,3 +707,62 @@ bugs at first glance:
 - **Estimator accuracy on natural text.** Every prompt here is one repeated phrase, so the
   cold-start bytes ÷ 3.5 fallback was only exercised incidentally (it read 660 tokens for a
   579-token prompt: a 14% *over*estimate, which is the safe direction).
+
+## 14. Production deployment (GOKAYA, promoted 2026-09-07)
+
+The `llama-server-root` unit no longer runs a single model. It runs the router:
+
+```
+ExecStart=/home/hjotha/src/llama-mtp-ctx/build/bin/llama-server \
+  --models-preset /home/hjotha/prod-two-tier.ini --models-max 1 \
+  --host 0.0.0.0 --port 8090 --metrics \
+  --log-file /home/hjotha/router-two-tier-prod-20260907.log
+WorkingDirectory=/home/hjotha/src/llama-mtp-ctx
+Environment=LD_LIBRARY_PATH=/home/hjotha/src/llama-mtp-ctx/build/bin
+```
+
+`/home/hjotha/prod-two-tier.ini` is section 4's INI with two deliberate differences:
+
+- **The tiers carry the names the old unit advertised as aliases** — `qwen-3.8-27b-ista-mtp` (fast)
+  and `qwen-3.8-27b-ista-nomtp` (long) — so a client that used to name one of them directly still
+  reaches a working model instead of a 404. `qwen-3.8-27b` is the group.
+- **No `sleep-idle-seconds`.** The old unit never slept; adding it would make every request after
+  an idle gap pay a reload. Add it later if the GPU is wanted for something else.
+
+What changed for clients, all of it measured:
+
+| | before | after |
+|---|---|---|
+| GGUF | `...IQ3_XXS.gguf`, no MTP | `...IQ3_XXS-mtp.gguf`, both tiers |
+| context | 65,536 | 60,928 (≤ 56,000 budget) / 105,472 |
+| advertised `context_window` | 65,536 | 105,472 |
+| batch / ubatch | 512 | 64 |
+| decode | ~28 tok/s | ~51 tok/s on the fast tier, ~20 on the long one |
+| prefill | ~917 tok/s | ~600 tok/s fast, ~500 long |
+| `/metrics`, `/props` | no parameter | need `?model=<name>`, the group name works |
+| web UI at `/` | served | still served |
+
+The trade is deliberate: b/ub 64 costs ~35% of prefill throughput and buys 9,216 tokens of MTP
+ceiling; MTP doubles decode. For interactive use decode dominates, and the long tier is what makes
+the 80,000-token contract possible at all.
+
+Verified on the live unit after the switch: a 264-token request routed to the MTP tier, a
+60,053-token one to the long tier (`60037 prompt + 16 output`), both answering as `qwen-3.8-27b`;
+the mem clock locked at 11,001 MHz and the decode power cap at 165 W, as before; real client traffic
+(`8836 prompt + 4096 output`) routed to the fast tier on its own. Routing decisions are logged by
+the router, so `journalctl -u llama-server-root | grep "route group"` is the way to see which tier
+served what.
+
+**Rollback** — the old unit is at `/home/hjotha/llama-server-root.service.bak-20260907` and the old
+build tree `/home/hjotha/src/llama.cpp` is untouched:
+
+```sh
+sudo cp /home/hjotha/llama-server-root.service.bak-20260907 \
+        /etc/systemd/system/llama-server-root.service
+sudo systemctl daemon-reload && sudo systemctl restart llama-server-root
+```
+
+One thing to keep an eye on: the advertised `context_window` is now the long tier's full 105,472,
+so a client that fills it will send a prefill larger than anything tested through the router (13.3).
+If that becomes a real pattern rather than a theoretical one, either measure 101,376 through the
+router or advertise less.

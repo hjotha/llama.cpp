@@ -243,7 +243,8 @@ Worth agreeing on these before implementing, because they are the price of the c
   justifies it, a hysteresis timer keeping the long tier resident for N seconds.
 - **Prompt cache loss on migration.** A swap discards the child's cached prefix. A 60k
   conversation crossing the threshold re-prefills from scratch, ~110 s. 6.3 limits this to
-  once per conversation; interleaved conversations of mixed sizes are the bad case.
+  once per conversation; interleaved conversations of mixed sizes are the bad case. Section 11
+  covers what can and cannot be done about it.
 - **The two GGUFs are not bit-identical.** Same base model and same quant class, so quality is
   comparable and MTP itself is distribution-preserving (every draft token is verified against
   the target), but the two files are separate artifacts. A conversation that migrates tiers can
@@ -301,6 +302,70 @@ Nothing in `common/speculative.cpp`, nothing in `server-context.cpp`, no change 
 2. Sections 6.1–6.3 — the routing itself. This is the deliverable the clients need.
 3. Section 6.4 — `/v1/models` cosmetics, same phase if cheap.
 4. Hysteresis only if test 8 says so.
+5. Section 11 state transfer only if test 8 says so **and** the same-GGUF measurement passes.
+
+## 11. Carrying the KV state across the swap
+
+The question this answers: can the RAM cache make the context load faster across the
+small→large / large→small switch? Short answer: not the RAM cache — but a file-backed path
+already in the tree can, and the prize is much bigger than the model load.
+
+### 11.1 `--cache-ram` cannot cross a swap
+
+`server_prompt_cache` (`server-task.h:597-635`, implementation `server-task.cpp:1689-1793`) is a
+`std::list` **in the child process's heap**, instantiated at `server-context.cpp:1419` and sized
+by `-cram`/`--cache-ram` (`arg.cpp:1726`). Sleeping is a full `destroy()`
+(`server-context.cpp:964-1005`) and eviction kills the subprocess, so the cache dies with the
+child. It accelerates turns **within** a tier and contributes nothing to the crossing.
+
+### 11.2 What can cross: slot state in a file
+
+Already implemented, no inference-side code needed:
+
+- `--slot-save-path` (`arg.cpp:3853`)
+- `SERVER_TASK_TYPE_SLOT_SAVE` / `_RESTORE` (`server-context.cpp:2688` / `:2738`), exposed over
+  HTTP as `action=save|restore` (`:4974-4977`)
+- underneath, `llama_state_seq_save_file` / `load_file` (`src/llama-context.cpp:4348` / `:4359`)
+
+Sizing at the calibrated 18.0 KiB/token: ~954 MiB for 54,264 tokens, ~1.4 GiB for 80k. On
+**tmpfs** that is a few seconds of write plus read against **~180 s of prefill** for an 80k
+prompt. That, not the 8 s model load, is where the latency actually is.
+
+Flow: `save` on the outgoing child before eviction → swap → `restore` on the incoming child →
+the next request finds its prefix already in the slot and prefills only the delta.
+
+### 11.3 Two hard constraints
+
+**(a) Both children must run the same GGUF.** Restore validation is purely structural — KV layer
+count (`src/llama-kv-cache.cpp:2535`), KV type (`:2563`), row size (`:2572`) — and there is **no
+weight hash**. With two different GGUFs the restore either fails, or worse succeeds and serves
+KV computed by different weights, silently. So this requires the same-GGUF variant floated in
+section 7 (one child with MTP, one without, off the same `-mtp.gguf`), which is exactly the row
+blocked by the ~19k calibration disagreement: it needs ≥84,096 tokens, the derivation gives
+~78,400, the doc's other matrix claims 96,000. One measurement settles it.
+
+In favour: the nextn KV lives in `ctx_dft`, a separate context, and never enters the target
+sequence state file. Same GGUF ⇒ same hparams ⇒ the target state file is compatible across both
+children.
+
+**(b) Only small→large is geometrically possible.** 54k of state fits in a 97k cache; the
+reverse never fits. That is precisely the only direction promote-only (6.3) permits — the
+large→small demotion is already forbidden for an unrelated reason.
+
+### 11.4 Recommendation: don't build it yet
+
+This is not config-only. `unload_lru()` (`server-models.cpp:938-960`) has no "save before you
+die" hook, the restore has to be issued after the load completes, and a tmpfs directory needs a
+size budget and a reaper.
+
+The lazy version that captures most of the win with none of that: **promote-only plus a generous
+`-cram` on the long child**. A conversation migrates once and then lives in the long tier, where
+the in-RAM cache works normally for every subsequent turn. Build the state transfer only if
+test 8 shows interleaved mixed-size conversations actually hurt.
+
+Unrelated config win, cheap and independent: **do not pass `--ctx-size 0` to the children.** With
+0 the fitting probe builds and frees full target + MTP contexts on every load, inflating swap
+time. Pin the calibrated 54264 / 97280 explicitly (section 4 already does).
 
 Keep `docs/mtp-adaptive-context-plan.md` for its code-path analysis — the always-on
 `common_speculative_process()` shadow decode and the five static-capability uses of

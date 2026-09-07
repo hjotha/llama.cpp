@@ -4747,7 +4747,7 @@ static json get_res_model_info(const server_context_meta & meta) {
     };
 }
 
-static json get_res_models(const server_context_meta & meta) {
+static json get_res_models(const server_context_meta & meta, const common_params & params) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
     return json{
@@ -4769,8 +4769,8 @@ static json get_res_models(const server_context_meta & meta) {
                 {"support_verbosity", false},
                 {"default_verbosity", "medium"},
                 {"truncation_policy", json{{"mode", "tokens"}, {"limit", 4096}}},
-                {"context_window", 40960},
-                {"max_context_window", 40960},
+                {"context_window", params.n_ctx},
+                {"max_context_window", params.n_ctx},
                 {"effective_context_window_percent", 100},
                 {"input_modalities", json::array({"text"})},
                 {"supports_search_tool", false},
@@ -5292,7 +5292,7 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_models);
         } else {
-            res->ok(get_res_models(*meta));
+            res->ok(get_res_models(*meta, params));
         }
         return res;
     };
@@ -5757,7 +5757,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     std::unique_lock<std::mutex> lock(mutex_cache);
 
     if (is_sleeping) {
-        cached_models  = get_res_models(*meta);
+        cached_models  = get_res_models(*meta, params);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();
 

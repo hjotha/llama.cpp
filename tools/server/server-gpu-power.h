@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-
 #include <vector>
 
 enum class server_gpu_power_phase {
@@ -61,6 +60,8 @@ class server_gpu_power_backend {
     virtual bool set_power_limit(uint32_t power_limit_mw, std::string & error)                     = 0;
     virtual bool set_memory_locked_clocks(uint32_t min_mhz, uint32_t max_mhz, std::string & error) = 0;
     virtual bool reset_memory_locked_clocks(std::string & error)                                   = 0;
+    virtual bool set_memory_clock_offset(int32_t offset_mhz, std::string & error)                  = 0;
+    virtual bool reset_memory_clock_offset(std::string & error)                                    = 0;
     virtual void shutdown()                                                                        = 0;
 };
 
@@ -68,6 +69,8 @@ std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_nvml_backend()
 
 class server_gpu_power {
   public:
+    static constexpr uint32_t MAX_SAFE_MEM_CLOCK_MHZ = 11001;
+
     // All methods are confined to the server_context loop thread.
     explicit server_gpu_power(std::unique_ptr<server_gpu_power_backend> backend = nullptr);
     ~server_gpu_power();
@@ -95,8 +98,12 @@ class server_gpu_power {
 
     uint32_t decode_mem_clock_mhz_        = 0;
     uint32_t prefill_mem_clock_mhz_       = 0;
+    int32_t  decode_mem_offset_mhz_       = 0;
+    int32_t  prefill_mem_offset_mhz_      = 0;
     uint32_t last_applied_mem_clock_mhz_  = 0;
+    int32_t  last_applied_mem_offset_mhz_ = 0;
     bool     mem_clock_locked_            = false;
+    bool     mem_offset_applied_          = false;
 
     server_gpu_power_phase phase_               = server_gpu_power_phase::idle;
     uint64_t               transition_count_    = 0;

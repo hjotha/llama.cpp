@@ -7,14 +7,17 @@
 #include <vector>
 
 struct fake_gpu_power_backend : server_gpu_power_backend {
-    int                   init_calls      = 0;
-    int                   set_calls       = 0;
-    int                   set_mem_calls   = 0;
-    int                   reset_mem_calls = 0;
-    int                   shutdown_calls  = 0;
-    int                   fail_on_call    = 0;
+    int                   init_calls         = 0;
+    int                   set_calls          = 0;
+    int                   set_mem_calls      = 0;
+    int                   reset_mem_calls    = 0;
+    int                   set_offset_calls   = 0;
+    int                   reset_offset_calls = 0;
+    int                   shutdown_calls     = 0;
+    int                   fail_on_call       = 0;
     std::vector<uint32_t> applied_limits;
     std::vector<uint32_t> applied_mem_clocks;
+    std::vector<int32_t>  applied_offsets;
 
     bool init(int32_t device, server_gpu_power_device_info & info, std::string &) override {
         init_calls++;
@@ -47,6 +50,17 @@ struct fake_gpu_power_backend : server_gpu_power_backend {
 
     bool reset_memory_locked_clocks(std::string &) override {
         reset_mem_calls++;
+        return true;
+    }
+
+    bool set_memory_clock_offset(int32_t offset_mhz, std::string &) override {
+        set_offset_calls++;
+        applied_offsets.push_back(offset_mhz);
+        return true;
+    }
+
+    bool reset_memory_clock_offset(std::string &) override {
+        reset_offset_calls++;
         return true;
     }
 
@@ -123,7 +137,7 @@ int main() {
         assert(backend_ptr->shutdown_calls == 1);
     }
 
-    // 2. Test pure memory governor (decode only)
+    // 2. Test pure memory governor (decode only, discrete stock)
     {
         auto             backend     = std::make_unique<fake_gpu_power_backend>();
         auto *           backend_ptr = backend.get();
@@ -187,11 +201,12 @@ int main() {
         assert(backend_ptr->applied_limits.back() == 160000);
     }
 
-    // 4. Test unsupported memory clock rejected
+    // 4. Test unsupported memory clock rejected (e.g. non-overclock value not in supported list)
     {
         auto             backend = std::make_unique<fake_gpu_power_backend>();
         server_gpu_power governor(std::move(backend));
-        assert(!governor.init({ -1, -1, 99999, -1, 0 }));
+        // 7000 is between 5001 and 10251, not in discrete list and not an overclock > 10501
+        assert(!governor.init({ -1, -1, 7000, -1, 0 }));
     }
 
     // 5. Test disabled backend
@@ -230,6 +245,64 @@ int main() {
         failing.shutdown();
         assert(failing_backend_ptr->set_calls == 3);
         assert(failing_backend_ptr->applied_limits.back() == 160000);
+    }
+
+    // 8. Test memory overclock governor (target > 10501, e.g. 11001 MHz)
+    {
+        auto             backend     = std::make_unique<fake_gpu_power_backend>();
+        auto *           backend_ptr = backend.get();
+        server_gpu_power governor(std::move(backend));
+
+        // 11001 MHz: max_stock=10501, base_p0=10251 -> offset=(11001-10251)*2 = 1500 MHz
+        assert(governor.init({ -1, -1, 11001, -1, 0 }));
+        assert(governor.enabled());
+        assert(backend_ptr->init_calls == 1);
+        assert(backend_ptr->set_mem_calls == 0);
+        assert(backend_ptr->set_offset_calls == 0);
+
+        governor.update(server_gpu_power_phase::prefill);
+        assert(backend_ptr->set_mem_calls == 0);
+        assert(backend_ptr->set_offset_calls == 0);
+
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_mem_calls == 1);
+        assert(backend_ptr->applied_mem_clocks.back() == 10501);
+        assert(backend_ptr->set_offset_calls == 1);
+        assert(backend_ptr->applied_offsets.back() == 1500);
+
+        // Deduplicated
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_mem_calls == 1);
+        assert(backend_ptr->set_offset_calls == 1);
+
+        // Idle resets both offset and locked clock
+        governor.update(server_gpu_power_phase::idle);
+        assert(backend_ptr->reset_offset_calls == 1);
+        assert(backend_ptr->reset_mem_calls == 1);
+
+        governor.shutdown();
+        assert(backend_ptr->shutdown_calls == 1);
+    }
+
+    // 9. Test memory overclock clamp to MAX_SAFE_MEM_CLOCK_MHZ (11001)
+    {
+        auto             backend     = std::make_unique<fake_gpu_power_backend>();
+        auto *           backend_ptr = backend.get();
+        server_gpu_power governor(std::move(backend));
+
+        // 12501 MHz exceeds MAX_SAFE_MEM_CLOCK_MHZ (11001), clamped to 11001
+        assert(governor.init({ -1, -1, 12501, -1, 0 }));
+        assert(governor.enabled());
+
+        governor.update(server_gpu_power_phase::decode);
+        assert(backend_ptr->set_mem_calls == 1);
+        assert(backend_ptr->applied_mem_clocks.back() == 10501);
+        assert(backend_ptr->set_offset_calls == 1);
+        // Clamped to 11001: (11001 - 10251) * 2 = 1500
+        assert(backend_ptr->applied_offsets.back() == 1500);
+
+        governor.shutdown();
+        assert(backend_ptr->reset_offset_calls == 1);
     }
 
     return 0;

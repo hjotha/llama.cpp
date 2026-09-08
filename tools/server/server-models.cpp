@@ -1399,7 +1399,7 @@ static int64_t route_count_prompt_tokens(const std::string & path, const json & 
     }
 }
 
-std::string server_models::resolve_route_target(const std::string & name, const server_http_req & req, const json & body, const std::string & conv_id) {
+std::string server_models::resolve_route_target(const std::string & name, const server_http_req & req, const json & body) {
     // snapshot the groups under the lock; everything past this point locks on its own
     std::unordered_map<std::string, std::vector<route_group_member>> groups;
     {
@@ -1465,34 +1465,12 @@ std::string server_models::resolve_route_target(const std::string & name, const 
 
     // first tier whose cap covers the budget, else the group's fallback (the last member: the
     // uncapped one, or the largest cap when the config declared none)
-    std::string chosen      = members.back().name;
-    int64_t     chosen_rank = (int64_t) (members.size() - 1);
+    std::string chosen = members.back().name;
     for (size_t i = 0; i < members.size(); i++) {
         const auto & m = members[i];
         if (m.max_tokens < 0 || m.max_tokens >= budget) {
-            chosen      = m.name;
-            chosen_rank = (int64_t) i;
+            chosen = m.name;
             break;
-        }
-    }
-
-    // no-demotion: a conversation pinned to a wider tier stays there, it never flips back to a
-    // smaller one. conversations grow monotonically, so each one migrates at most once instead
-    // of flapping around the threshold (and each migration also drops the child's prompt cache)
-    if (!conv_id.empty()) {
-        auto pinned = conv_models.lookup(conv_id);
-        if (pinned.has_value() && !pinned->empty()) {
-            for (size_t i = 0; i < members.size(); i++) {
-                if (members[i].name == *pinned) {
-                    if ((int64_t) i > chosen_rank) {
-                        chosen = *pinned;
-                    } else if ((int64_t) i < chosen_rank) {
-                        SRV_INF("route group '%s': conversation %s migrates up: %s -> %s\n",
-                                name.c_str(), conv_id.c_str(), pinned->c_str(), chosen.c_str());
-                    }
-                    break;
-                }
-            }
         }
     }
 
@@ -2468,7 +2446,7 @@ void server_models_routes::init_routes() {
             route_lock = models.lock_route_requests();
         }
         // body-less requests resolve to the loaded member of a group, or the capped tier cold
-        name = models.resolve_route_target(name, req, json::object(), std::string());
+        name = models.resolve_route_target(name, req, json::object());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
@@ -2488,14 +2466,13 @@ void server_models_routes::init_routes() {
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string requested_name = json_value(body, "model", std::string());
-        // route group resolution happens before validation: a group name is not a mapping
-        // entry, and the no-demotion rule needs the conversation pin from the previous turn
+        // A route group must resolve to a child before model validation.
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         std::unique_lock<std::mutex> route_lock;
         if (models.is_route_group(requested_name)) {
             route_lock = models.lock_route_requests();
         }
-        std::string name = models.resolve_route_target(requested_name, req, body, conv_id);
+        std::string name = models.resolve_route_target(requested_name, req, body);
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {

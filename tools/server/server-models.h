@@ -293,11 +293,10 @@ public:
     // not routing groups are returned unchanged. a group name resolves by request size: the
     // prompt+output budget is estimated (exactly via a loaded member's tokenizer when one is
     // up, bytes/3.5 fallback otherwise) and the first tier whose cap covers it is picked, else
-    // the group's uncapped fallback. a conversation never migrates to a smaller tier than the
-    // one it is already pinned to (no-demotion, see conv_model_tracker). body-less requests
+    // the group's uncapped fallback. each request can select a smaller or larger tier. body-less requests
     // (GET /props, management endpoints, ...) go to the currently loaded member, or the first
     // (capped) tier when nothing is loaded (thread-safe)
-    std::string resolve_route_target(const std::string & name, const server_http_req & req, const json & body, const std::string & conv_id);
+    std::string resolve_route_target(const std::string & name, const server_http_req & req, const json & body);
 
     // return a copy of the routing groups (thread-safe)
     std::unordered_map<std::string, std::vector<route_group_member>> get_route_groups();

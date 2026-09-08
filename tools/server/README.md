@@ -1905,10 +1905,8 @@ own name (useful for staging the group before relying on it).
 - **Cold start (nothing loaded):** the estimate falls back to `body bytes / 3.5` and, on doubt,
   the request is biased toward the wider tier. Loading a model just to count tokens would cost
   more than being one tier too high.
-- **No demotion within a conversation:** a conversation pinned to a wider tier stays there; it
-  migrates up at most once (conversations grow monotonically). Without this, a conversation near
-  the threshold would swap children on nearly every turn, and each swap also drops the child's
-  in-RAM prompt cache.
+- **Re-evaluate each request:** conversations return to a smaller tier whenever the current
+  prompt plus output budget fits, including after compaction or a smaller output reserve.
 - **Only generating routes decide a tier.** `/tokenize`, `/detokenize`, `/apply-template` and the
   input-token counting endpoints carry a prompt-shaped body but produce nothing, and every member
   answers them identically: they go to whichever member is already loaded, so counting an 80k text
@@ -1917,8 +1915,8 @@ own name (useful for staging the group before relying on it).
 **What clients will notice** (the price of the contract):
 
 - TTFT spikes: a small request that follows a big one pays the child swap (`--models-max 1`).
-- Prompt-cache loss on migration: the child's cached prefix dies with the child, the migrating
-  conversation re-prefills from scratch once (the no-demotion rule limits this to a single hop).
+- Downward migrations re-prefill the prompt in the smaller child. Upward migrations attempt
+  the slot-state transfer described below; a failed transfer also re-prefills the prompt.
 - No style shift across the swap if both tiers load the same GGUF (only the speculative head
   changes), which also keeps any slot-state transfer between tiers legal - slot save/restore
   validates KV geometry only, **never load a state file written by other weights into a tier**.

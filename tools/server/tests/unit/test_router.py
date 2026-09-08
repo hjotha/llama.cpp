@@ -521,11 +521,24 @@ def test_router_route_group_restores_slot_state(tmp_path, fail_target_load):
         len(full_tokens.body["tokens"]) - first.body["timings"]["prompt_n"]
     )
 
+    # The same conversation returns to the fast tier after its prompt shrinks.
+    third = server.make_request("POST", "/completion", headers=headers, data={
+        "model": "route-test",
+        "prompt": prefix,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert third.status_code == 200
+    assert not list(tmp_path.glob("llama-router-state-*/slot-*.bin"))
+
     server.stop()
     with open(log_path) as f:
         log = f.read()
     assert "saved route state for conversation route-state-test" in log
     assert "restored route state for conversation route-state-test" in log
+    selections = [line.rsplit(" -> ", 1)[-1] for line in log.splitlines()
+                  if "route group 'route-test':" in line and " tokens -> " in line]
+    assert selections == ["route-fast", "route-long", "route-fast"]
 
     os.remove(preset_path)
 

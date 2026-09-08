@@ -1414,8 +1414,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;

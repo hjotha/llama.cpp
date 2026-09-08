@@ -133,6 +133,23 @@ private:
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
 
+    // serializes route preparation through save/load/restore. The lock is released once the
+    // request has claimed the target model's request count, so it never covers generation.
+    std::mutex route_mutex;
+
+    struct route_state {
+        std::string source;
+        std::string target;
+        std::string model_identity;
+        std::string filename;
+        int id_slot = 0;
+        int64_t n_tokens = -1;
+    };
+
+    std::string route_state_dir;
+    bool route_state_dir_owned = false;
+    std::unordered_map<std::string, route_state> route_states;
+
     // public name -> member tiers (ascending max_tokens, uncapped member last), built by
     // rebuild_route_groups() inside load_models(). kept deliberately outside mapping: a group
     // is not a loadable child, and every existing invariant (LRU counting, status transitions)
@@ -223,6 +240,14 @@ private:
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
+    void render_child_args(server_model_meta & meta);
+    void ensure_route_state_dir();
+    void cleanup_route_state_dir();
+    std::optional<json> route_slot_action(const server_model_meta & meta, const char * action, int id_slot, const std::string & filename);
+    bool save_route_state(const std::string & group, const std::string & conv_id, const std::string & target, int id_slot);
+    bool restore_route_state(const std::string & conv_id, const std::string & target);
+    void discard_route_state(const std::string & conv_id);
+
     // unload least recently used models if the limit is reached
     void unload_lru();
 
@@ -272,6 +297,9 @@ public:
 
     // return a copy of the routing groups (thread-safe)
     std::unordered_map<std::string, std::vector<route_group_member>> get_route_groups();
+
+    bool is_route_group(const std::string & name);
+    std::unique_lock<std::mutex> lock_route_requests();
 
     struct load_options {
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;

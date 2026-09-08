@@ -408,6 +408,75 @@ def test_router_reload_models():
         os.remove(preset_path)
 
 
+def test_router_route_group_restores_slot_state(tmp_path):
+    """a route-group migration restores the outgoing child's prompt cache"""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_route_state.ini")
+    log_path = os.path.join(tmp_path, "route-state.log")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[*]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "batch-size = 32\n"
+            "ubatch-size = 32\n"
+            "\n"
+            "[route-fast]\n"
+            "ctx-size = 256\n"
+            "parallel = 1\n"
+            "route-group = route-test\n"
+            "route-max-tokens = 64\n"
+            "\n"
+            "[route-long]\n"
+            "ctx-size = 512\n"
+            "parallel = 1\n"
+            "route-group = route-test\n"
+        )
+
+    server.models_preset = preset_path
+    server.models_max = 1
+    server.slot_save_path = str(tmp_path)
+    server.log_path = log_path
+    server.start()
+
+    headers = {"X-Conversation-Id": "route-state-test"}
+    prefix = "The quick brown fox jumps"
+    first = server.make_request("POST", "/completion", headers=headers, data={
+        "model": "route-test",
+        "prompt": prefix,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert first.status_code == 200
+    assert first.body["timings"]["prompt_n"] > 0
+
+    extended = prefix + " " + ("over the lazy dog " * 32)
+    second = server.make_request("POST", "/completion", headers=headers, data={
+        "model": "route-test",
+        "prompt": extended,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert second.status_code == 200
+    full_tokens = server.make_request("POST", "/tokenize", data={
+        "model": "route-test",
+        "content": extended,
+        "add_special": True,
+    })
+    assert full_tokens.status_code == 200
+    assert second.body["timings"]["prompt_n"] == (
+        len(full_tokens.body["tokens"]) - first.body["timings"]["prompt_n"]
+    )
+
+    server.stop()
+    with open(log_path) as f:
+        log = f.read()
+    assert "saved route state for conversation route-state-test" in log
+    assert "restored route state for conversation route-state-test" in log
+
+    os.remove(preset_path)
+
+
 def test_router_dedup_cache_models():
     """dedup-cache-models hides the cache entry backing a preset from GET /models"""
     global server

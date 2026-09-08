@@ -2,7 +2,8 @@
 
 Status: **implemented, tested and in production on GOKAYA** since 2026-09-07 (sections 6, 13, 14;
 the code is in `tools/server/server-models.{h,cpp}`, documented in `tools/server/README.md`).
-Section 11, the KV-state transfer across a swap, remains optional and undone. Written after tracing
+Section 11, the KV-state transfer across a swap, is implemented in this branch and passed a
+two-process local integration smoke; it is not yet promoted to GOKAYA. Written after tracing
 `tools/server/server-models.{h,cpp}`, `common/arg.cpp` (preset-only keys), `common/preset.h`,
 `common/common.cpp` (`common_fit_normal_kv_context`) and re-deriving the VRAM arithmetic from
 `docs/kv-calibration-findings.md` (GOKAYA, `192.168.1.57`).
@@ -438,8 +439,8 @@ contract allows (80,036 tokens) through the router, on the long child, at 11,887
 2. Sections 6.1–6.3 — the routing itself. This is the deliverable the clients need.
 3. Section 6.4 — `/v1/models` cosmetics, same phase if cheap.
 4. Hysteresis only if test 9 says so.
-5. Section 11 KV state transfer between the two children, only if test 9 says the migration cost
-   hurts. It is legal (same weights) but it is real code, not config.
+5. Section 11 KV state transfer between the two children. It is legal (same weights) and now
+   implemented; promote it only with a new CUDA build and a controlled production restart.
 
 ## 11. Carrying the KV state across the swap
 
@@ -499,18 +500,22 @@ computed by other weights, silently. So:
 - **Only upward.** 61k of cells fit in a 105k cache, never the reverse — and the no-demotion rule
   (6.3) already forbids the other direction.
 
-### 11.4 Why it is still step 5, not step 2
+### 11.4 Implementation status
 
-Not config-only: `unload_lru()` (`server-models.cpp:938-960`) has no "save before you die" hook,
-the restore has to be issued after the load completes, and a tmpfs directory needs a size budget
-and a reaper. The guard against the forbidden hop above is also code that has to be written and
-reviewed.
+The router now injects `--slots` and a private state directory into every group child. For an
+upward migration carrying `X-Conversation-Id`, it saves slot 0 before `ensure_model_ready()`,
+restores it after the target child is loaded, checks the saved/restored token count, and removes
+the file. The transfer is best-effort: a failed action falls back to the normal full prefill.
+The router compares model and mmproj identity before saving, so a different GGUF cannot receive
+the state file. The directory is below the router's `--slot-save-path` parent when provided, or
+the system temporary directory otherwise; a RAM filesystem such as `/dev/shm` is an explicit
+operator choice and must fit the host's available memory.
 
-Meanwhile the cheap version is already in the plan: **no-demotion plus `-cram` on the long child**.
-A conversation migrates once, then lives in `qwen3-long`, where the in-RAM cache works normally for
-every later turn. That leaves exactly one expensive turn per conversation. Build 11.2 when test 9
-shows those turns add up. Keep `-cram` at 2048, not 3072: on this box the host RAM is what breaks
-first (1.1).
+The local smoke used the same GGUF in two children with `--models-max 1`: 20 tokens were saved and
+restored, and the second request processed 289 of 309 prompt tokens (`309 - 20`). The production
+deployment still needs a new CUDA build and a controlled restart before this path is live.
+
+Keep `-cram` at 2048, not 3072: on this box the host RAM is what breaks first (1.1).
 
 Unrelated config win, cheap and independent: **do not pass `--ctx-size 0` to the children in
 production.** With 0 the fitting probe builds and frees full target + MTP contexts on every load,

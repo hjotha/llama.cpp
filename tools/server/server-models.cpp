@@ -446,7 +446,304 @@ server_models::server_models(
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
 }
 
-server_models::~server_models() = default;
+server_models::~server_models() {
+    cleanup_route_state_dir();
+}
+
+static bool is_route_member(const server_model_meta & meta) {
+    std::string group;
+    return meta.preset.get_option(COMMON_ARG_PRESET_ROUTE_GROUP, group) && !group.empty();
+}
+
+static std::string route_state_model_identity(const server_model_meta & meta) {
+    static constexpr const char * keys[] = {
+        "LLAMA_ARG_MODEL",
+        "LLAMA_ARG_MODEL_URL",
+        "LLAMA_ARG_DOCKER_REPO",
+        "LLAMA_ARG_HF_REPO",
+        "LLAMA_ARG_HF_FILE",
+        "LLAMA_ARG_MMPROJ",
+        "LLAMA_ARG_MMPROJ_URL",
+    };
+
+    std::string identity;
+    bool has_identity = false;
+    for (const char * key : keys) {
+        std::string value;
+        identity += key;
+        identity += '=';
+        if (meta.preset.get_option(key, value)) {
+            identity += value;
+            has_identity = true;
+        }
+        identity += '\n';
+    }
+    return has_identity ? identity : std::string();
+}
+
+static bool route_state_weights_match(const server_model_meta & source, const server_model_meta & target) {
+    const std::string source_identity = route_state_model_identity(source);
+    return !source_identity.empty() && source_identity == route_state_model_identity(target);
+}
+
+static int route_member_rank(const std::vector<route_group_member> & members, const std::string & name) {
+    for (size_t i = 0; i < members.size(); ++i) {
+        if (members[i].name == name) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+static std::string route_state_filename(const std::string & conv_id) {
+    const size_t first = std::hash<std::string>{}(conv_id);
+    const size_t second = std::hash<std::string>{}(std::string("llama-route-state:") + conv_id);
+    return "slot-" + std::to_string(first) + "-" + std::to_string(second) + ".bin";
+}
+
+void server_models::ensure_route_state_dir() {
+    if (!route_state_dir.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(route_state_dir, ec)) {
+            return;
+        }
+    }
+
+    std::error_code ec;
+    const std::filesystem::path root = base_params.slot_save_path.empty()
+        ? std::filesystem::temp_directory_path(ec)
+        : std::filesystem::path(base_params.slot_save_path);
+    if (ec || root.empty()) {
+        SRV_WRN("%s\n", "unable to create route state directory: no temporary directory is available");
+        return;
+    }
+
+    const std::string suffix = std::to_string(ggml_time_ms()) + "-" +
+        std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const std::filesystem::path dir = root / ("llama-router-state-" + suffix + "-" + std::to_string(attempt));
+        ec.clear();
+        if (!std::filesystem::create_directory(dir, ec)) {
+            if (!ec) {
+                continue;
+            }
+            break;
+        }
+
+        std::error_code perm_ec;
+        std::filesystem::permissions(
+            dir,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace,
+            perm_ec);
+        if (perm_ec) {
+            SRV_WRN("unable to restrict route state directory permissions: %s\n", perm_ec.message().c_str());
+        }
+        route_state_dir = dir.string();
+        route_state_dir_owned = true;
+        SRV_INF("route state directory: %s\n", route_state_dir.c_str());
+        return;
+    }
+
+    SRV_WRN("unable to create route state directory under %s: %s\n", root.string().c_str(), ec.message().c_str());
+}
+
+void server_models::cleanup_route_state_dir() {
+    std::lock_guard<std::mutex> route_lock(route_mutex);
+    if (route_state_dir_owned && !route_state_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(route_state_dir, ec);
+        if (ec) {
+            SRV_WRN("unable to remove route state directory %s: %s\n", route_state_dir.c_str(), ec.message().c_str());
+        }
+    }
+    route_state_dir.clear();
+    route_state_dir_owned = false;
+    route_states.clear();
+}
+
+void server_models::render_child_args(server_model_meta & meta) {
+    meta.update_args(ctx_preset, bin_path);
+    if (!is_route_member(meta)) {
+        return;
+    }
+
+    ensure_route_state_dir();
+    if (route_state_dir.empty()) {
+        SRV_WRN("route member %s has no slot state directory; KV transfer is disabled\n", meta.name.c_str());
+        return;
+    }
+
+    // Group children must expose the native slot action endpoint and share one private directory.
+    for (auto it = meta.args.begin(); it != meta.args.end();) {
+        if (*it == "--slot-save-path") {
+            it = meta.args.erase(it);
+            if (it != meta.args.end()) {
+                it = meta.args.erase(it);
+            }
+        } else {
+            ++it;
+        }
+    }
+    meta.args.push_back("--slots");
+    meta.args.push_back("--slot-save-path");
+    meta.args.push_back(route_state_dir);
+}
+
+std::optional<json> server_models::route_slot_action(
+        const server_model_meta & meta,
+        const char * action,
+        int id_slot,
+        const std::string & filename) {
+    if (meta.port <= 0 || route_state_dir.empty()) {
+        return std::nullopt;
+    }
+
+    httplib::Client cli(CHILD_ADDR, meta.port);
+    if (base_params.timeout_read > 0) {
+        cli.set_connection_timeout(base_params.timeout_read, 0);
+        cli.set_write_timeout(base_params.timeout_read, 0);
+    }
+    if (base_params.timeout_write > 0) {
+        cli.set_read_timeout(base_params.timeout_write, 0);
+    }
+
+    const std::string path = "/slots/" + std::to_string(id_slot) + "?action=" + action;
+    const std::string body = json{{"filename", filename}}.dump();
+    auto response = cli.Post(path, body, "application/json");
+    if (!response) {
+        SRV_WRN("route slot %s failed for model %s: no response\n", action, meta.name.c_str());
+        return std::nullopt;
+    }
+    if (response->status != 200) {
+        SRV_WRN("route slot %s failed for model %s: HTTP %d\n", action, meta.name.c_str(), response->status);
+        return std::nullopt;
+    }
+
+    try {
+        json result = json::parse(response->body);
+        const char * count_key = std::strcmp(action, "save") == 0 ? "n_saved" : "n_restored";
+        if (!result.is_object() || !result.contains(count_key) || !result.at(count_key).is_number_integer()) {
+            SRV_WRN("route slot %s returned an invalid response for model %s\n", action, meta.name.c_str());
+            return std::nullopt;
+        }
+        return result;
+    } catch (const std::exception & e) {
+        SRV_WRN("route slot %s returned invalid JSON for model %s: %s\n", action, meta.name.c_str(), e.what());
+        return std::nullopt;
+    }
+}
+
+bool server_models::save_route_state(
+        const std::string & group,
+        const std::string & conv_id,
+        const std::string & target,
+        int id_slot) {
+    if (group.empty() || conv_id.empty() || target.empty()) {
+        return false;
+    }
+
+    const auto pinned = conv_models.lookup(conv_id);
+    if (!pinned.has_value() || *pinned == target) {
+        return false;
+    }
+
+    const auto groups = get_route_groups();
+    const auto group_it = groups.find(group);
+    if (group_it == groups.end()) {
+        return false;
+    }
+    const int source_rank = route_member_rank(group_it->second, *pinned);
+    const int target_rank = route_member_rank(group_it->second, target);
+    if (source_rank < 0 || target_rank <= source_rank) {
+        return false;
+    }
+
+    const auto source_meta = get_meta(*pinned);
+    const auto target_meta = get_meta(target);
+    if (!source_meta.has_value() || !target_meta.has_value() || !source_meta->is_ready_or_sleep()) {
+        return false;
+    }
+    if (!route_state_weights_match(*source_meta, *target_meta)) {
+        SRV_WRN("route state transfer disabled for %s -> %s: model identity differs\n",
+                pinned->c_str(), target.c_str());
+        return false;
+    }
+    const std::string model_identity = route_state_model_identity(*source_meta);
+
+    ensure_route_state_dir();
+    if (route_state_dir.empty()) {
+        return false;
+    }
+
+    const std::string filename = route_state_filename(conv_id);
+    const auto result = route_slot_action(*source_meta, "save", id_slot, filename);
+    if (!result.has_value()) {
+        return false;
+    }
+
+    const int64_t n_tokens = result->at("n_saved").get<int64_t>();
+    route_states[conv_id] = { *pinned, target, model_identity, filename, id_slot, n_tokens };
+    SRV_INF("saved route state for conversation %s: %s -> %s, slot=%d, tokens=%lld\n",
+            conv_id.c_str(), pinned->c_str(), target.c_str(), id_slot, (long long) n_tokens);
+    return true;
+}
+
+void server_models::discard_route_state(const std::string & conv_id) {
+    auto it = route_states.find(conv_id);
+    if (it == route_states.end()) {
+        return;
+    }
+    if (!route_state_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::path(route_state_dir) / it->second.filename, ec);
+        if (ec) {
+            SRV_WRN("unable to remove route state file for conversation %s: %s\n", conv_id.c_str(), ec.message().c_str());
+        }
+    }
+    route_states.erase(it);
+}
+
+bool server_models::restore_route_state(const std::string & conv_id, const std::string & target) {
+    auto it = route_states.find(conv_id);
+    if (it == route_states.end()) {
+        return false;
+    }
+    if (it->second.target != target) {
+        discard_route_state(conv_id);
+        return false;
+    }
+
+    const auto target_meta = get_meta(target);
+    if (!target_meta.has_value() || !target_meta->is_ready_or_sleep()) {
+        return false;
+    }
+
+    const route_state state = it->second;
+    if (route_state_model_identity(*target_meta) != state.model_identity) {
+        SRV_WRN("route state restore skipped for conversation %s: target model identity changed\n", conv_id.c_str());
+        discard_route_state(conv_id);
+        return false;
+    }
+    const auto result = route_slot_action(*target_meta, "restore", state.id_slot, state.filename);
+    if (!result.has_value()) {
+        discard_route_state(conv_id);
+        return false;
+    }
+
+    const int64_t n_tokens = result->at("n_restored").get<int64_t>();
+    if (state.n_tokens >= 0 && n_tokens != state.n_tokens) {
+        SRV_WRN("route state restore count mismatch for conversation %s: saved=%lld restored=%lld\n",
+                conv_id.c_str(), (long long) state.n_tokens, (long long) n_tokens);
+        discard_route_state(conv_id);
+        return false;
+    }
+
+    SRV_INF("restored route state for conversation %s: %s, slot=%d, tokens=%lld\n",
+            conv_id.c_str(), target.c_str(), state.id_slot, (long long) n_tokens);
+    discard_route_state(conv_id);
+    return true;
+}
 
 void server_models::add_model(server_model_meta && meta) {
     if (mapping.find(meta.name) != mapping.end()) {
@@ -497,7 +794,7 @@ void server_models::add_model(server_model_meta && meta) {
         }
     }
 
-    meta.update_args(ctx_preset, bin_path); // render args
+    render_child_args(meta);
     meta.update_caps();
     std::string name = meta.name;
     mapping[name] = instance_t{
@@ -905,7 +1202,7 @@ void server_models::load_models() {
             }
 
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
-            inst.meta.update_args(ctx_preset, bin_path);
+            render_child_args(inst.meta);
             inst.meta.update_caps();
         }
 
@@ -1027,6 +1324,16 @@ std::vector<server_model_meta> server_models::get_all_meta() {
 std::unordered_map<std::string, std::vector<route_group_member>> server_models::get_route_groups() {
     std::lock_guard<std::mutex> lk(mutex);
     return route_groups;
+}
+
+bool server_models::is_route_group(const std::string & name) {
+    std::lock_guard<std::mutex> lk(mutex);
+    auto it = route_groups.find(name);
+    return it != route_groups.end() && !it->second.empty();
+}
+
+std::unique_lock<std::mutex> server_models::lock_route_requests() {
+    return std::unique_lock<std::mutex>(route_mutex);
 }
 
 // does this request carry a prompt whose token budget matters for routing? control, slots,
@@ -1302,7 +1609,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
     {
         SRV_INF("spawning server instance with name=%s on port %d\n", inst.meta.name.c_str(), inst.meta.port);
 
-        inst.meta.update_args(ctx_preset, bin_path); // render args
+        render_child_args(inst.meta);
 
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
@@ -1500,6 +1807,7 @@ void server_models::unload_all() {
             th.join();
         }
     }
+    cleanup_route_state_dir();
 }
 
 void server_models::update_status(const std::string & name, const update_status_args & args) {
@@ -2181,6 +2489,10 @@ void server_models_routes::init_routes() {
     this->proxy_get = [this](const server_http_req & req) {
         std::string method = "GET";
         std::string name = req.get_param("model");
+        std::unique_lock<std::mutex> route_lock;
+        if (models.is_route_group(name)) {
+            route_lock = models.lock_route_requests();
+        }
         // body-less requests resolve to the loaded member of a group, or the capped tier cold
         name = models.resolve_route_target(name, req, json::object(), std::string());
         bool autoload = is_autoload(params, req);
@@ -2191,22 +2503,34 @@ void server_models_routes::init_routes() {
         if (autoload) {
             models.ensure_model_ready(name, req.should_stop);
         }
+        if (route_lock.owns_lock()) {
+            route_lock.unlock();
+        }
         return models.proxy_request(req, method, name, false);
     };
 
     this->proxy_post = [this](const server_http_req & req) {
         std::string method = "POST";
         json body = json::parse(req.body);
-        std::string name = json_value(body, "model", std::string());
+        std::string requested_name = json_value(body, "model", std::string());
         // route group resolution happens before validation: a group name is not a mapping
         // entry, and the no-demotion rule needs the conversation pin from the previous turn
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
-        name = models.resolve_route_target(name, req, body, conv_id);
+        std::unique_lock<std::mutex> route_lock;
+        if (models.is_route_group(requested_name)) {
+            route_lock = models.lock_route_requests();
+        }
+        std::string name = models.resolve_route_target(requested_name, req, body, conv_id);
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
+        int id_slot = json_value(body, "id_slot", 0);
+        if (id_slot < 0) {
+            id_slot = 0;
+        }
+        const bool state_saved = models.save_route_state(requested_name, conv_id, name, id_slot);
         // remember which child serves this conversation so the stream routes can route straight
         // to it without polling, keyed on the exact conv id from the header. registered before
         // the load wait so a stop issued while the model loads can erase the entry and cancel
@@ -2218,9 +2542,18 @@ void server_models_routes::init_routes() {
         if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
             SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
                     conv_id.c_str(), name.c_str());
+            if (state_saved) {
+                models.discard_route_state(conv_id);
+            }
             res_err(error_res, format_error_response(
                     "request cancelled by a stop while the model was loading", ERROR_TYPE_INVALID_REQUEST));
             return error_res;
+        }
+        if (state_saved) {
+            models.restore_route_state(conv_id, name);
+        }
+        if (route_lock.owns_lock()) {
+            route_lock.unlock();
         }
         // a session request that waited for a load detaches from the client socket: the
         // client may have dropped during the wait (page reload) and the session buffer must

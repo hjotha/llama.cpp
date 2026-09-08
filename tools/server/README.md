@@ -1920,8 +1920,17 @@ own name (useful for staging the group before relying on it).
 - Prompt-cache loss on migration: the child's cached prefix dies with the child, the migrating
   conversation re-prefills from scratch once (the no-demotion rule limits this to a single hop).
 - No style shift across the swap if both tiers load the same GGUF (only the speculative head
-  changes), which also keeps any slot-state transfer between tiers legal — slot save/restore
+  changes), which also keeps any slot-state transfer between tiers legal - slot save/restore
   validates KV geometry only, **never load a state file written by other weights into a tier**.
+
+When a request carries `X-Conversation-Id`, the router preserves that conversation's slot state
+across an upward migration: it calls the native `save` action before evicting the old child and
+the native `restore` action after the new child is ready. This is best-effort; a failed transfer
+falls back to the normal full prefill. The group children are started with `--slots` and a private
+state directory below the router's `--slot-save-path`, or below the system temporary directory
+when that option is omitted. Use a path on a RAM filesystem such as `/dev/shm` only when the host
+has enough available memory. The transfer targets slot 0, which matches the supported
+`--parallel 1` deployment.
 
 **What the group looks like from outside:**
 

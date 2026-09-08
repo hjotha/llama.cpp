@@ -191,6 +191,23 @@ class _Bg:
             f"{what} failed: {self.result.status_code if self.result else None} {self.result.body if self.result else None}"
 
 
+@pytest.mark.parametrize("status", ["loading", "unloaded"])
+def test_router_queue_preserves_cold_autoload(status):
+    """a cold autoload keeps its model until its waiting request reaches the proxy"""
+    global server
+    server.models_max = 1
+    server.start()
+
+    first = _Bg(lambda: _tokenize(MODEL_A)).start()
+    _wait_for_model_status(MODEL_A, {status})
+    second = _Bg(lambda: _tokenize(MODEL_B)).start()
+
+    first.join()
+    second.join()
+    first.assert_ok("cold autoload request")
+    second.assert_ok("queued request")
+
+
 def test_router_queue_does_not_evict_busy_model():
     """a request that finds no free slot waits, and the model serving a request survives it"""
     global server

@@ -128,11 +128,6 @@ struct server_lru_sched {
         }
     }
 
-    bool queue_empty(std::unique_lock<std::mutex> & lk) {
-        check_lock(lk);
-        return queue.empty();
-    }
-
     // true if it is this model's turn to load, and nobody is loading it yet
     bool try_claim(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
         check_lock(lk);
@@ -1736,6 +1731,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         {"status", server_model_status_to_string(inst.meta.status)},
     });
 
+    inst.req_count = mapping[name].req_count;
     mapping[name] = std::move(inst);
     cv.notify_all();
 }
@@ -1961,17 +1957,9 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
         std::unique_lock<std::mutex> lk(mutex);
         auto it = mapping.find(name);
         if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
-            if (sched->has_capacity(lk) && sched->queue_empty(lk)) {
-                lk.unlock();
-                SRV_INF("model name=%s is not loaded, loading...\n", name.c_str());
-                load(name);
-                did_load = true;
-            } else {
-                // also queue when a slot looks free but others wait already, else they starve
-                sched->join(lk, name);
-                sched->tick(lk);
-                queued = true;
-            }
+            sched->join(lk, name);
+            sched->tick(lk);
+            queued = true;
         }
     }
 
@@ -2051,6 +2039,30 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     return true;
 }
 
+std::shared_ptr<void> server_models::reserve_request(const std::string & name) {
+    auto release = [this, name](void *) { release_request(name); };
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
+            throw std::runtime_error("model name=" + name + " is not found");
+        }
+        it->second.req_count++;
+    }
+    return std::shared_ptr<void>(this, std::move(release));
+}
+
+void server_models::release_request(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it != mapping.end() && it->second.req_count > 0) {
+        it->second.req_count--;
+        if (it->second.req_count == 0) {
+            sched->tick(lk);
+        }
+    }
+}
+
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
@@ -2092,16 +2104,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             base_params.timeout_write
             );
 
-    proxy->cleanup = [this, name]() {
-        std::unique_lock<std::mutex> lk(mutex);
-        auto it = mapping.find(name);
-        if (it != mapping.end() && it->second.req_count > 0) {
-            it->second.req_count--;
-            if (it->second.req_count == 0) {
-                sched->tick(lk);
-            }
-        }
-    };
+    proxy->cleanup = [this, name]() { release_request(name); };
 
     return proxy;
 }
@@ -2471,6 +2474,7 @@ void server_models_routes::init_routes() {
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
+        auto reservation = models.reserve_request(name);
         if (autoload) {
             models.ensure_model_ready(name, req.should_stop);
         }
@@ -2497,6 +2501,7 @@ void server_models_routes::init_routes() {
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
+        auto reservation = models.reserve_request(name);
         int id_slot = json_value(body, "id_slot", 0);
         if (id_slot < 0) {
             id_slot = 0;

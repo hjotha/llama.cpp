@@ -126,7 +126,7 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
         std::thread th;
         server_model_meta meta;
-        int req_count = 0; // number of active proxy requests
+        int req_count = 0; // number of waiting and active proxy requests
     };
 
     std::mutex mutex;
@@ -345,6 +345,10 @@ public:
     // if models_max is reached, the request waits in a queue until a slot frees up
     // throws if the load fails, or if should_stop fires while waiting
     bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr);
+
+    // keep a model reserved while preparing its proxy request
+    std::shared_ptr<void> reserve_request(const std::string & name);
+    void release_request(const std::string & name);
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);

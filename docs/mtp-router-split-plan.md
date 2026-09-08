@@ -1,4 +1,46 @@
-# Plan: one public model name, two router children off the *same* GGUF (MTP 61k / no-MTP 105k)
+# Plan: one public model name, two context profiles from the same GGUF
+
+## Current deployment - upstream sync, 2026-09-08
+
+GOKAYA `8090` now runs fork `de57d0269` with official upstream through `64e9bceb2`.
+The release and shared libraries are in `/home/hjotha/llama-releases/de57d0269/build/bin`.
+Cold-autoload reservations fix both integration races; 9 router tests passed,
+including slot-state transfer. Real Qwen tier migration preserved cached tokens.
+
+| Profile | Context | Batch / ubatch | Validated input + output |
+| --- | ---: | ---: | ---: |
+| MTP | 61,184 | 64 | 57,088 + 4,094 |
+| No MTP | 98,304 | 512 | 94,208 + 4,096 |
+
+This release passed 7 CPU/parser/governor tests, 130 CUDA comparisons, and
+56 sequential Qwen requests at the contexts above. Production routing, cache,
+Chat, Responses and loaded-library checks passed. The preset remains
+`/home/hjotha/prod-two-tier.ini`, with `fit=off`, `cache-ram=2048`, one slot,
+and the 61184-token MTP route threshold. `load-mode=none` avoids the host-RAM OOM seen during rapid mmap reloads; both maximum requests were repeated through the router with this setting. Slot transfer is active in this release.
+
+Evidence directory: `/home/hjotha/upstream-sync-20260908/`.
+
+## Corrected operational validation - CUDA MMQ, 2026-09-08
+
+This section supersedes the earlier single-pattern calibration below. The original 61,440 MTP setting reproduced fatal CUDA OOM on the second request (9,954 + 265 tokens passed; 10,952 + 32 failed). Disabling CUDA Graphs reproduced the same failure with 1.625 MiB free. Successful first-time cudaFuncSetAttribute calls consumed memory in 2 MiB increments; this is evidence of late kernel allocation under capacity pressure, not demonstrated fragmentation. The NVIDIA driver also reserves 380 MiB outside the usable CUDA memory.
+
+The one-line MMQ fix (fork commit `3955ac793`) configures only mul_mat_q<type, J, fallback>, instead of loading/configuring both fallback variants. It passed 139 numerical MUL_MAT checks for IQ1/IQ2/IQ3 against CPU. The patched 61,440 MTP and 98,560 no-MTP settings passed the original second request but failed later widths; the code saving alone does not validate that old ceiling.
+
+| Profile | batch/ubatch | Context | Input tokens | Output tokens | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| MTP | 64 | 61,184 | 57,088 | 4,095 | 520.71 | 42.85 |
+| No MTP | 512 | 98,304 | 94,208 | 4,096 | 686.54 | 19.76 |
+
+Each selected process completed 28 sequential requests on port 8095 as root, including the incident-sized calls, 16 uncached prompts varying the batch remainder, a ctx-minus-4096 request with 4096 requested output, and another completion afterward. The maximum request runs after kernel warmup. Exact prompt IDs, cache accounting, argv, timing and errors are in the JSON files. An output of 4094-4096 is accepted at the context edge; truncated=true there does not imply lost input. CUDA Graph allocation warnings with successful direct-execution fallback remain recorded separately from fatal OOM.
+
+Production keeps fit=off, cache-ram=2048, one slot, q4_0 KV, and the same batch/ubatch and MTP/power options. The MTP route cap is 61184; larger total prompt-plus-requested-output budgets select the 98304-token no-MTP profile, subject to existing conversation pinning. These are tested operational values for these workloads, not a guarantee for arbitrary GPU co-tenants or all allocation histories.
+
+Evidence: /home/hjotha/cuda-oom-20260908/. Selected results: patched-mtp-long-ctx61184.json, patched-nomtp-long-ctx98304.json. Reproducible checks: run.py and numerical.log. Production canaries and loaded-library hashes are recorded separately in production-verification.json.
+
+## Historical design and calibration notes
+
+The status statements and ceilings below describe earlier experiments and
+are superseded by the current deployment and operational validation above.
 
 Status: **implemented, tested and in production on GOKAYA** since 2026-09-07 (sections 6, 13, 14;
 the code is in `tools/server/server-models.{h,cpp}`, documented in `tools/server/README.md`).

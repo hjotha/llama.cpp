@@ -19,112 +19,83 @@
 
 ## About this fork
 
-This fork is an experimental long-context serving branch built around a shared,
-paged KV cache. It keeps the upstream `llama.cpp` interface while adding the
-pieces needed to run long, concurrent Qwen requests on memory-constrained GPUs.
+This fork follows official `ggml-org/llama.cpp` and adds context-based model
+routing, CUDA memory fixes, GPU governors, and experimental paged KV serving.
+The feature list below distinguishes source additions from the configuration
+actually used by the GOKAYA production server.
 
-The main additions are:
+### Upstream and production status (2026-09-08)
 
-- paged KV pools for CUDA and Vulkan, including quantized paged attention;
-- shared physical KV pages across server slots instead of a fixed KV partition
-  per slot;
-- multi-sequence scheduling, physical-budget admission control, CPU/GPU pools,
-  and dynamic page growth;
-- CUDA Flash Decode / DFlash2 support for paged attention;
-- optional SnapKV page scoring, selective retention, per-sequence score state,
-  eviction timing, and a repeatable quality benchmark;
-- page-eviction guards in the paged attention kernels (`physical_block < 0` is
-  skipped/masked instead of dereferenced), so evicted pages never corrupt KV
-  reads during prefill or decode;
-- a per-sequence `n_prompt`/`n_decoded` allocator invariant so cached tokens
-  and decoded tokens keep `n_prompt + n_decoded == previous_max + 1` while
-  pages are being released and reused;
-- SnapKV state kept per sequence and correctly sized against the *logical*
-  per-slot context even under `--kv-paged-dynamic` with multiple parallel
-  slots (the fix uses `cparams.n_ctx` instead of `n_ctx_seq`, which previously
-  under-sized the score window and crashed with more than one slot);
-- `--kv-paged-prealloc-max`, which measures the usable GPU budget, runs one
-  synthetic long prefill before the health endpoint becomes ready, and freezes
-  the largest validated page pool for the lifetime of the server.
+Official upstream is integrated through `64e9bceb2` (21 new upstream commits).
+The validated server build is `de57d0269`, including a follow-up fix for two
+cold-autoload races found during integration: eviction before the first proxy
+starts, and simultaneous requests competing for the same model slot.
 
-The last mode avoids allocations and page-table migrations in live prefill. A
-server started with `--ctx-size 0` therefore publishes the physical context
-that was actually calibrated, rather than a larger optimistic value that can
-fail later under load. Slots draw from one shared pool: `--parallel` limits
-simultaneous sequences but does not divide the pool into fixed per-slot quotas.
-Pages released by a completed request can be reused by requests that remain.
+GOKAYA port `8090` runs this build and its matching shared libraries from
+`/home/hjotha/llama-releases/de57d0269/build/bin`, under
+`llama-server-root.service`. Source hashes match the fork for all
+1,712 audited files in `common`, `src`, `include`, `ggml`, and
+`tools/server` (documentation, tests, assets and vendor directories excluded).
+There is no pending runtime-source delta within that scope. The README and
+operational-plan update follows the runtime build as a documentation commit.
+The separate Vulkan compactor on port `8092` retains its existing build.
 
-### Recent integration status (2026-09-04)
+Both production profiles use the same `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`
+and public model name `qwen-3.8-27b`. The preset is
+`/home/hjotha/prod-two-tier.ini`; `models-max=1` keeps one child loaded at a time.
 
-The current fork `master` contains the upstream merge through
-`86b351fd6`, followed by the experimental SnapKV paged-retention merges. The
-recent work adds streaming SnapKV capture, per-head page scores, selective
-eviction, CPU-to-GPU page migration, and the repeatable
-`tools/snapkv-40k-mtp-bench.py` harness.
+| Profile | Context | Batch / ubatch | Validated input + output |
+| --- | ---: | ---: | ---: |
+| MTP | 61,184 | 64 | 57,088 + 4,094 |
+| No MTP | 98,304 | 512 | 94,208 + 4,096 |
 
-The normal KV and traditional MTP paths remain the upstream implementation.
-The added code is selected only for paged KV configurations. SnapKV remains
-experimental: it is a long-context capacity and quality experiment, not the
-default production profile.
+The route threshold is 61,184 **prompt plus requested output tokens**; the
+larger budget selects the 98,304-token no-MTP profile. Existing conversation
+pinning prevents demotion of a conversation already on the larger profile.
+Cold-start routing still uses its existing byte estimate until a tokenizer is
+available. Common settings are traditional KV, `parallel=1`, `q4_0` K/V,
+`flash-attn=on`, `fit=off`, `load-mode=none`, `cache-ram=2048`, and one context checkpoint.
+The native buffered load mode avoids full-file mmap population: rapid tier
+reloads with mmap triggered a host-RAM OOM during the first deployment canary.
+The same routing and cache canaries passed with buffered loading.
+The MTP profile uses two draft tokens and `spec-draft-p-min=0.80`.
+Slot-state reuse requires a compatible continuing prefix, including the previous
+response. Removing or rewriting saved tokens can require prompt recomputation
+for the hybrid/recurrent model even when the state file was restored successfully.
 
-### RTX 4070 12 GB calibration and production profile (2026-09-04)
+### Fork additions and what is not active in production
 
-The complete, model-specific calibration record is in
-[docs/kv-calibration-findings.md](docs/kv-calibration-findings.md). Results
-below use CUDA0, `q4_0` K/V, `parallel=1`, CUDA Flash Attention, and the
-tested RTX 4070 12 GB unless stated otherwise.
+| Addition beyond official upstream | Status on GOKAYA `8090` |
+| --- | --- |
+| [Context route groups and conversation pinning](tools/server/README.md) | Enabled: one public name selects the two profiles above. |
+| Slot-state transfer across a tier swap | Enabled with `--slot-save-path /dev/shm`; a real Qwen migration preserved cached prompt tokens. |
+| Cold-autoload request reservations | Enabled; both concurrent cold-load regression cases pass. |
+| Responses compatibility and configured-context model metadata | Enabled; Chat and Responses canaries pass and the catalog advertises 98,304. |
+| CUDA graph capture/fallback fixes, bounded IQ1_M workspace, IQ1 MMQ kernels and selected-variant initialization | Compiled; numerical comparisons and varied-shape Qwen requests pass. Recoverable CUDA Graph allocation fallback remains observable. |
+| [NVIDIA power governor](docs/phase-aware-nvidia-gpu-power-governor.md) and [memory-clock governor](docs/phase-aware-nvidia-gpu-memory-clock-governor.md) | Configured for 200 W prefill, 165 W decode and 11001 MHz decode memory clock. |
+| Traditional-KV context fitting / calibration | Available in the binary; production uses explicit tested contexts with `fit=off`. |
+| Paged KV, shared multi-slot pools, physical-budget admission, dynamic growth and CPU/GPU page migration | Compiled CUDA/CPU paths; disabled by the current preset (`kv_paged=false`, one slot). |
+| `--kv-paged-prealloc-max` automatic pool calibration | Available; disabled in production. |
+| SnapKV streaming/per-head/per-sequence scoring and selective retention | Experimental source and CUDA/CPU support present; disabled in production. |
+| DFlash2 and stochastic draft verification | Available source path; no DFlash2 draft model is configured. Production speculation uses MTP only. |
+| Vulkan paged attention and Android compatibility changes | Present in the fork; the `8090` build has `GGML_VULKAN=OFF`. HIP/ROCm is also not compiled into this release. |
+| Paged examples and SnapKV benchmark tools | Operator tools in the source tree; not running as production services. |
 
-The promoted profile is traditional KV with the ISTA MTP GGUF. It avoids the
-paged-attention throughput penalty while retaining a validated 54K request
-budget:
+Validation for this release: 7 CPU/parser/governor tests, 9 router tests,
+130 CUDA numerical comparisons, and 56 sequential Qwen requests.
+Both maximum requests were repeated through the router with `load-mode=none`.
+Each profile passed an input of `context - 4096`, a requested output of 4096,
+and another completion afterward. Production canaries checked both routing
+boundaries, real MTP-to-no-MTP cache transfer, Chat, Responses, and loaded-library
+hashes. An output of 4094-4096 at the context edge is accepted. These limits
+apply to the tested model, GPU, cache format and request sequence.
 
-```sh
-llama-server \
-  --model Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf \
-  --ctx-size 54272 --parallel 1 \
-  --batch-size 64 --ubatch-size 64 \
-  --device CUDA0 --flash-attn on \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
-  --fit off --cache-ram 4096 --ctx-checkpoints 1 --metrics \
-  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
-  --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
-```
-
-| Configuration | Validated boundary | Observed throughput | Operational result |
-| --- | --- | --- | --- |
-| ISTA traditional MTP | 50,168 prompt + 4,096 output | 510.54 prompt tok/s, 46.98 decode tok/s | promoted production profile |
-| ISTA paged MTP | 60,160 total tokens | 471.00 prompt tok/s, 30.11 decode tok/s | more capacity, not a speed replacement |
-| ISTA traditional no-MTP | 97,280 total tokens | 456.42 prompt tok/s, 21.19 decode tok/s | highest tested traditional capacity |
-| ISTA paged no-MTP | 105,584 total tokens | 439.02 prompt tok/s, 17.27 decode tok/s | highest tested paged capacity |
-
-For a literal 4,096-token MTP completion, `54,264` is the highest validated
-traditional-KV context. At `54,272`, the server completes 4,094 tokens at the
-exact boundary; `54,273` OOMs during the request. This two-token reserve is a
-server boundary behavior, not a client-side cache hit or throughput issue.
-
-Paged KV expands the memory ceiling, but should not be selected for raw
-throughput at equal context. At `ctx-size=54,272`, paged MTP measured 485.01
-prompt tok/s and 32.26 decode tok/s versus 549.13 and 46.66 for traditional
-KV: 11.7% lower prefill and 30.9% lower decode. The current paged attention
-path is still experimental and is expected to improve with backend work.
-
-The calibration is intentionally model- and configuration-specific. The
-larger Unsloth UD GGUF has different free VRAM and different usable limits;
-do not reuse the ISTA thresholds for it. Run the automatic probe and then a
-maximum-shaped request on the target model, batch/ubatch, cache type, and GPU.
-
-Traditional MTP was also checked against a CUDA `sm_89` stock-upstream build.
-At 128, 8,192, and 50,168 prompt tokens, the stock decode delta was 0.053%,
-0.104%, and 0.532%, respectively, with identical draft counts and acceptance.
-This is not a material regression; MTP acceptance and GPU clock variation are
-larger sources of sub-1% run-to-run differences.
-
-Sustained requests with varying prompt shapes exposed an upstream CUDA graph
-recapture OOM at this tight VRAM boundary. The local fix requires four stable
-graph calls before capture, preserving decode graphs while avoiding transient
-prefill captures. The exact reproduction, upstream A/B, instrumentation, and
-ten-request validation are recorded in
-[docs/oom-reproduction-trace.md](docs/oom-reproduction-trace.md).
+The current operational record is in
+[docs/mtp-router-split-plan.md](docs/mtp-router-split-plan.md).
+Earlier capacity and throughput experiments remain in
+[docs/kv-calibration-findings.md](docs/kv-calibration-findings.md) and
+[docs/oom-reproduction-trace.md](docs/oom-reproduction-trace.md); their old
+production profiles are superseded by the values above.
 
 ## Quick start
 

@@ -26,42 +26,27 @@ actually used by the GOKAYA production server.
 
 ### Upstream and production status (2026-09-08)
 
-Official upstream is integrated through `64e9bceb2` (21 new upstream commits).
-The validated server build is `de57d0269`, including a follow-up fix for two
-cold-autoload races found during integration: eviction before the first proxy
-starts, and simultaneous requests competing for the same model slot.
+Official upstream is integrated through `64e9bceb2` (21 upstream commits in the last sync).
+Production uses the `de57d0269` runtime base plus a server-library fix that removes a saved slot snapshot when the destination profile fails to load. The launcher, CUDA/model/GGML libraries are unchanged; only `libllama-server-impl.so` was rebuilt. All 18 selected local router tests pass against this release combination.
 
-GOKAYA port `8090` runs this build and its matching shared libraries from
-`/home/hjotha/llama-releases/de57d0269/build/bin`, under
-`llama-server-root.service`. Source hashes match the fork for all
-1,712 audited files in `common`, `src`, `include`, `ggml`, and
-`tools/server` (documentation, tests, assets and vendor directories excluded).
-There is no pending runtime-source delta within that scope. The README and
-operational-plan update follows the runtime build as a documentation commit.
-The separate Vulkan compactor on port `8092` retains its existing build.
+GOKAYA `8090` runs `/home/hjotha/llama-releases/graph-headroom-20260908/build/bin` under `llama-server-root.service`. Its manifest and live loaded-library hashes were verified. The separate Vulkan compactor on `8092` retains its existing build.
 
-Both production profiles use the same `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`
-and public model name `qwen-3.8-27b`. The preset is
-`/home/hjotha/prod-two-tier.ini`; `models-max=1` keeps one child loaded at a time.
+Both profiles use `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`, public name `qwen-3.8-27b`, and `/home/hjotha/prod-two-tier.ini`; `models-max=1` keeps one child loaded at a time.
 
-| Profile | Context | Batch / ubatch | Validated input + output |
-| --- | ---: | ---: | ---: |
-| MTP | 61,184 | 64 | 57,088 + 4,094 |
-| No MTP | 98,304 | 512 | 94,208 + 4,096 |
+| Profile | Context | Batch / ubatch | Validated input + output | Stable free VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| MTP | 60,416 | 64 | 56,320 + 4,095 | 8 MiB |
+| No MTP | 97,536 | 512 | 93,440 + 4,096 | 4 MiB |
 
-The route threshold is 61,184 **prompt plus requested output tokens**; the
-larger budget selects the 98,304-token no-MTP profile. Existing conversation
-pinning prevents demotion of a conversation already on the larger profile.
-Cold-start routing still uses its existing byte estimate until a tokenizer is
-available. Common settings are traditional KV, `parallel=1`, `q4_0` K/V,
-`flash-attn=on`, `fit=off`, `load-mode=none`, `cache-ram=2048`, and one context checkpoint.
-The native buffered load mode avoids full-file mmap population: rapid tier
-reloads with mmap triggered a host-RAM OOM during the first deployment canary.
-The same routing and cache canaries passed with buffered loading.
-The MTP profile uses two draft tokens and `spec-draft-p-min=0.80`.
-Slot-state reuse requires a compatible continuing prefix, including the previous
-response. Removing or rewriting saved tokens can require prompt recomputation
-for the hybrid/recurrent model even when the state file was restored successfully.
+The MTP route threshold is 60,416 **prompt plus requested output tokens**; larger budgets select the 97,536-token no-MTP profile. Existing conversation pinning prevents demotion. Cold-start routing retains its byte estimate until a tokenizer is available. Settings remain traditional q4_0 KV, `parallel=1`, `flash-attn=on`, `fit=off`, `load-mode=none`, `cache-ram=2048`, one checkpoint, and two MTP draft tokens with `spec-draft-p-min=0.80`.
+
+The previous 61,184/98,304 limits repeatedly ran out of VRAM while instantiating CUDA Graphs. A 256-token cut was insufficient: on no-MTP it enabled the graph but allowed a later fatal MMQ OOM. The selected 768-token reductions passed 86 requests including both maximum requests and 20 identical repeats per profile, with no fallback or fatal OOM. Free VRAM remained constant during those repeats. These are measured limits for this GPU/workload; they retain only the headroom shown in the table.
+
+Four real save/restore cycles reused 4164 cached tokens each with no leftover snapshots or OOM; the matching no-transfer control also passed. No progressive VRAM leak was observed. A separate RAM/tmpfs snapshot leak on target-load failure was reproduced and fixed. Compatible continuing prefixes, including the previous response, are still required for cache reuse by the hybrid/recurrent model.
+
+A separate post-canary GSP firmware fault (Xid 120/154 during memory-clock reset) required PCIe FLR recovery. The final preset leaves memory clocks automatic, while retaining the 200 W / 165 W power governor. The internal firmware cause was not isolated. All production canaries were repeated after recovery, plus alternating-profile idle/resume checks and a real 8092 completion; no new Xid, CUDA error or graph fallback was observed in that recovery window.
+
+Production canaries cover loaded hashes, exact routing boundaries, effective contexts, cache migration, Chat, Responses and sustained decoding. Full methodology, rejected limits, the same-context graphs-off control and raw artifact paths are in the [operational validation report](docs/mtp-router-split-plan.md#current-deployment---cuda-graph-headroom-and-slot-cleanup-2026-09-08).
 
 ### Fork additions and what is not active in production
 
@@ -69,10 +54,12 @@ for the hybrid/recurrent model even when the state file was restored successfull
 | --- | --- |
 | [Context route groups and conversation pinning](tools/server/README.md) | Enabled: one public name selects the two profiles above. |
 | Slot-state transfer across a tier swap | Enabled with `--slot-save-path /dev/shm`; a real Qwen migration preserved cached prompt tokens. |
+| Slot-state cleanup after failed destination load | Enabled; the saved snapshot is discarded before returning the load error. Fail-before/pass-after regression verified. |
 | Cold-autoload request reservations | Enabled; both concurrent cold-load regression cases pass. |
-| Responses compatibility and configured-context model metadata | Enabled; Chat and Responses canaries pass and the catalog advertises 98,304. |
-| CUDA graph capture/fallback fixes, bounded IQ1_M workspace, IQ1 MMQ kernels and selected-variant initialization | Compiled; numerical comparisons and varied-shape Qwen requests pass. Recoverable CUDA Graph allocation fallback remains observable. |
-| [NVIDIA power governor](docs/phase-aware-nvidia-gpu-power-governor.md) and [memory-clock governor](docs/phase-aware-nvidia-gpu-memory-clock-governor.md) | Configured for 200 W prefill, 165 W decode and 11001 MHz decode memory clock. |
+| Responses compatibility and configured-context model metadata | Enabled; Chat and Responses canaries pass and the catalog advertises 97,536. |
+| CUDA graph capture/fallback fixes, bounded IQ1_M workspace, IQ1 MMQ kernels and selected-variant initialization | Compiled; numerical comparisons and varied-shape Qwen requests pass. Graph headroom is validated at the limits above; recoverable OOM fallback remains available. |
+| [NVIDIA power governor](docs/phase-aware-nvidia-gpu-power-governor.md) | Configured for 200 W prefill and 165 W decode. |
+| [GPU memory-clock governor](docs/phase-aware-nvidia-gpu-memory-clock-governor.md) | Compiled but disabled in the final preset after the GSP reset incident; driver-default memory clocks are used. |
 | Traditional-KV context fitting / calibration | Available in the binary; production uses explicit tested contexts with `fit=off`. |
 | Paged KV, shared multi-slot pools, physical-budget admission, dynamic growth and CPU/GPU page migration | Compiled CUDA/CPU paths; disabled by the current preset (`kv_paged=false`, one slot). |
 | `--kv-paged-prealloc-max` automatic pool calibration | Available; disabled in production. |

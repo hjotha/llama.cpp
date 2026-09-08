@@ -445,8 +445,9 @@ def test_router_reload_models():
         os.remove(preset_path)
 
 
-def test_router_route_group_restores_slot_state(tmp_path):
-    """a route-group migration restores the outgoing child's prompt cache"""
+@pytest.mark.parametrize("fail_target_load", [False, True])
+def test_router_route_group_restores_slot_state(tmp_path, fail_target_load):
+    """a route-group migration restores or discards the outgoing child's prompt cache"""
     global server
 
     preset_path = os.path.join(TMP_DIR, "test_route_state.ini")
@@ -469,6 +470,10 @@ def test_router_route_group_restores_slot_state(tmp_path):
             "parallel = 1\n"
             "route-group = route-test\n"
         )
+
+    if fail_target_load:
+        with open(preset_path, "a") as f:
+            f.write(f"lora = {tmp_path / 'missing-adapter.gguf'}\n")
 
     server.models_preset = preset_path
     server.models_max = 1
@@ -494,7 +499,18 @@ def test_router_route_group_restores_slot_state(tmp_path):
         "n_predict": 1,
         "cache_prompt": True,
     })
+    if fail_target_load:
+        assert second.status_code == 500
+        assert "failed to load" in str(second.body)
+        with open(log_path) as f:
+            assert "saved route state for conversation route-state-test" in f.read()
+        snapshots = list(tmp_path.glob("llama-router-state-*/slot-*.bin"))
+        assert not snapshots, [(str(path), path.stat().st_size) for path in snapshots]
+        os.remove(preset_path)
+        return
+
     assert second.status_code == 200
+    assert not list(tmp_path.glob("llama-router-state-*/slot-*.bin"))
     full_tokens = server.make_request("POST", "/tokenize", data={
         "model": "route-test",
         "content": extended,

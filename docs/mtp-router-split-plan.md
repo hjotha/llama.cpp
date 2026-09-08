@@ -1,6 +1,77 @@
 # Plan: one public model name, two context profiles from the same GGUF
 
-## Current deployment - upstream sync, 2026-09-08
+## Current deployment - CUDA Graph headroom and slot cleanup, 2026-09-08
+
+GOKAYA `8090` runs `/home/hjotha/llama-releases/graph-headroom-20260908/build/bin` under `llama-server-root.service`. It uses the `de57d0269` launcher, CUDA/model/GGML libraries and a rebuilt `libllama-server-impl.so` containing the failed-load snapshot cleanup. The release manifest proves that only this server library changed. Its SHA-256 is `fd389edd1c96045b722609c5855113248f2ce4e861c54ecd8264fb780d37c20a`.
+
+| Profile | Context | Batch / ubatch | Validated input + output | Stable free VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| MTP | 60,416 | 64 | 56,320 + 4,095 | 8 MiB |
+| No MTP | 97,536 | 512 | 93,440 + 4,096 | 4 MiB |
+
+Both contexts and the MTP route threshold were reduced by 768 tokens. These are the largest clean settings tested on the 256-token grid below, with the same GPU ownership and production settings. This is a workload-bounded validation, not an absolute hardware ceiling. The small remaining VRAM margin is measured after graph and kernel warmup, not just after loading weights.
+
+The preset remains `/home/hjotha/prod-two-tier.ini`: one child, one slot, traditional q4_0 KV, flash attention, fit off, load-mode none, cache-ram 2048 MiB, one context checkpoint, and unchanged MTP/batch/power settings. The memory-clock override was subsequently removed after the separate GSP incident below. The route threshold is 60,416 prompt plus requested output tokens; larger budgets use the 97,536-token no-MTP tier, subject to existing conversation pinning. Slot transfer remains enabled under `/dev/shm`.
+
+### What caused the failure
+
+The first graph failed in a fresh standalone process with no router, conversation ID or slot restore. At the old MTP limit, CUDA reported only 5.62 MiB free before instantiation. Reducing MTP by 256 and 512 tokens still failed at 13.62 and 17.62 MiB free. A successful MTP graph instantiation consumed 18 MiB; the corresponding no-MTP graph consumed 14 MiB.
+
+Graph memory is not the entire budget. At no-MTP context 97,792, the first graph succeeded, but later widths exhausted VRAM. The existing attribute tracer reproduced successful first-time `cudaFuncSetAttribute` calls consuming another 2 MiB each, then error 2 with 1.62 MiB free at `launch_mul_mat_q`. Graph update-begin/update-complete pairs had unchanged free memory, and the temporary VMM pool remained mapped at 14 MiB in this trace. The exact internal CUDA allocation mechanism was not fully traced; the evidence identifies first-time function setup costs, not progressive graph-update leakage.
+
+The identical 97,792-token sequence passed with `GGML_CUDA_DISABLE_GRAPHS=1` (21 completions). Keeping the graph's extra allocation at that limit removes the headroom needed by later shapes. The chosen limits keep graphs enabled; the recoverable OOM fallback remains compiled and available.
+
+| Profile | Context tested | Result |
+| --- | ---: | --- |
+| MTP | 61,184 / 60,928 / 60,672 | First-request graph instantiate OOM; direct fallback completed |
+| MTP | 60,416 / 60,160 | Varied shapes passed with graphs active |
+| No MTP | 98,304 | First-request graph instantiate OOM; direct fallback completed |
+| No MTP | 98,048 | Graph entered; fatal CUDA OOM on request 2 |
+| No MTP | 97,792 | Graph entered; fatal CUDA OOM on request 14; reproduced with tracer |
+| No MTP | 97,536 / 97,280 | Varied shapes passed with graphs active |
+| No MTP, graphs disabled | 97,792 | Same 21-request sequence passed |
+
+### Leak and save/restore checks
+
+Each selected process completed 43 requests: 21 varied shapes, one maximum-input/4096-output request, one follow-up, and 20 identical uncached 4096-input/64-output requests. There were zero graph fallbacks and zero fatal CUDA errors. The maximum request evaluated every input token with context shifting disabled. `truncated=true` at the context edge reflects the generation boundary; measured input counts matched the complete request. MTP produced 4095 of the 4096 requested tokens.
+
+During the 20 identical repetitions, free VRAM stayed at 8 MiB for MTP and 4 MiB for no MTP. Each model instantiated one graph and completed 75/59 graph updates respectively. Child RSS varied by 776 KiB within each repeat series after cache warmup. GPU usage returned to the same 13 MiB baseline when each process exited. No progressive VRAM leak was observed in this sample; this does not establish the absence of every possible leak.
+
+The router A/B ran four cycles without conversation transfer and four with real transfer, using the same prefix/output. Both modes completed 16 graph instantiations with no OOM or fallback. All four transfers logged save and restore, reused 4164 cached tokens and left zero test snapshot files afterward. The no-MTP child ended each cycle with 10 MiB free without transfer and 22 MiB with transfer: restoring the prefix avoided prefill work and its extra temporary allocations. Restore was not the cause of the reproduced GPU failure.
+
+A separate RAM/tmpfs leak was found and fixed: if target loading threw after a migration snapshot was saved, the snapshot and route-state entry survived until router cleanup. A CPU regression reproduced a retained 13284-byte snapshot after an injected missing-LoRA load failure returned HTTP 500. The fix discards saved state when `ensure_model_ready()` throws, then preserves the original error. The same regression and 17 other local router tests passed with the new server library and the original release dependencies. Three external/download tests were not selected.
+
+### Separate GSP firmware incident and final mitigation
+
+After the first successful deployment canaries, NVIDIA driver `610.57.04` reported GSP task exception / load access page fault (Xid 120), followed by recovery-required Xid 154, at 15:25:34 CEST. This occurred during the memory-clock governor's decode-to-idle reset operation. The next real request only surfaced the already-failed CUDA context at 15:27:18 as `unspecified launch failure` while synchronizing for `prompt_save`. It was not a CUDA OOM, and the cache-save stack was downstream of the earlier firmware failure. The internal GSP/driver root cause was not isolated.
+
+`nvidia-smi --gpu-reset` returned Not Supported. A PCIe FLR of the RTX 4070 at `0000:65:00.0`, with NVIDIA unbind/rebind, recovered the device. The idle 8092 Vulkan compactor briefly had to stop because its backend enumeration held NVIDIA device handles; it was restarted and passed a real completion afterward. Restoring the previous `flr bus` reset-method list returned EINVAL, so the device remains selected for the supported `flr` method.
+
+The final preset removes `gpu-mem-clock-decode=11001`, leaving memory clocks under driver control as a mitigation of this reset path. Power limits remain 200 W prefill / 165 W decode. CUDA Graphs, MTP, save/restore, the validated contexts and all other model settings remain enabled as described above. The 86-request capacity measurements and the first router A/B used the old clock setting; they are not a throughput benchmark of the final automatic-clock configuration.
+
+After recovery, the complete production hash/context/cache/Chat/Responses/decode canary set passed again. Three additional requests, alternating MTP / no MTP / MTP after 12-second idle intervals, each generated 129 tokens; a final idle check and the 8092 completion passed. From recovery start, driver and service logs contained no new Xid, CUDA error, reset-required event or graph fallback. Evidence: `post-canary-kernel.log`, `post-canary-transition.log`, `gpu-reset.log`, `gpu-flr-recovery.json`, `reset-method-restoration.json`, `recovery-verification.json`, `recovery-kernel.log`, and `recovery-service.log`.
+
+The harnesses now use automatic memory clocks by default. `LLAMA_GRAPH_MEMORY_CLOCK=11001` explicitly reproduces the earlier clock setting; it is not the current production default.
+
+### Production verification and artifacts
+
+Production validation checked actual loaded-library paths/hashes, effective slot contexts/MTP status, exact route budgets 60,416 and 60,417, model catalog context 97,536, real cache migration, Chat, Responses and sustained constrained decoding in both profiles. It completed with zero fallback and zero fatal CUDA errors. An earlier deployment attempt was automatically rolled back because a constrained-output canary exhausted its 128-token test budget; increasing only that canary budget to 256 allowed the complete validation to pass. A busy-service guard also deferred the retry until the active request finished. Those events were not treated as successful deployments.
+
+Evidence directory: `/home/hjotha/graph-headroom-20260908/`.
+
+- `probe-*.json`, `refine-*.json`, matching logs: context sweep and 256-token refinement.
+- `trace-nomtp-97792.log`: first-time CUDA function allocation trace and fatal reproduction.
+- `control-no-graphs-nomtp-97792.json`: same-context graph-off control.
+- `confirm-mtp-60416.json`, `confirm-nomtp-97536.json`: all 86 final direct requests, token counts, timing and memory samples.
+- `route-transfer-off.json`, `route-transfer-on.json`: repeated cold loads and actual slot migration.
+- `slot-cleanup/`: fail-before log, pass-after logs, 18-test JUnit result, build, dependency and hash evidence.
+- `production-verification.json`, `deployment-result.json`: final live deployment proof.
+- `deployment-attempt1.json`, `deployment-attempt1-journal.log`: preserved rollback evidence.
+- `preset.before.ini`, `candidate.ini`, `release-dropin.before.conf`: configuration before/after and rollback inputs.
+
+Reproducible host-specific harnesses are `scripts/bench-cuda-graph-headroom.py` and `scripts/bench-route-graph-memory.py`. They run on GOKAYA as root, stop the production service while owning port 8095/GPU, and restore the service in `finally`. Set `LLAMA_GRAPH_TEST_BIN` to the release under test. `--sweep` probes the initial limits; `--confirm` reads `selected.json`, validates the full workload and lowers a failing candidate in 256-token steps. The route harness reads the same selected limits. Raw experiment failures remain evidence; only the final selected settings and corrected code passed the deployment gates.
+
+## Historical deployment - upstream sync, 2026-09-08
 
 GOKAYA `8090` now runs fork `de57d0269` with official upstream through `64e9bceb2`.
 The release and shared libraries are in `/home/hjotha/llama-releases/de57d0269/build/bin`.

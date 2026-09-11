@@ -1483,7 +1483,7 @@ struct ggml_backend_cuda_context {
         if (mem_stat == cudaSuccess) {
             static const size_t safe_headroom = [] {
                 const char * env = getenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB");
-                return (env != nullptr ? (size_t)atoi(env) : 32) * 1024 * 1024;
+                return (env != nullptr ? (size_t)atoi(env) : 18) * 1024 * 1024;
             }();
 
             if (free_bytes >= safe_headroom) {

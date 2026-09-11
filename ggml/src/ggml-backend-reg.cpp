@@ -572,10 +572,16 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 }
 
 void ggml_backend_load_all() {
+#ifdef GGML_BACKEND_DL
     ggml_backend_load_all_from_path(nullptr);
+#endif
 }
 
 void ggml_backend_load_all_from_path(const char * dir_path) {
+#ifndef GGML_BACKEND_DL
+    (void) dir_path;
+    return;
+#else
 #ifdef NDEBUG
     bool silent = true;
 #else
@@ -602,4 +608,5 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     if (backend_path) {
         ggml_backend_load(backend_path);
     }
+#endif
 }

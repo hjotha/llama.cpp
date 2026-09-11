@@ -586,16 +586,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            const CUresult alloc_err = cuMemCreate(&handle, reserve_size, &prop, 0);
-            // Paged-KV growth uses allocation failure as a recoverable signal:
-            // llama_kv_cache_paged can then retry the same layer on a spill
-            // backend (normally the CPU).  CU_CHECK aborts the whole process,
-            // which made dynamic paged KV defeat its own spill path whenever
-            // the transient batch workspace consumed the remaining VRAM.
-            if (alloc_err == CUDA_ERROR_OUT_OF_MEMORY) {
-                return nullptr;
-            }
-            CU_CHECK(alloc_err);
+            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {

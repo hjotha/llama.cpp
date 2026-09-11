@@ -1689,8 +1689,14 @@ static void common_fit_paged_kv_blocks(common_params& params, llama_model * mode
 
     size_t available = (free_vram > margin) ? free_vram - margin : 0;
 
+    // A paged prealloc-max request can pin an explicit ctx-size while fit is
+    // disabled.  It still needs the same real compute probe as the automatic
+    // ctx-size=0 path: batch/ubatch, MTP, and parallel slots consume VRAM that
+    // a KV-only block estimate cannot see.
     size_t compute_overhead = 0;
-    if (params.fit_params && params.n_ctx == 0) {
+    const bool need_compute_probe = params.kv_paged_prealloc_max ||
+        (params.fit_params && params.n_ctx == 0);
+    if (need_compute_probe) {
         const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
         const uint32_t align = params.block_size * 64;
         const uint32_t probe_ctx_per_seq = common_fit_probe_context(params, model->hparams.n_ctx_train, align);

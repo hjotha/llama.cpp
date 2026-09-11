@@ -1470,6 +1470,37 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    void check_memory_pressure_recovery() {
+        if (!disable_cuda_graphs_due_to_memory_pressure) {
+            return;
+        }
+
+        ggml_cuda_set_device(device);
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        const cudaError_t mem_stat = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (mem_stat == cudaSuccess) {
+            static const size_t safe_headroom = [] {
+                const char * env = getenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB");
+                return (env != nullptr ? (size_t)atoi(env) : 32) * 1024 * 1024;
+            }();
+
+            if (free_bytes >= safe_headroom) {
+                disable_cuda_graphs_due_to_memory_pressure = false;
+                for (auto & pair : cuda_graphs) {
+                    if (pair.second) {
+                        pair.second->disable_due_to_memory_pressure = false;
+                        pair.second->warmup_complete = false;
+                        pair.second->warmup_stable_calls = 0;
+                    }
+                }
+                GGML_LOG_INFO("%s: CUDA graphs re-enabled after VRAM headroom recovered (%.2f MiB free >= %.2f MiB)\n",
+                              __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
+            }
+        }
+    }
+
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
@@ -1485,6 +1516,8 @@ struct ggml_backend_cuda_context {
             }
         }
 
+        check_memory_pressure_recovery();
+
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
@@ -1496,7 +1529,8 @@ struct ggml_backend_cuda_context {
 
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
-    bool any_cuda_graph_enabled() const {
+    bool any_cuda_graph_enabled() {
+        check_memory_pressure_recovery();
         if (disable_cuda_graphs_due_to_memory_pressure) {
             return false;
         }
